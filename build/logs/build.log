@@ -1,0 +1,13 @@
+[21:28:27.579] > nasm -f bin C:\Users\Omar\Documents\Documentos WEb\Portix\portix\boot\boot.asm -o C:\Users\Omar\Documents\Documentos WEb\Portix\portix\build\boot.bin
+[21:28:27.593] [OK] boot.bin (512 bytes)
+[21:28:27.593] > nasm -f bin C:\Users\Omar\Documents\Documentos WEb\Portix\portix\boot\stage2.asm -o C:\Users\Omar\Documents\Documentos WEb\Portix\portix\build\stage2.bin
+[21:28:27.613] [OK] stage2.bin (32768 bytes)
+[21:28:27.615] > nasm -f elf32 C:\Users\Omar\Documents\Documentos WEb\Portix\portix\kernel\src\isr.asm -o C:\Users\Omar\Documents\Documentos WEb\Portix\portix\build\isr.o
+[21:28:27.626] [OK] isr.o (976 bytes)
+[21:28:27.626] === COMPILANDO KERNEL RUST ===
+[21:28:27.627] > cargo +nightly build --release -Z build-std=core -Z json-target-spec --target C:\Users\Omar\Documents\Documentos WEb\Portix\portix\kernel\i686-portix.json
+[21:28:27.785] > objcopy -I elf32-i386 -O binary --strip-all C:\Users\Omar\Documents\Documentos WEb\Portix\portix\kernel\target\i686-portix\release\kernel C:\Users\Omar\Documents\Documentos WEb\Portix\portix\build\kernel.bin
+[21:28:27.803] [OK] kernel.bin (18696 bytes, 37 sectores)
+[21:28:27.804] === CREANDO FLOPPY ===
+[21:28:27.827] [OK] floppy.img lista. Kernel en offset 33280
+[21:28:27.828] === EJECUTANDO QEMU ===

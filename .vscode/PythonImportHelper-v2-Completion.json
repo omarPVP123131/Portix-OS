@@ -1,0 +1,447 @@
+[
+    {
+        "label": "shutil",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "shutil",
+        "description": "shutil",
+        "detail": "shutil",
+        "documentation": {}
+    },
+    {
+        "label": "subprocess",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "subprocess",
+        "description": "subprocess",
+        "detail": "subprocess",
+        "documentation": {}
+    },
+    {
+        "label": "sys",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "sys",
+        "description": "sys",
+        "detail": "sys",
+        "documentation": {}
+    },
+    {
+        "label": "math",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "math",
+        "description": "math",
+        "detail": "math",
+        "documentation": {}
+    },
+    {
+        "label": "os",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "os",
+        "description": "os",
+        "detail": "os",
+        "documentation": {}
+    },
+    {
+        "label": "Path",
+        "importPath": "pathlib",
+        "description": "pathlib",
+        "isExtraImport": true,
+        "detail": "pathlib",
+        "documentation": {}
+    },
+    {
+        "label": "Path",
+        "importPath": "pathlib",
+        "description": "pathlib",
+        "isExtraImport": true,
+        "detail": "pathlib",
+        "documentation": {}
+    },
+    {
+        "label": "Path",
+        "importPath": "pathlib",
+        "description": "pathlib",
+        "isExtraImport": true,
+        "detail": "pathlib",
+        "documentation": {}
+    },
+    {
+        "label": "datetime",
+        "importPath": "datetime",
+        "description": "datetime",
+        "isExtraImport": true,
+        "detail": "datetime",
+        "documentation": {}
+    },
+    {
+        "label": "re",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "re",
+        "description": "re",
+        "detail": "re",
+        "documentation": {}
+    },
+    {
+        "label": "defaultdict",
+        "importPath": "collections",
+        "description": "collections",
+        "isExtraImport": true,
+        "detail": "collections",
+        "documentation": {}
+    },
+    {
+        "label": "log",
+        "kind": 2,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "def log(msg, logfile=None):\n    timestamp = datetime.now().strftime(\"%H:%M:%S.%f\")[:-3]\n    line = f\"[{timestamp}] {msg}\"\n    print(line)\n    if logfile:\n        logfile.parent.mkdir(parents=True, exist_ok=True)\n        with open(logfile, \"a\", encoding=\"utf-8\") as f:\n            f.write(line + \"\\n\")\ndef run(cmd, **kwargs):\n    log(f\"> {' '.join(map(str, cmd))}\", BUILD_LOG)",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "run",
+        "kind": 2,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "def run(cmd, **kwargs):\n    log(f\"> {' '.join(map(str, cmd))}\", BUILD_LOG)\n    subprocess.run(cmd, check=True, **kwargs)\n# --------------------------------------------------\n# CHECK TOOLS\n# --------------------------------------------------\ndef check_tools():\n    log(\"=== VERIFICANDO HERRAMIENTAS ===\", BUILD_LOG)\n    tools = [\"nasm\", \"cargo\", \"objcopy\", \"qemu-system-x86_64\"]\n    ok = True",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "check_tools",
+        "kind": 2,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "def check_tools():\n    log(\"=== VERIFICANDO HERRAMIENTAS ===\", BUILD_LOG)\n    tools = [\"nasm\", \"cargo\", \"objcopy\", \"qemu-system-x86_64\"]\n    ok = True\n    for t in tools:\n        path = shutil.which(t)\n        if not path:\n            log(f\"[ERROR] '{t}' no está en PATH\", BUILD_LOG)\n            ok = False\n        else:",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "build_rust_kernel",
+        "kind": 2,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "def build_rust_kernel():\n    log(\"=== COMPILANDO KERNEL RUST ===\", BUILD_LOG)\n    target_json = KERNEL_DIR / \"i686-portix.json\"\n    env = os.environ.copy()\n    env[\"CARGO_ENCODED_RUSTFLAGS\"] = f\"-C\\x1flink-arg={ISROBJECT}\"\n    run([\n        \"cargo\",\n        \"+nightly\",\n        \"build\",\n        \"--release\",",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "assemble",
+        "kind": 2,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "def assemble():\n    log(\"=== COMPILANDO ASM ===\", BUILD_LOG)\n    BUILD.mkdir(parents=True, exist_ok=True)\n    LOGS.mkdir(parents=True, exist_ok=True)\n    for f in [BUILD_LOG, QEMU_LOG, SERIAL_LOG, DEBUG_LOG]:\n        if f.exists():\n            f.unlink()\n    run([\"nasm\", \"-f\", \"bin\", BOOT_DIR / \"boot.asm\", \"-o\", BOOTBIN])\n    log(f\"[OK] boot.bin ({BOOTBIN.stat().st_size} bytes)\", BUILD_LOG)\n    run([\"nasm\", \"-f\", \"bin\", BOOT_DIR / \"stage2.asm\", \"-o\", STAGE2BIN])",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "create_floppy",
+        "kind": 2,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "def create_floppy():\n    log(\"=== CREANDO FLOPPY ===\", BUILD_LOG)\n    with open(FLOPPY, \"wb\") as f:\n        f.truncate(1440 * 1024)\n    with open(BOOTBIN, \"rb\") as src, open(FLOPPY, \"r+b\") as dst:\n        dst.seek(0)\n        dst.write(src.read())\n    with open(STAGE2BIN, \"rb\") as src, open(FLOPPY, \"r+b\") as dst:\n        dst.seek(512)\n        data = src.read()",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "run_qemu",
+        "kind": 2,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "def run_qemu():\n    log(\"=== EJECUTANDO QEMU ===\", BUILD_LOG)\n    subprocess.run([\n        \"qemu-system-x86_64\",\n        \"-fda\", str(FLOPPY),\n        \"-boot\", \"a\",\n        \"-m\", \"32M\",\n        \"-serial\", f\"file:{SERIAL_LOG}\",\n        \"-no-reboot\",\n        \"-no-shutdown\",",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "main",
+        "kind": 2,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "def main():\n    print(\"🚀 PORTIX BUILD SYSTEM (ESTABLE)\")\n    print(\"=\" * 60)\n    if not check_tools():\n        sys.exit(1)\n    assemble()\n    create_floppy()\n    run_qemu()\nif __name__ == \"__main__\":\n    main()",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "ROOT",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "ROOT = Path(__file__).resolve().parents[1]\nBOOT_DIR = ROOT / \"boot\"\nKERNEL_DIR = ROOT / \"kernel\"\nBUILD = ROOT / \"build\"\nLOGS = BUILD / \"logs\"\nFLOPPY = BUILD / \"floppy.img\"\nBOOTBIN = BUILD / \"boot.bin\"\nSTAGE2BIN = BUILD / \"stage2.bin\"\nKERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "BOOT_DIR",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "BOOT_DIR = ROOT / \"boot\"\nKERNEL_DIR = ROOT / \"kernel\"\nBUILD = ROOT / \"build\"\nLOGS = BUILD / \"logs\"\nFLOPPY = BUILD / \"floppy.img\"\nBOOTBIN = BUILD / \"boot.bin\"\nSTAGE2BIN = BUILD / \"stage2.bin\"\nKERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "KERNEL_DIR",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "KERNEL_DIR = ROOT / \"kernel\"\nBUILD = ROOT / \"build\"\nLOGS = BUILD / \"logs\"\nFLOPPY = BUILD / \"floppy.img\"\nBOOTBIN = BUILD / \"boot.bin\"\nSTAGE2BIN = BUILD / \"stage2.bin\"\nKERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------\n# LOGS",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "BUILD",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "BUILD = ROOT / \"build\"\nLOGS = BUILD / \"logs\"\nFLOPPY = BUILD / \"floppy.img\"\nBOOTBIN = BUILD / \"boot.bin\"\nSTAGE2BIN = BUILD / \"stage2.bin\"\nKERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------\n# LOGS\n# --------------------------------------------------",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "LOGS",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "LOGS = BUILD / \"logs\"\nFLOPPY = BUILD / \"floppy.img\"\nBOOTBIN = BUILD / \"boot.bin\"\nSTAGE2BIN = BUILD / \"stage2.bin\"\nKERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------\n# LOGS\n# --------------------------------------------------\nBUILD_LOG = LOGS / \"build.log\"",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "FLOPPY",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "FLOPPY = BUILD / \"floppy.img\"\nBOOTBIN = BUILD / \"boot.bin\"\nSTAGE2BIN = BUILD / \"stage2.bin\"\nKERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------\n# LOGS\n# --------------------------------------------------\nBUILD_LOG = LOGS / \"build.log\"\nQEMU_LOG = LOGS / \"qemu.log\"",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "BOOTBIN",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "BOOTBIN = BUILD / \"boot.bin\"\nSTAGE2BIN = BUILD / \"stage2.bin\"\nKERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------\n# LOGS\n# --------------------------------------------------\nBUILD_LOG = LOGS / \"build.log\"\nQEMU_LOG = LOGS / \"qemu.log\"\nSERIAL_LOG = LOGS / \"serial.log\"",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "STAGE2BIN",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "STAGE2BIN = BUILD / \"stage2.bin\"\nKERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------\n# LOGS\n# --------------------------------------------------\nBUILD_LOG = LOGS / \"build.log\"\nQEMU_LOG = LOGS / \"qemu.log\"\nSERIAL_LOG = LOGS / \"serial.log\"\nDEBUG_LOG = LOGS / \"debug.log\"",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "KERNELBIN",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "KERNELBIN = BUILD / \"kernel.bin\"\nISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------\n# LOGS\n# --------------------------------------------------\nBUILD_LOG = LOGS / \"build.log\"\nQEMU_LOG = LOGS / \"qemu.log\"\nSERIAL_LOG = LOGS / \"serial.log\"\nDEBUG_LOG = LOGS / \"debug.log\"\n# --------------------------------------------------",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "ISROBJECT",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "ISROBJECT = BUILD / \"isr.o\"\n# --------------------------------------------------\n# LOGS\n# --------------------------------------------------\nBUILD_LOG = LOGS / \"build.log\"\nQEMU_LOG = LOGS / \"qemu.log\"\nSERIAL_LOG = LOGS / \"serial.log\"\nDEBUG_LOG = LOGS / \"debug.log\"\n# --------------------------------------------------\n# LIMITES",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "BUILD_LOG",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "BUILD_LOG = LOGS / \"build.log\"\nQEMU_LOG = LOGS / \"qemu.log\"\nSERIAL_LOG = LOGS / \"serial.log\"\nDEBUG_LOG = LOGS / \"debug.log\"\n# --------------------------------------------------\n# LIMITES\n# --------------------------------------------------\nSTAGE2_SECTORS_LIMIT = 64\nKERNEL_SECTORS_LIMIT = 64\n# --------------------------------------------------",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "QEMU_LOG",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "QEMU_LOG = LOGS / \"qemu.log\"\nSERIAL_LOG = LOGS / \"serial.log\"\nDEBUG_LOG = LOGS / \"debug.log\"\n# --------------------------------------------------\n# LIMITES\n# --------------------------------------------------\nSTAGE2_SECTORS_LIMIT = 64\nKERNEL_SECTORS_LIMIT = 64\n# --------------------------------------------------\n# UTILIDADES",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "SERIAL_LOG",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "SERIAL_LOG = LOGS / \"serial.log\"\nDEBUG_LOG = LOGS / \"debug.log\"\n# --------------------------------------------------\n# LIMITES\n# --------------------------------------------------\nSTAGE2_SECTORS_LIMIT = 64\nKERNEL_SECTORS_LIMIT = 64\n# --------------------------------------------------\n# UTILIDADES\n# --------------------------------------------------",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "DEBUG_LOG",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "DEBUG_LOG = LOGS / \"debug.log\"\n# --------------------------------------------------\n# LIMITES\n# --------------------------------------------------\nSTAGE2_SECTORS_LIMIT = 64\nKERNEL_SECTORS_LIMIT = 64\n# --------------------------------------------------\n# UTILIDADES\n# --------------------------------------------------\ndef log(msg, logfile=None):",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "STAGE2_SECTORS_LIMIT",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "STAGE2_SECTORS_LIMIT = 64\nKERNEL_SECTORS_LIMIT = 64\n# --------------------------------------------------\n# UTILIDADES\n# --------------------------------------------------\ndef log(msg, logfile=None):\n    timestamp = datetime.now().strftime(\"%H:%M:%S.%f\")[:-3]\n    line = f\"[{timestamp}] {msg}\"\n    print(line)\n    if logfile:",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "KERNEL_SECTORS_LIMIT",
+        "kind": 5,
+        "importPath": "scripts.build",
+        "description": "scripts.build",
+        "peekOfCode": "KERNEL_SECTORS_LIMIT = 64\n# --------------------------------------------------\n# UTILIDADES\n# --------------------------------------------------\ndef log(msg, logfile=None):\n    timestamp = datetime.now().strftime(\"%H:%M:%S.%f\")[:-3]\n    line = f\"[{timestamp}] {msg}\"\n    print(line)\n    if logfile:\n        logfile.parent.mkdir(parents=True, exist_ok=True)",
+        "detail": "scripts.build",
+        "documentation": {}
+    },
+    {
+        "label": "hexdump",
+        "kind": 2,
+        "importPath": "scripts.Diagnostico",
+        "description": "scripts.Diagnostico",
+        "peekOfCode": "def hexdump(data, offset=0, length=64):\n    \"\"\"Mostrar hexdump de los datos\"\"\"\n    for i in range(0, min(len(data), length), 16):\n        hex_str = ' '.join(f'{b:02x}' for b in data[i:i+16])\n        ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])\n        print(f\"{offset+i:08x}  {hex_str:<48}  {ascii_str}\")\ndef main():\n    print(\"=\"*70)\n    print(\"DIAGNÓSTICO DEL FLOPPY\")\n    print(\"=\"*70)",
+        "detail": "scripts.Diagnostico",
+        "documentation": {}
+    },
+    {
+        "label": "main",
+        "kind": 2,
+        "importPath": "scripts.Diagnostico",
+        "description": "scripts.Diagnostico",
+        "peekOfCode": "def main():\n    print(\"=\"*70)\n    print(\"DIAGNÓSTICO DEL FLOPPY\")\n    print(\"=\"*70)\n    if not FLOPPY.exists():\n        print(f\"ERROR: {FLOPPY} no existe\")\n        return 1\n    print(f\"\\n✓ Floppy encontrado: {FLOPPY}\")\n    print(f\"  Tamaño: {FLOPPY.stat().st_size} bytes\")\n    with open(FLOPPY, \"rb\") as f:",
+        "detail": "scripts.Diagnostico",
+        "documentation": {}
+    },
+    {
+        "label": "ROOT",
+        "kind": 5,
+        "importPath": "scripts.Diagnostico",
+        "description": "scripts.Diagnostico",
+        "peekOfCode": "ROOT = Path(__file__).resolve().parents[1]\nFLOPPY = ROOT / \"build\" / \"floppy.img\"\nKERNELBIN = ROOT / \"build\" / \"kernel.bin\"\ndef hexdump(data, offset=0, length=64):\n    \"\"\"Mostrar hexdump de los datos\"\"\"\n    for i in range(0, min(len(data), length), 16):\n        hex_str = ' '.join(f'{b:02x}' for b in data[i:i+16])\n        ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])\n        print(f\"{offset+i:08x}  {hex_str:<48}  {ascii_str}\")\ndef main():",
+        "detail": "scripts.Diagnostico",
+        "documentation": {}
+    },
+    {
+        "label": "FLOPPY",
+        "kind": 5,
+        "importPath": "scripts.Diagnostico",
+        "description": "scripts.Diagnostico",
+        "peekOfCode": "FLOPPY = ROOT / \"build\" / \"floppy.img\"\nKERNELBIN = ROOT / \"build\" / \"kernel.bin\"\ndef hexdump(data, offset=0, length=64):\n    \"\"\"Mostrar hexdump de los datos\"\"\"\n    for i in range(0, min(len(data), length), 16):\n        hex_str = ' '.join(f'{b:02x}' for b in data[i:i+16])\n        ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])\n        print(f\"{offset+i:08x}  {hex_str:<48}  {ascii_str}\")\ndef main():\n    print(\"=\"*70)",
+        "detail": "scripts.Diagnostico",
+        "documentation": {}
+    },
+    {
+        "label": "KERNELBIN",
+        "kind": 5,
+        "importPath": "scripts.Diagnostico",
+        "description": "scripts.Diagnostico",
+        "peekOfCode": "KERNELBIN = ROOT / \"build\" / \"kernel.bin\"\ndef hexdump(data, offset=0, length=64):\n    \"\"\"Mostrar hexdump de los datos\"\"\"\n    for i in range(0, min(len(data), length), 16):\n        hex_str = ' '.join(f'{b:02x}' for b in data[i:i+16])\n        ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])\n        print(f\"{offset+i:08x}  {hex_str:<48}  {ascii_str}\")\ndef main():\n    print(\"=\"*70)\n    print(\"DIAGNÓSTICO DEL FLOPPY\")",
+        "detail": "scripts.Diagnostico",
+        "documentation": {}
+    },
+    {
+        "label": "Colors",
+        "kind": 6,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "class Colors:\n    RED = '\\033[91m'\n    GREEN = '\\033[92m'\n    YELLOW = '\\033[93m'\n    BLUE = '\\033[94m'\n    MAGENTA = '\\033[95m'\n    CYAN = '\\033[96m'\n    BOLD = '\\033[1m'\n    RESET = '\\033[0m'\nEXCEPTION_NAMES = {",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "parse_qemu_log",
+        "kind": 2,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "def parse_qemu_log(log_file):\n    \"\"\"Parse QEMU CPU log\"\"\"\n    try:\n        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:\n            return f.readlines()\n    except FileNotFoundError:\n        print(f\"{Colors.RED}Error: Log file '{log_file}' not found{Colors.RESET}\")\n        return []\ndef analyze_exceptions(lines):\n    \"\"\"Analizar excepciones en el log\"\"\"",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "analyze_exceptions",
+        "kind": 2,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "def analyze_exceptions(lines):\n    \"\"\"Analizar excepciones en el log\"\"\"\n    exceptions = []\n    for i, line in enumerate(lines):\n        if 'check_exception' in line:\n            match = re.search(r'old: (0x[0-9a-f]+) new (0x[0-9a-f]+)', line)\n            if match:\n                old_exc = int(match.group(1), 16) if match.group(1) != '0xffffffff' else None\n                new_exc = int(match.group(2), 16)\n                # Leer la siguiente línea para obtener contexto",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "analyze_registers",
+        "kind": 2,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "def analyze_registers(lines):\n    \"\"\"Extraer estado de registros en puntos clave\"\"\"\n    states = []\n    for i, line in enumerate(lines):\n        if re.match(r'^\\s*\\d+:', line):\n            # Línea con número de instrucción\n            regs = {}\n            # Extraer registros de propósito general\n            if i + 1 < len(lines):\n                reg_line = lines[i + 1]",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "detect_patterns",
+        "kind": 2,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "def detect_patterns(exceptions):\n    \"\"\"Detectar patrones en las excepciones\"\"\"\n    patterns = {\n        'triple_fault': False,\n        'gp_loop': False,\n        'stack_overflow': False,\n        'invalid_segment': False,\n        'exception_cascade': []\n    }\n    # Detectar cascada de excepciones",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "print_exception_summary",
+        "kind": 2,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "def print_exception_summary(exceptions):\n    \"\"\"Imprimir resumen de excepciones\"\"\"\n    print(f\"\\n{Colors.BOLD}{Colors.CYAN}╔═══════════════════════════════════════════════════════════════╗\")\n    print(f\"║               ANÁLISIS DE EXCEPCIONES                        ║\")\n    print(f\"╚═══════════════════════════════════════════════════════════════╝{Colors.RESET}\\n\")\n    if not exceptions:\n        print(f\"{Colors.GREEN}✓ No se detectaron excepciones{Colors.RESET}\")\n        return\n    print(f\"{Colors.RED}Total de excepciones: {len(exceptions)}{Colors.RESET}\\n\")\n    # Contar tipos",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "print_diagnosis",
+        "kind": 2,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "def print_diagnosis(patterns, exceptions):\n    \"\"\"Imprimir diagnóstico de problemas\"\"\"\n    print(f\"\\n{Colors.BOLD}{Colors.MAGENTA}╔═══════════════════════════════════════════════════════════════╗\")\n    print(f\"║                    DIAGNÓSTICO                                ║\")\n    print(f\"╚═══════════════════════════════════════════════════════════════╝{Colors.RESET}\\n\")\n    has_problems = False\n    if patterns['triple_fault']:\n        has_problems = True\n        print(f\"{Colors.RED}{Colors.BOLD}✗ TRIPLE FAULT DETECTADO{Colors.RESET}\")\n        print(f\"  {Colors.RED}El sistema está en un loop de excepciones{Colors.RESET}\")",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "print_recommendations",
+        "kind": 2,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "def print_recommendations():\n    \"\"\"Imprimir recomendaciones\"\"\"\n    print(f\"\\n{Colors.BOLD}{Colors.GREEN}╔═══════════════════════════════════════════════════════════════╗\")\n    print(f\"║                  RECOMENDACIONES                              ║\")\n    print(f\"╚═══════════════════════════════════════════════════════════════╝{Colors.RESET}\\n\")\n    print(f\"{Colors.BOLD}1. Arreglar segmentos en stage2.asm:{Colors.RESET}\")\n    print(f\"   Asegurar que ES=DS=FS=GS=SS=0x10 en modo protegido\\n\")\n    print(f\"{Colors.BOLD}2. Agregar TSS válido:{Colors.RESET}\")\n    print(f\"   Necesario para manejar Double Faults correctamente\\n\")\n    print(f\"{Colors.BOLD}3. Revisar handlers de IDT:{Colors.RESET}\")",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "main",
+        "kind": 2,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "def main():\n    if len(sys.argv) < 2:\n        print(f\"Uso: {sys.argv[0]} <qemu_log.txt>\")\n        print(f\"\\nPara generar el log de QEMU:\")\n        print(f\"  qemu-system-i386 -drive file=portix.img,format=raw -d int,cpu_reset -D qemu_log.txt\")\n        sys.exit(1)\n    log_file = sys.argv[1]\n    print(f\"{Colors.BOLD}{Colors.BLUE}\")\n    print(\"╔══════════════════════════════════════════════════════════════════╗\")\n    print(\"║             PORTIX KERNEL DEBUGGER v1.0                          ║\")",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    },
+    {
+        "label": "EXCEPTION_NAMES",
+        "kind": 5,
+        "importPath": "scripts.kernel",
+        "description": "scripts.kernel",
+        "peekOfCode": "EXCEPTION_NAMES = {\n    0x00: \"Divide by Zero (#DE)\",\n    0x01: \"Debug Exception (#DB)\",\n    0x02: \"Non-Maskable Interrupt\",\n    0x03: \"Breakpoint (#BP)\",\n    0x04: \"Overflow (#OF)\",\n    0x05: \"Bound Range Exceeded (#BR)\",\n    0x06: \"Invalid Opcode (#UD)\",\n    0x07: \"Device Not Available (#NM)\",\n    0x08: \"Double Fault (#DF)\",",
+        "detail": "scripts.kernel",
+        "documentation": {}
+    }
+]

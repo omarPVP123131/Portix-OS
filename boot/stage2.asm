@@ -1,12 +1,17 @@
-; boot/stage2.asm - CORREGIDO PARA NASM
-BITS 16
-org 0x8000
+; boot/stage2.asm - PORTIX v7 - FIXED (corregido lectura LFB en long mode)
+; nasm -f bin stage2.asm -o stage2.bin
 
-KERNEL_SECTORS  equ 64
-KERNEL_LOAD_SEG equ 0x1000
-KERNEL_START_LBA equ 65
+BITS 16
+ORG 0x8000
+
+KERNEL_SECTORS   equ 256            ; ← subido de 192 (kernel actual ~225 sec)
+KERNEL_LOAD_SEG  equ 0x1000
+KERNEL_PHYS_ADDR equ 0x10000
+
+section .text
 
 start2:
+    mov [boot_drive], dl
     cli
     xor ax, ax
     mov ds, ax
@@ -17,324 +22,412 @@ start2:
 
     mov si, msg_stage2
     call print
-    
-    ; Habilitar A20
-    call check_a20
-    test ax, ax
-    jz .enable_a20
-    mov si, msg_a20_enabled
-    call print
-    jmp .a20_ok
-    
-.enable_a20:
-    mov si, msg_a20_disabled
-    call print
-    in al, 0x92
-    or al, 2
-    out 0x92, al
-    call check_a20
-    test ax, ax
-    jz a20_error
-    
-.a20_ok:
-    mov si, msg_loading_k
-    call print
 
-    ; Cargar kernel
+    ; ── 1. A20 ───────────────────────────────────────────────────────────────
+    in  al, 0x92
+    or  al, 0x02
+    and al, 0xFE
+    out 0x92, al
+
+; ── 2. E820 RAM (Construcción de Tabla) ──────────────────────────────────
+    mov di, 0x9102          ; Las entradas empiezan en 0x9102
+    xor ebx, ebx            ; EBX debe ser 0 para empezar
+    xor bp, bp              ; Usaremos BP como contador de entradas
+.e820_loop:
+    mov eax, 0xE820
+    mov ecx, 24             ; Pedir 24 bytes
+    mov edx, 0x534D4150     ; 'SMAP'
+    int 0x15
+    jc .e820_done
+    cmp eax, 0x534D4150
+    jne .e820_done
+    
+    test ecx, ecx           ; ¿BIOS retornó 0 bytes?
+    jz .e820_next
+    
+    add di, 20              ; Avanzar al siguiente slot de la tabla
+    inc bp                  ; Incrementar contador
+    
+.e820_next:
+    test ebx, ebx           ; Si EBX es 0, terminó el mapa
+    jnz .e820_loop
+.e820_done:
+    mov [0x9100], bp        ; Guardar el número total de entradas en 0x9100
+    
+
+    ; ── 3. Deshabilitar nIEN (IDE IRQ) ────────────────────────────────────────
+    mov al, 0x02
+    mov dx, 0x3F6
+    out dx, al
+    out 0x80, al
+    mov dx, 0x376
+    out dx, al
+    out 0x80, al
+
+    ; ── 4. Cargar kernel ──────────────────────────────────────────────────────
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, 0x80
+    int 0x13
+    jc  .try_ext_orig
+    cmp bx, 0xAA55
+    jne .try_ext_orig
+    mov byte [boot_drive], 0x80
+    jmp .do_lba_read
+
+.try_ext_orig:
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, [boot_drive]
+    int 0x13
+    jc  .try_chs
+    cmp bx, 0xAA55
+    jne .try_chs
+    jmp .do_lba_read
+
+.do_lba_read:
+    mov word  [dap_count],   1
+    mov word  [dap_offset],  0
+    mov word  [dap_segment], KERNEL_LOAD_SEG
+    mov dword [dap_lba_lo],  65
+    mov dword [dap_lba_hi],  0
+    mov cx, KERNEL_SECTORS
+
+.lba_loop:
+    mov si, dap
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    int 0x13
+    jc  .lba_error
+    inc dword [dap_lba_lo]
+    mov ax, [dap_segment]
+    add ax, 0x20
+    mov [dap_segment], ax
+    loop .lba_loop
+    jmp .kernel_loaded
+
+.lba_error:
+    jmp .try_chs
+
+.try_chs:
+    mov byte [boot_drive], 0x80
     mov ax, KERNEL_LOAD_SEG
     mov es, ax
     xor bx, bx
-    mov word [current_lba], KERNEL_START_LBA
+    mov word [current_lba], 65
     mov cx, KERNEL_SECTORS
-    mov word [sectors_loaded], 0
 
-load_kernel_loop:
+.chs_loop:
     push cx
+    push bx
+    push es
     mov ax, [current_lba]
-    call lba_to_chs
+    call lba_to_chs_hd
     mov ah, 0x02
     mov al, 1
-    mov dl, 0
+    mov dl, [boot_drive]
     int 0x13
-    jc disk_error
-    inc word [sectors_loaded]
+    jc  .chs_fail
+    pop es
+    pop bx
     pop cx
-    add bx, 512
-    inc word [current_lba]
-    loop load_kernel_loop
-    
-    mov si, msg_load_ok
-    call print
-
-    ; Verificar kernel
-    mov si, msg_verify_kernel
-    call print
-    mov ax, KERNEL_LOAD_SEG
+    mov ax, es
+    add ax, 0x20
     mov es, ax
-    mov eax, [es:0]
-    test eax, eax
-    jz kernel_corrupt
-    cmp eax, 0xFFFFFFFF
-    je kernel_corrupt
+    inc word [current_lba]
+    loop .chs_loop
+    jmp .kernel_loaded
+
+.chs_fail:
+    pop es
+    pop bx
+    pop cx
+    jmp error_disk
+
+.kernel_loaded:
     mov si, msg_kernel_ok
     call print
 
-    ; ==========================
-    ; Detectar RAM con E820
-    ; Resultado final en 0x9000 (bytes)
-    ; ==========================
-    mov si, msg_detect_ram
-    call print
-
-xor ebx, ebx
-
-mov ax, 0x0000
-mov es, ax
-mov di, 0x9100        ; buffer E820 en 0x9100
-
-; total RAM = 0 en 0x9000
-mov dword [0x9000], 0
-
-
-detect_loop:
-    mov eax, 0xE820
-    mov edx, 0x534D4150   ; "SMAP"
-    mov ecx, 24
-    int 0x15
-    jc detect_done
-    cmp eax, 0x534D4150
-    jne detect_done
-
-    ; Tipo de memoria usable = 1
-    cmp dword [es:di+16], 1
-    jne .next
-
-    ; Sumar tamaño (parte baja del tamaño)
-    mov eax, [es:di+8]
-    add [0x9000], eax
-
-.next:
-    add di, 24
-    test ebx, ebx
-    jnz detect_loop
-
-detect_done:
-    mov si, msg_ram_ok
-    call print
-
-
-    mov si, msg_setup_pm
-    call print
-    cli
-    lgdt [gdt_desc]
-    mov si, msg_gdt_loaded
-    call print
-    mov si, msg_enter_pm
-    call print
-
-    ; Activar protected mode
-    mov eax, cr0
-    or eax, 1
-    mov cr0, eax
-    jmp 0x08:pm_entry
-
-a20_error:
-    mov si, msg_a20_fail
-    call print
-    cli
-    hlt
-
-disk_error:
-    mov si, msg_disk
-    call print
-    cli
-    hlt
-
-kernel_corrupt:
-    mov si, msg_kernel_bad
-    call print
-    cli
-    hlt
-
-check_a20:
-    push es
-    push ds
+; ── 5. VESA ───────────────────────────────────────────────────────────────
     xor ax, ax
     mov es, ax
-    mov di, 0x0500
-    mov ax, 0xFFFF
-    mov ds, ax
-    mov si, 0x0510
-    mov al, [es:di]
-    push ax
-    mov al, [ds:si]
-    push ax
-    mov byte [es:di], 0x00
-    mov byte [ds:si], 0xFF
-    cmp byte [es:di], 0xFF
-    pop ax
-    mov [ds:si], al
-    pop ax
-    mov [es:di], al
-    mov ax, 0
-    je .disabled
-    mov ax, 1
-.disabled:
-    pop ds
-    pop es
-    ret
+    mov ax, 0x4F01
+    mov cx, 0x118
+    mov di, 0x8500
+    int 0x10
+    cmp ax, 0x004F
+    jne .vesa_skip
 
-lba_to_chs:
+    mov eax, [0x8528]
+    mov [0x9004], eax
+    mov ax, [0x8512]
+    mov [0x9008], ax
+    mov ax, [0x8514]
+    mov [0x900A], ax
+    mov ax, [0x8510]
+    mov [0x900C], ax
+    mov al, [0x8519]
+    mov [0x900E], al
+
+    mov ax, 0x4F02
+    mov bx, 0x4118
+    int 0x10
+    jmp .vesa_done
+    
+.try_modo_112:
+    mov ax, 0x4F01
+    mov cx, 0x112
+    mov di, 0x8500
+    int 0x10
+    cmp ax, 0x004F
+    jne .vesa_skip
+
+    mov eax, [0x8528]
+    mov [0x9004], eax
+    mov ax,  [0x8512]
+    mov [0x9008], ax
+    mov ax,  [0x8514]
+    mov [0x900A], ax
+    mov ax,  [0x8510]
+    mov [0x900C], ax
+    mov al,  [0x8519]
+    mov [0x900E], al
+
+    mov ax, 0x4F02
+    mov bx, 0x4112
+    int 0x10
+    jmp .vesa_done
+
+.vesa_skip:
+    xor eax, eax
+    mov [0x9004], eax
+    mov word [0x9008], 640
+    mov word [0x900A], 480
+    mov word [0x900C], 2560
+    mov byte [0x900E], 32
+.vesa_done:
+
+    ; ── 6. Tablas de paginación (identity map 0-1GB + LFB) ───────────────────
+    mov edi, 0x1000
+    xor eax, eax
+    mov ecx, (0x5000 / 4)
+    rep stosd
+
+    mov dword [0x1000], 0x2003
+    mov dword [0x1004], 0
+
+    mov dword [0x2000], 0x3003
+    mov dword [0x2004], 0
+
+    mov edi, 0x3000
+    mov eax, 0x00000083
+    mov ecx, 512
+.fill_pd:
+    mov [edi],   eax
+    mov dword [edi+4], 0
+    add eax, 0x200000
+    add edi, 8
+    loop .fill_pd
+
+    mov ebx, [0x9004]
+    test ebx, ebx
+    jz  .paging_done
+    mov eax, ebx
+    shr eax, 30
+    and eax, 0x1FF
+    cmp eax, 0
+    je  .paging_done
+    shl eax, 3
+    mov dword [0x2000 + eax], 0x4003
+    mov dword [0x2004 + eax], 0
+    mov edi, 0x4000
+    mov eax, ebx
+    and eax, 0xC0000000
+    or  eax, 0x83
+    mov ecx, 512
+.fill_lfb:
+    mov [edi],   eax
+    mov dword [edi+4], 0
+    add eax, 0x200000
+    add edi, 8
+    loop .fill_lfb
+.paging_done:
+
+    ; ── 7. PIC remap + enmascarar TODO ───────────────────────────────────────
+    cli
+    mov al, 0x11
+    out 0x20, al
+    out 0x80, al
+    out 0xA0, al
+    out 0x80, al
+    mov al, 0x20
+    out 0x21, al
+    out 0x80, al
+    mov al, 0x28
+    out 0xA1, al
+    out 0x80, al
+    mov al, 0x04
+    out 0x21, al
+    out 0x80, al
+    mov al, 0x02
+    out 0xA1, al
+    out 0x80, al
+    mov al, 0x01
+    out 0x21, al
+    out 0x80, al
+    out 0xA1, al
+    out 0x80, al
+    mov al, 0xFF
+    out 0x21, al
+    out 0x80, al
+    out 0xA1, al
+    out 0x80, al
+
+    ; ── 8. Long Mode ──────────────────────────────────────────────────────────
+    lgdt [gdt64_desc]
+    lidt [idt_null_desc]
+
+    mov eax, cr4
+    or  eax, (1 << 5)
+    mov cr4, eax
+
+    mov eax, 0x1000
+    mov cr3, eax
+
+    mov ecx, 0xC0000080
+    rdmsr
+    or  eax, (1 << 8)
+    xor edx, edx
+    wrmsr
+
+    mov eax, cr0
+    or  eax, (1 << 31) | (1 << 0)
+    mov cr0, eax
+
+    o32 jmp far [far_jump_ptr]
+
+; ── Funciones ─────────────────────────────────────────────────────────────────
+lba_to_chs_hd:
+    push bx
+    push ax
+    mov ax, dx
     xor dx, dx
-    mov cx, 18
-    div cx
+    mov bx, 63
+    div bx
     inc dx
-    mov [temp_sector], dl
+    mov cl, dl
     xor dx, dx
-    mov cx, 2
-    div cx
+    mov bx, 255
+    div bx
     mov ch, al
+    shl ah, 6
+    or cl, ah
     mov dh, dl
-    mov cl, [temp_sector]
+    pop ax
+    pop bx
     ret
 
 print:
     pusha
-.next:
-    lodsb
+.pl: lodsb
     or al, al
-    jz .done
+    jz .pd
     mov ah, 0x0E
     int 0x10
-    jmp .next
-.done:
-    popa
+    jmp .pl
+.pd: popa
     ret
 
-temp_sector db 0
-current_lba dw 0
-sectors_loaded dw 0
+error_disk:
+    mov si, msg_err_disk
+    call print
+    cli
+    hlt
 
-msg_stage2      db 13,10,"[Stage2] Loaded",13,10,0
-msg_a20_enabled db "[A20] Enabled",13,10,0
-msg_a20_disabled db "[A20] Enabling...",13,10,0
-msg_a20_fail    db "[A20] FAILED!",13,10,0
-msg_loading_k   db "[KERNEL] Loading...",13,10,0
-msg_load_ok     db "[KERNEL] Loaded",13,10,0
-msg_verify_kernel db "[VERIFY] Checking...",0
-msg_kernel_ok   db "OK",13,10,0
-msg_kernel_bad  db "INVALID!",13,10,0
-msg_setup_pm    db "[PM] Setup...",13,10,0
-msg_gdt_loaded  db "[GDT] Loaded",13,10,0
-msg_enter_pm    db "[PM] Entering...",13,10,0
-msg_disk        db "[ERROR] Disk!",13,10,0
-msg_detect_ram db "[RAM] Detecting...",13,10,0
-msg_ram_ok     db "[RAM] OK",13,10,0
+; ── Datos ──────────────────────────────────────────────────────────────────────
+msg_stage2    db "S2 OK", 13, 10, 0
+msg_kernel_ok db "K  OK", 13, 10, 0
+msg_err_disk  db "DISK ERR", 13, 10, 0
+boot_drive    db 0
+current_lba   dw 0
 
-; ==========================================
-; GDT - SIMPLIFICADA
-; ==========================================
-align 8
-gdt_start:
-    ; Null descriptor (0x00)
-    dq 0x0000000000000000
-
-    ; Code segment (0x08)
-    dw 0xFFFF           ; Limit
-    dw 0x0000           ; Base 0:15
-    db 0x00             ; Base 16:23
-    db 10011011b        ; Access: Present, Ring 0, Code, Exec/Read
-    db 11001111b        ; Flags: 4KB, 32-bit
-    db 0x00             ; Base 24:31
-
-    ; Data segment (0x10)
-    dw 0xFFFF
-    dw 0x0000
-    db 0x00
-    db 10010011b        ; Access: Present, Ring 0, Data, Read/Write
-    db 11001111b
-    db 0x00
-
-    ; TSS descriptor (0x18)
-    ; La base se calcula como: (gdt_start - 0x8000) + offset_de_tss
-    ; Que es: tss_location = 0x8000 + (tss - $$)
-tss_descriptor:
-    dw 103              ; Limit (104 bytes - 1)
-    dw (tss_location & 0xFFFF)     ; Base 0:15
-    db ((tss_location >> 16) & 0xFF)  ; Base 16:23
-    db 10001001b        ; Access: Present, Ring 0, TSS Available (0x89)
-    db 00000000b        ; Flags: Byte granularity
-    db ((tss_location >> 24) & 0xFF)  ; Base 24:31
-gdt_end:
-
-gdt_desc:
-    dw gdt_end - gdt_start - 1
-    dd gdt_start
-
-; ==========================================
-; TSS - En memoria después de la GDT
-; ==========================================
 align 4
-tss_location equ 0x8000 + (tss_data - $$)
+dap:
+    db 0x10, 0x00
+dap_count:   dw 1
+dap_offset:  dw 0
+dap_segment: dw KERNEL_LOAD_SEG
+dap_lba_lo:  dd 65
+dap_lba_hi:  dd 0
 
-tss_data:
-    dd 0                ; Link (unused)
-    dd 0x9000           ; ESP0 - Stack para ring 0
-    dd 0x10             ; SS0 - Data segment
-    times 23 dd 0       ; Resto del TSS (zeros)
-tss_data_end:
+align 8
+gdt64:
+    dq 0x0000000000000000
+    dq 0x00AF9A000000FFFF
+    dq 0x00CF92000000FFFF
+gdt64_end:
 
-; ==========================================
-; PROTECTED MODE
-; ==========================================
-[BITS 32]
-pm_entry:
-    ; Configurar segmentos
+gdt64_desc:
+    dw gdt64_end - gdt64 - 1
+    dd gdt64
+
+idt_null_desc:
+    dw 0x0000
+    dd 0x00000000
+
+align 4
+far_jump_ptr:
+    dd long_mode_entry
+    dw 0x08
+
+; ── 64-bit entry ──────────────────────────────────────────────────────────────
+BITS 64
+long_mode_entry:
+    cli
+    
     mov ax, 0x10
     mov ds, ax
     mov es, ax
+    mov ss, ax
+    xor ax, ax
     mov fs, ax
     mov gs, ax
-    mov ss, ax
-    mov esp, 0x90000
-    mov ebp, esp
+    mov rsp, 0x7FF00
+    xor rbp, rbp
 
-    ; Cargar TSS - IMPORTANTE PARA EXCEPCIONES
-    mov ax, 0x18
-    ltr ax
+    ; Habilitar FPU y SSE
+    mov rax, cr0
+    and ax, 0xFFFB
+    or  ax, 0x0002
+    mov cr0, rax
+    mov rax, cr4
+    or  ax, 3 << 9
+    mov cr4, rax
 
-    ; Habilitar SSE
-    mov eax, cr0
-    and eax, 0xFFFFFFFB
-    or eax, 0x00000002
-    mov cr0, eax
-    mov eax, cr4
-    or eax, 0x00000600
-    mov cr4, eax
+    xor rdi, rdi
+    mov edi, dword [0x9004]
+    test rdi, rdi
+    jz .no_debug_pixel
+    mov eax, 0xFFFFFFFF
+    mov ecx, 8
+    mov ebx, dword [0x900C]
 
-    ; Verificar kernel
-    mov eax, [0x10000]
-    test eax, eax
-    jz kernel_missing
+.loop_y:
+    push rcx
+    mov ecx, 8
+.loop_x:
+    mov [rdi], eax
+    add rdi, 4
+    loop .loop_x
+    add rdi, rbx
+    sub rdi, 32
+    pop rcx
+    loop .loop_y
+    
+.no_debug_pixel:
+    mov rax, KERNEL_PHYS_ADDR
+    jmp rax
 
-    ; Saltar al kernel
-    jmp 0x08:0x10000
-
-kernel_missing:
-    mov edi, 0xB8000
-    mov esi, error_no_kernel
-    mov ah, 0x4F
-.loop:
-    lodsb
-    test al, al
-    jz .hang
-    stosw
-    jmp .loop
-.hang:
-    cli
-    hlt
-    jmp .hang
-
-error_no_kernel db "NO KERNEL!", 0
-
+; Pad to exactly 64 sectors (512*64 bytes) — use DEFAULT ABS explicitly
+DEFAULT ABS
 times (512*64)-($-$$) db 0

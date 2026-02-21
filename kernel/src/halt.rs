@@ -1,11 +1,8 @@
-// halt.rs
+// kernel/src/halt.rs
 use core::arch::asm;
 
 pub fn halt_loop() -> ! {
     loop {
-        unsafe {
-            asm!("cli");
-            asm!("hlt");
-        }
+        unsafe { asm!("cli; hlt", options(nostack, nomem)); }
     }
-}
+}   

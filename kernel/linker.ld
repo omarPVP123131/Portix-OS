@@ -1,42 +1,40 @@
-/* linker.ld - Linker script corregido para Portix */
-ENTRY(_start)
+    /* kernel/linker.ld - PORTIX v3 */
+    OUTPUT_FORMAT("elf64-x86-64")
+    OUTPUT_ARCH(i386:x86-64)
+    ENTRY(_start)
 
-SECTIONS
-{
-    /* Cargar el kernel en 0x10000 (como lo espera stage2.asm) */
-    . = 0x10000;
+    SECTIONS
+    {
+        . = 0x10000;
 
-    /* .text: código (incluye _start) */
-    .text : ALIGN(4) {
-        PROVIDE(__text_start = .);
-        *(.text._start)
-        *(.text._start.*)
-        *(.text*)
-        PROVIDE(__text_end = .);
+        .text : ALIGN(16) {
+            KEEP(*(.text._start))
+            *(.text .text.*)
+        }
+
+        .rodata : ALIGN(16) {
+            *(.rodata .rodata.*)
+        }
+
+        .data : ALIGN(16) {
+            *(.data .data.*)
+        }
+
+        .bss : ALIGN(16) {
+            __bss_start = .;
+            *(.bss .bss.*)
+            *(COMMON)
+            . = ALIGN(16);
+            __bss_end = .;
+        }
+
+        __kernel_end = .;
+
+        /DISCARD/ : {
+            *(.eh_frame)
+            *(.eh_frame_hdr)
+            *(.note .note.*)
+            *(.comment)
+            *(.gcc_except_table)
+        }
     }
-
-    /* .rodata: datos constantes */
-    .rodata : ALIGN(4) {
-        *(.rodata*)
-        *(.rodata.*)
-    }
-
-    /* .data: variables inicializadas */
-    .data : ALIGN(4) {
-        PROVIDE(__data_start = .);
-        *(.data*)
-        *(.data.*)
-        PROVIDE(__data_end = .);
-    }
-
-    /* .bss: variables no inicializadas */
-    .bss (NOLOAD) : ALIGN(4) {
-        PROVIDE(__bss_start = .);
-        *(.bss*)
-        *(COMMON)
-        PROVIDE(__bss_end = .);
-    }
-
-    /* Evitar que se pierdan secciones de excepción de unwinding que no necesitamos */
-    /DISCARD/ : { *(.eh_frame) }
-}

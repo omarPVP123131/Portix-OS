@@ -1,0 +1,12 @@
+# Rust
+target/
+
+# Python
+__pycache__/
+*.pyc
+
+# VSCode
+.vscode/
+
+# logs
+*.log

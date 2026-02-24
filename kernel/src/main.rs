@@ -1,16 +1,25 @@
-// kernel/src/main.rs — PORTIX Kernel v0.7.2
+// kernel/src/main.rs — PORTIX Kernel v0.7.4
 //
-// CORRECCIONES vs v0.7.1:
-//   - Tabs: solo se cambian con CLIC (left_clicked), NO con hover.
-//     El hover ahora es solo un efecto visual muy sutil (texto más brillante).
-//   - Scrollbar: ahora es arrastrable con el mouse.
-//     Ancho aumentado a 12px para ser clickable cómodamente.
-//     Cálculo de max_scroll corregido usando term.max_scroll() que respeta
-//     el ring-buffer (no excede TERM_ROWS líneas disponibles).
-//   - Scroll: SOLO ocurre desde rueda del mouse (scroll_delta) o teclado.
-//     Nunca desde movimiento en Y del cursor.
-//   - visible_range: ahora usa term.line_at(start + i) correctamente.
-//   - Anti-flicker: present() limitado a RENDER_HZ (30 Hz) como antes.
+// CORRECCIÓN ARQUITECTURAL: Drenado unificado del buffer PS/2
+//
+// El bug raíz no era `if let` vs `while let`. Era que kbd.poll() y ms.poll()
+// compiten por el mismo registro de hardware (0x60) y se borran bytes
+// mutuamente:
+//
+//   kbd.poll(): si encuentra byte de ratón → inb(0x60) lo consume → return None
+//   ms.poll():  loop interno → si byte es de teclado → lo consume → continue
+//
+// Con `if let`: ms.poll() borraba los scancodes no leídos → teclado sordo
+// Con `while let`: kbd.poll() al ver byte de ratón lo borraba y paraba
+//                  → ms.poll() no lo encontraba → ratón muerto
+//
+// SOLUCIÓN: drenar el buffer PS/2 UNA sola vez por frame en main, clasificando
+// cada byte por el bit AUXB (bit 5 del registro de estado 0x64):
+//   AUXB = 0 → byte de teclado → cola kbd[]
+//   AUXB = 1 → byte de ratón  → cola ms[]
+// Luego procesar cada cola de forma independiente con feed_byte() / feed().
+// Ninguno de los dos drivers toca 0x60 directamente durante el frame.
+
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
@@ -66,19 +75,24 @@ global_asm!(
     RUST_MAIN = sym rust_main,
 );
 
-// ── Configuración de render ───────────────────────────────────────────────────
 const RENDER_HZ:       u64 = 30;
-const RENDER_INTERVAL: u64 = 100 / RENDER_HZ; // ticks entre presents al LFB
-
-// ── Scrollbar (terminal) ──────────────────────────────────────────────────────
-/// Ancho de la barra lateral de scroll en píxeles
+const RENDER_INTERVAL: u64 = 100 / RENDER_HZ;
 const SCROLLBAR_W: usize = 12;
 
-// ── Tabs ──────────────────────────────────────────────────────────────────────
+// Puerto PS/2 — solo usado en el drain unificado de main
+const PS2_STATUS: u16 = 0x64;
+const PS2_DATA:   u16 = 0x60;
+
+#[inline(always)]
+unsafe fn ps2_inb(p: u16) -> u8 {
+    let v: u8;
+    core::arch::asm!("in al, dx", out("al") v, in("dx") p, options(nostack, nomem));
+    v
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab { System = 0, Terminal = 1, Devices = 2 }
 
-// ── Formato de números ────────────────────────────────────────────────────────
 fn fmt_u32<'a>(mut n: u32, buf: &'a mut [u8; 16]) -> &'a str {
     if n == 0 { buf[0] = b'0'; return core::str::from_utf8(&buf[..1]).unwrap_or("0"); }
     let mut i = 0usize;
@@ -149,98 +163,68 @@ fn fmt_uptime<'a>(buf: &'a mut [u8; 24]) -> &'a str {
     core::str::from_utf8(&buf[..pos]).unwrap_or("?")
 }
 
-// ── Section label ─────────────────────────────────────────────────────────────
 fn section_label(c: &mut Console, x: usize, y: usize, title: &str, w: usize) {
     c.fill_rounded(x, y, w, 14, 2, Color::new(4, 14, 30));
     c.hline(x, y + 13, w, Color::SEP_BRIGHT);
     c.write_at(title, x + 6, y + 3, Color::TEAL);
 }
 
-// ── Chrome ────────────────────────────────────────────────────────────────────
 fn draw_chrome(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
                active: Tab, mx: i32, my: i32) {
     let fw = lay.fw;
-
-    // Cabecera
     c.fill_rect(0, 0, fw, lay.header_h, Color::HEADER_BG);
     c.fill_rect(0, 0, 6, lay.header_h, Color::PORTIX_GOLD);
     c.fill_rect(6, 0, 2, lay.header_h, Color::new(180, 120, 0));
     c.write_at_tall("PORTIX", 16, lay.header_h / 2 - 8, Color::PORTIX_GOLD);
     c.write_at("v0.7", 16, lay.header_h / 2 + 9, Color::PORTIX_AMBER);
-
     let brand = hw.cpu.brand_str();
     let brand = if brand.len() > 38 { &brand[..38] } else { brand };
     let bx = fw / 2 - (brand.len() * 9) / 2;
     c.write_at(brand, bx, lay.header_h / 2 - 4, Color::CYAN);
-
     let bx = fw.saturating_sub(100);
     let by = (lay.header_h - 22) / 2;
     c.fill_rounded(bx, by, 92, 22, 4, Color::new(0, 40, 10));
     c.draw_rect(bx, by, 92, 22, 1, Color::new(0, 100, 30));
     c.write_at("● BOOT OK", bx + 8, by + 7, Color::GREEN);
-
-    // Línea dorada separadora
     c.fill_rect(0, lay.header_h, fw, lay.gold_h, Color::PORTIX_GOLD);
-
-    // ── Barra de tabs ─────────────────────────────────────────────────────────
-    //
-    // CORRECCIÓN: el hover solo cambia el COLOR del texto, NUNCA cambia la tab
-    // activa. El cambio de tab requiere un clic izquierdo (manejado en main).
     let ty = lay.tab_y;
     c.fill_rect(0, ty, fw, lay.tab_h + 2, Color::TAB_INACTIVE);
-
     let tw = lay.tab_w;
     let tab_data: &[(&str, Tab)] = &[
         (" F1  SISTEMA  ", Tab::System),
         (" F2  TERMINAL ", Tab::Terminal),
         (" F3  DISPOSITIVOS", Tab::Devices),
     ];
-
     for (i, &(label, tab)) in tab_data.iter().enumerate() {
         let tx = i * tw;
         let is_active = tab == active;
-
-        // Hover: solo comprobamos posición para efecto visual; NO cambia tab
         let hovered = !is_active
             && (mx as usize) >= tx && (mx as usize) < tx + tw
             && (my as usize) >= ty && (my as usize) < ty + lay.tab_h + 2;
-
         if is_active {
-            // Tab activa: barra dorada + fondo oscuro azul
             c.fill_rect(tx, ty, tw - 1, 2, Color::PORTIX_GOLD);
             c.fill_rect(tx, ty + 2, tw - 1, lay.tab_h, Color::TAB_ACTIVE);
         } else {
-            // Tab inactiva: fondo uniforme, SIN cambio de fondo en hover
-            // (evita la confusión visual de que "se seleccionó")
             c.fill_rect(tx, ty, tw - 1, lay.tab_h + 2, Color::TAB_INACTIVE);
         }
-
-        // Separador vertical entre tabs
         c.fill_rect(tx + tw - 1, ty, 1, lay.tab_h + 2, Color::SEPARATOR);
-
         let fy = ty + 2 + lay.tab_h / 2 - 4;
-        // Activa → dorado, hover → gris claro, inactiva → gris oscuro
         let fg = if is_active { Color::PORTIX_GOLD }
                  else if hovered { Color::LIGHT_GRAY }
                  else { Color::GRAY };
         c.write_at(label, tx + 4, fy, fg);
     }
-
-    // Pista de ayuda de teclado
     let hx = tab_data.len() * tw + 14;
     let hy = ty + lay.tab_h / 2 - 4 + 2;
     if hx + 320 < fw {
         c.write_at("CLIC=cambiar tab  ESC=limpiar  Rueda/RePag=scroll", hx, hy,
                    Color::new(28, 40, 56));
     }
-
-    // Barra de estado inferior
     let sy_bar = lay.bottom_y;
     c.fill_rect(0, sy_bar, fw, 2, Color::PORTIX_GOLD);
     let bar_h = lay.fh.saturating_sub(sy_bar + 2);
     c.fill_rect(0, sy_bar + 2, fw, bar_h, Color::HEADER_BG);
     let sy = sy_bar + 2 + bar_h / 2 - 4;
-
     c.write_at("PORTIX", 12, sy, Color::PORTIX_GOLD);
     c.write_at("v0.7", 66, sy, Color::PORTIX_AMBER);
     c.write_at("|", 102, sy, Color::SEP_BRIGHT);
@@ -252,11 +236,9 @@ fn draw_chrome(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
     let mut ut = [0u8; 24];
     c.write_at("Tiempo:", 238, sy, Color::GRAY);
     c.write_at(fmt_uptime(&mut ut), 298, sy, Color::LIGHT_GRAY);
-
     let mut mr = [0u8; 24];
     c.write_at("RAM:", fw.saturating_sub(140), sy, Color::GRAY);
     c.write_at(fmt_mib(hw.ram.usable_or_default(), &mut mr), fw.saturating_sub(100), sy, Color::PORTIX_GOLD);
-
     let mut bmx = [0u8; 16]; let mut bmy = [0u8; 16];
     let mxs = fmt_u32(mx.max(0) as u32, &mut bmx);
     let mys = fmt_u32(my.max(0) as u32, &mut bmy);
@@ -267,7 +249,6 @@ fn draw_chrome(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
     c.write_at(mys, mox + 28 + mxs.len() * 9 + 9, sy, Color::new(44, 60, 80));
 }
 
-// ── SYSTEM tab ────────────────────────────────────────────────────────────────
 fn draw_system_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
                    boot_lines: &[(&str, &str, Color)]) {
     let cy  = lay.content_y;
@@ -383,16 +364,6 @@ fn draw_system_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
     }
 }
 
-// ── TERMINAL tab — scrollbar arrastrable ─────────────────────────────────────
-//
-// La scrollbar es un rectángulo de SCROLLBAR_W píxeles de ancho en el borde
-// derecho del área de historial. El usuario puede:
-//   - Usar la rueda del mouse (scroll_delta)
-//   - Usar RePag/AvPag en el teclado
-//   - Hacer clic y arrastrar el thumb de la scrollbar
-//
-// CORRECCIÓN: el scroll NUNCA es causado por movimiento en Y del cursor.
-
 fn terminal_hist_geometry(lay: &Layout) -> (usize, usize, usize, usize) {
     let input_h  = 24usize;
     let input_y  = lay.bottom_y.saturating_sub(input_h + 4);
@@ -403,16 +374,12 @@ fn terminal_hist_geometry(lay: &Layout) -> (usize, usize, usize, usize) {
 }
 
 fn draw_terminal_tab(c: &mut Console, lay: &Layout,
-                     term: &terminal::Terminal,
-                     sb_dragging: bool) {
+                     term: &terminal::Terminal, sb_dragging: bool) {
     let cy  = lay.content_y;
     let ch  = lay.bottom_y.saturating_sub(cy);
     let fw  = lay.fw;
     let pad = lay.pad;
-
     c.fill_rect(0, cy, fw, ch, Color::TERM_BG);
-
-    // Barra de título del terminal
     c.fill_rect(0, cy, fw, 18, Color::new(2, 8, 18));
     c.hline(0, cy + 17, fw, Color::new(16, 32, 60));
     c.fill_rect(pad, cy + 4, 8, 8, Color::GREEN);
@@ -421,66 +388,39 @@ fn draw_terminal_tab(c: &mut Console, lay: &Layout,
     c.write_at("PORTIX TERMINAL v0.7", pad + 46, cy + 5, Color::PORTIX_AMBER);
     c.write_at("Rueda/RePag=scroll  ESC=limpiar",
                fw.saturating_sub(280), cy + 5, Color::new(32, 48, 68));
-
     let (hist_top, hist_h, input_y, max_lines) = terminal_hist_geometry(lay);
-
-    // Gutter izquierdo decorativo
     for y in (hist_top..input_y).step_by(2) {
         c.fill_rect(0, y, 3, 1, Color::new(0, 5, 10));
     }
-
-    // ── Scrollbar ─────────────────────────────────────────────────────────────
     let sb_x = fw.saturating_sub(SCROLLBAR_W);
-
     if term.line_count > max_lines {
-        // Fondo de la barra
         c.fill_rect(sb_x, hist_top, SCROLLBAR_W, hist_h, Color::new(4, 10, 20));
-
         let max_scroll = term.max_scroll(max_lines);
-
-        // Tamaño proporcional del thumb
         let available = term.line_count
             .saturating_sub(if term.line_count > terminal::TERM_ROWS {
                 term.line_count - terminal::TERM_ROWS
             } else { 0 });
-        let thumb_h = if available == 0 {
-            hist_h
-        } else {
-            (hist_h * max_lines / available).max(10).min(hist_h)
-        };
-
-        // Posición del thumb:
-        //   scroll_offset=0       → thumb al fondo
-        //   scroll_offset=max     → thumb arriba
+        let thumb_h = if available == 0 { hist_h }
+                      else { (hist_h * max_lines / available).max(10).min(hist_h) };
         let travel    = hist_h.saturating_sub(thumb_h);
-        let thumb_top = if max_scroll == 0 {
-            hist_top + travel  // siempre al fondo si no hay scroll disponible
-        } else {
-            let offset_clamped = term.scroll_offset.min(max_scroll);
-            // Mapear offset → posición: 0→abajo, max→arriba
-            hist_top + travel - (travel * offset_clamped / max_scroll)
+        let thumb_top = if max_scroll == 0 { hist_top + travel } else {
+            let oc = term.scroll_offset.min(max_scroll);
+            hist_top + travel - (travel * oc / max_scroll)
         };
-
-        // Color del thumb: dorado si arrastrando, cyan si en reposo al fondo
         let thumb_col = if sb_dragging { Color::PORTIX_GOLD }
                         else if term.at_bottom() { Color::TEAL }
                         else { Color::PORTIX_AMBER };
-        c.fill_rect(sb_x,     thumb_top, 2,           thumb_h, Color::new(8, 20, 40));
+        c.fill_rect(sb_x,     thumb_top, 2,               thumb_h, Color::new(8, 20, 40));
         c.fill_rect(sb_x + 2, thumb_top, SCROLLBAR_W - 4, thumb_h, thumb_col);
         c.fill_rect(sb_x + SCROLLBAR_W - 2, thumb_top, 2, thumb_h, Color::new(8, 20, 40));
-
-        // Badge "[↑ SCROLL]" cuando no estamos al fondo
         if !term.at_bottom() {
             let bx = sb_x.saturating_sub(82);
             c.fill_rounded(bx, hist_top + 4, 78, 14, 3, Color::new(20, 40, 0));
             c.write_at("arrib SCROLL", bx + 4, hist_top + 6, Color::PORTIX_GOLD);
         }
     } else {
-        // No hay contenido suficiente para scroll: barra atenuada
         c.fill_rect(sb_x, hist_top, SCROLLBAR_W, hist_h, Color::new(2, 6, 12));
     }
-
-    // ── Historial — usando line_at(start + i) para índice lógico correcto ────
     let (start, count) = term.visible_range(max_lines);
     let text_area_w = sb_x.saturating_sub(pad + 4);
     for i in 0..count {
@@ -504,25 +444,19 @@ fn draw_terminal_tab(c: &mut Console, lay: &Layout,
         }
         c.write_at(s, pad + 4, ly, col);
     }
-
-    // ── Área de input ─────────────────────────────────────────────────────────
     c.fill_rect(0, input_y - 2, fw, 2, Color::new(12, 28, 52));
     c.fill_rect(0, input_y, fw, 24, Color::new(2, 10, 22));
-
     let prompt = "PORTIX> ";
     c.write_at(prompt, pad, input_y + 8, Color::PORTIX_GOLD);
     let ix = pad + prompt.len() * 9;
     let input_str = core::str::from_utf8(&term.input[..term.input_len]).unwrap_or("");
     c.write_at(input_str, ix, input_y + 8, Color::WHITE);
-
-    // Cursor parpadeante
     let cur_x = ix + term.input_len * 9;
     if term.cursor_vis && cur_x + 7 < sb_x {
         c.fill_rect(cur_x, input_y + 6, 7, 13, Color::PORTIX_GOLD);
     }
 }
 
-// ── DEVICES tab ───────────────────────────────────────────────────────────────
 fn draw_devices_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
                     pci: &pci::PciBus) {
     let cy  = lay.content_y;
@@ -533,11 +467,8 @@ fn draw_devices_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
     c.fill_rect(0, cy, fw, 18, Color::new(2, 8, 18));
     c.hline(0, cy + 17, fw, Color::SEP_BRIGHT);
     c.write_at(" DISPOSITIVOS Y HARDWARE", pad, cy + 5, Color::PORTIX_AMBER);
-
     let col_w    = fw / 3;
     let ry_start = cy + 24;
-
-    // ── Columna 1: CPU + Pantalla ──────────────────────────────────────────
     let c1x = pad;
     let c1w = col_w - pad * 2;
     let mut ry = ry_start;
@@ -577,8 +508,6 @@ fn draw_devices_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
         c.write_at("(DblBuf@0x600000)", c1x+4, ry+lay.line_h, Color::new(28,40,56));
         let _ = ry;
     }
-
-    // ── Columna 2: Almacenamiento + Entrada ───────────────────────────────
     let c2x = col_w;
     let mut c2y = ry_start;
     section_label(c, c2x, c2y, " ALMACENAMIENTO", col_w-8); c2y += 20;
@@ -613,8 +542,6 @@ fn draw_devices_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
     c.write_at("Rueda scroll:", c2x+4, c2y, Color::GRAY);
     c.fill_rounded(c2x+116, c2y-2, 76, 13, 3, Color::new(0,30,8));
     c.write_at("● IntelliMouse", c2x+120, c2y, Color::NEON_GREEN);
-
-    // ── Columna 3: PCI ─────────────────────────────────────────────────────
     let c3x = col_w * 2;
     let c3w = fw.saturating_sub(c3x + pad);
     let mut c3y = ry_start;
@@ -645,7 +572,6 @@ fn draw_devices_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
     }
 }
 
-// ── Pantalla de excepción ─────────────────────────────────────────────────────
 fn draw_exception(c: &mut Console, title: &str, info: &str) {
     let w = c.width(); let h = c.height();
     c.fill_rect(0, 0, w, h, Color::new(0, 0, 60));
@@ -667,23 +593,17 @@ fn draw_exception(c: &mut Console, title: &str, info: &str) {
 #[no_mangle]
 extern "C" fn rust_main() -> ! {
     unsafe { idt::init_idt(); }
-
     serial::init();
-    serial::log("PORTIX", "kernel v0.7.2 iniciando");
-
+    serial::log("PORTIX", "kernel v0.7.4 iniciando");
     pit::init();
     serial::log("PIT", "temporizador 100 Hz inicializado");
-
     let hw  = hardware::HardwareInfo::detect_all();
     serial::log("HW", hw.cpu.brand_str());
-
     let pci = pci::PciBus::scan();
     {
         let mut t = [0u8; 16];
         let s = fmt_u32(pci.count as u32, &mut t);
-        serial::write_str("PCI: ");
-        serial::write_str(s);
-        serial::write_str(" dispositivos\n");
+        serial::write_str("PCI: "); serial::write_str(s); serial::write_str(" dispositivos\n");
     }
 
     let mut kbd = keyboard::KeyboardState::new();
@@ -693,47 +613,36 @@ extern "C" fn rust_main() -> ! {
 
     ms.init(lay.fw.max(1), lay.fh.max(1));
     if ms.present {
-        let wstr = if ms.has_wheel { "raton PS/2 + rueda (IntelliMouse)" }
-                   else            { "raton PS/2 (sin rueda)" };
-        serial::log("MOUSE", wstr);
+        serial::log("MOUSE", if ms.has_wheel { "PS/2 + rueda" } else { "PS/2 sin rueda" });
     }
 
     let mut term = terminal::Terminal::new();
-    term.write_line("PORTIX v0.7.2  Kernel Bare-Metal  [Doble Buffer + Scroll Corregido]", LineColor::Header);
-    term.write_line("Escribe 'ayuda' para ver comandos. Rueda=scroll. Clic en tabs para cambiar.", LineColor::Info);
-    if ms.has_wheel {
-        term.write_line("  Rueda de scroll detectada (IntelliMouse).", LineColor::Success);
-    } else {
-        term.write_line("  Sin rueda. Usa RePag/AvPag para desplazarte.", LineColor::Warning);
-    }
+    term.write_line("PORTIX v0.7.4  Kernel Bare-Metal", LineColor::Header);
+    term.write_line("Escribe 'ayuda' para comandos. Rueda=scroll. Clic en tabs para cambiar.", LineColor::Info);
     term.write_empty();
 
     let mut tab = Tab::System;
-
-    // ── Estado del arrastre de scrollbar ─────────────────────────────────────
     let mut sb_dragging:    bool  = false;
-    let mut sb_drag_y:      i32   = 0;   // Y donde empezó el drag
-    let mut sb_drag_offset: usize = 0;   // scroll_offset al inicio del drag
-
-    // ── Timers ────────────────────────────────────────────────────────────────
+    let mut sb_drag_y:      i32   = 0;
+    let mut sb_drag_offset: usize = 0;
     let mut last_blink_tick  = 0u64;
     let mut last_render_tick = 0u64;
     let mut needs_draw    = true;
     let mut needs_present = true;
 
     let boot_lines: &[(&str, &str, Color)] = &[
-        ("  OK  ", "Modo largo (64-bit) activo",             Color::GREEN),
-        ("  OK  ", "GDT + TSS cargados",                     Color::GREEN),
-        ("  OK  ", "IDT configurada (0-19 + IRQ)",           Color::GREEN),
-        ("  OK  ", "PIC remapeado, IRQ0 habilitado",         Color::GREEN),
-        ("  OK  ", "PIT @ 100 Hz",                           Color::GREEN),
-        ("  OK  ", "Teclado PS/2 inicializado",              Color::GREEN),
-        ("  OK  ", "Raton PS/2 inicializado",                Color::GREEN),
-        ("  OK  ", "Escaneo de discos ATA completo",         Color::GREEN),
-        ("  OK  ", "Framebuffer VESA activo",                Color::GREEN),
-        ("  OK  ", "Doble buffer @ 0x600000",                Color::GREEN),
-        ("  OK  ", "Bus PCI escaneado",                      Color::GREEN),
-        ("  OK  ", "Serial COM1 @ 38400 baud",               Color::GREEN),
+        ("  OK  ", "Modo largo (64-bit) activo",     Color::GREEN),
+        ("  OK  ", "GDT + TSS cargados",             Color::GREEN),
+        ("  OK  ", "IDT configurada (0-19 + IRQ)",   Color::GREEN),
+        ("  OK  ", "PIC remapeado, IRQ0 habilitado", Color::GREEN),
+        ("  OK  ", "PIT @ 100 Hz",                   Color::GREEN),
+        ("  OK  ", "Teclado PS/2 inicializado",      Color::GREEN),
+        ("  OK  ", "Raton PS/2 inicializado",        Color::GREEN),
+        ("  OK  ", "Escaneo de discos ATA completo", Color::GREEN),
+        ("  OK  ", "Framebuffer VESA activo",        Color::GREEN),
+        ("  OK  ", "Doble buffer @ 0x600000",        Color::GREEN),
+        ("  OK  ", "Bus PCI escaneado",              Color::GREEN),
+        ("  OK  ", "Serial COM1 @ 38400 baud",       Color::GREEN),
     ];
 
     c.clear(Color::PORTIX_BG);
@@ -741,88 +650,136 @@ extern "C" fn rust_main() -> ! {
     loop {
         let now = pit::ticks();
 
-        // ── Teclado (primero, antes del mouse) ────────────────────────────────
-        if let Some(key) = kbd.poll() {
-            needs_draw = true;
-            match key {
-                Key::F1  => tab = Tab::System,
-                Key::F2  => tab = Tab::Terminal,
-                Key::F3  => tab = Tab::Devices,
-                Key::Tab => {
-                    tab = match tab {
-                        Tab::System   => Tab::Terminal,
-                        Tab::Terminal => Tab::Devices,
-                        Tab::Devices  => Tab::System,
-                    };
+        // ════════════════════════════════════════════════════════════════════
+        // DRENADO UNIFICADO DEL BUFFER PS/2
+        // ════════════════════════════════════════════════════════════════════
+        //
+        // El controlador 8042 tiene UN SOLO registro de datos (0x60) compartido
+        // entre teclado y ratón. El bit AUXB (bit 5 del registro de estado 0x64)
+        // indica el origen del byte disponible:
+        //   AUXB = 0 → teclado
+        //   AUXB = 1 → ratón
+        //
+        // Si kbd.poll() y ms.poll() leen 0x60 de forma independiente, compiten:
+        //   kbd.poll() puede consumir bytes de ratón y descartarlos
+        //   ms.poll()  puede consumir bytes de teclado y descartarlos
+        //
+        // SOLUCIÓN: leer 0x60 UNA sola vez aquí, enrutar por AUXB, y pasar
+        // los bytes ya clasificados a cada driver mediante feed_byte() / feed().
+        // Ningún driver toca el hardware durante el procesamiento del frame.
+        // ════════════════════════════════════════════════════════════════════
+
+        // Colas por dispositivo. 32 bytes cada una: el 8042 tiene buffer de 1
+        // byte, pero con interrupciones activas o latencia alta puede acumular
+        // varios. 32 es suficiente para cualquier ráfaga realista.
+        let mut kbd_buf = [0u8; 32];
+        let mut kbd_n   = 0usize;
+        let mut ms_buf  = [0u8; 32];
+        let mut ms_n    = 0usize;
+
+        unsafe {
+            loop {
+                let st = ps2_inb(PS2_STATUS);
+                if st & 0x01 == 0 { break; }   // buffer vacío: salir
+                let byte = ps2_inb(PS2_DATA);   // leer UNA VEZ
+                if st & 0x20 != 0 {
+                    // Byte de ratón (AUXB = 1)
+                    if ms_n < 32 { ms_buf[ms_n] = byte; ms_n += 1; }
+                } else {
+                    // Byte de teclado (AUXB = 0)
+                    if kbd_n < 32 { kbd_buf[kbd_n] = byte; kbd_n += 1; }
                 }
-                Key::PageUp if tab == Tab::Terminal => {
-                    let (_, _, _, max_lines) = terminal_hist_geometry(&lay);
-                    term.scroll_up(10, max_lines);
-                }
-                Key::PageDown if tab == Tab::Terminal => {
-                    term.scroll_down(10);
-                }
-                Key::Home if tab == Tab::Terminal => {
-                    let (_, _, _, max_lines) = terminal_hist_geometry(&lay);
-                    term.scroll_up(usize::MAX / 2, max_lines);
-                }
-                Key::End if tab == Tab::Terminal => {
-                    term.scroll_to_bottom();
-                }
-                Key::Char(ch) if tab == Tab::Terminal => {
-                    term.type_char(ch);
-                    serial::write_byte(ch);
-                }
-                Key::Backspace if tab == Tab::Terminal => term.backspace(),
-                Key::Enter if tab == Tab::Terminal => {
-                    serial::write_byte(b'\n');
-                    term.enter(&hw, &pci);
-                }
-                Key::Escape => {
-                    if tab == Tab::Terminal {
-                        term.clear_history();
-                        term.clear_input();
-                    }
-                    sb_dragging = false;
-                }
-                _ => {}
             }
         }
 
-        // ── Mouse (después del teclado) ───────────────────────────────────────
-        let mouse_changed = ms.present && ms.poll();
+        // ── Procesar cola de teclado ──────────────────────────────────────
+        for i in 0..kbd_n {
+            if let Some(key) = kbd.feed_byte(kbd_buf[i]) {
+                needs_draw = true;
+                match key {
+                    Key::F1  => tab = Tab::System,
+                    Key::F2  => tab = Tab::Terminal,
+                    Key::F3  => tab = Tab::Devices,
+                    Key::Tab => {
+                        tab = match tab {
+                            Tab::System   => Tab::Terminal,
+                            Tab::Terminal => Tab::Devices,
+                            Tab::Devices  => Tab::System,
+                        };
+                    }
+                    Key::PageUp if tab == Tab::Terminal => {
+                        let (_, _, _, ml) = terminal_hist_geometry(&lay);
+                        term.scroll_up(10, ml);
+                    }
+                    Key::PageDown if tab == Tab::Terminal => {
+                        term.scroll_down(10);
+                    }
+                    Key::Home if tab == Tab::Terminal => {
+                        let (_, _, _, ml) = terminal_hist_geometry(&lay);
+                        term.scroll_up(usize::MAX / 2, ml);
+                    }
+                    Key::End if tab == Tab::Terminal => {
+                        term.scroll_to_bottom();
+                    }
+                    Key::Char(ch) if tab == Tab::Terminal => {
+                        term.type_char(ch);
+                        serial::write_byte(ch);
+                    }
+                    Key::Backspace if tab == Tab::Terminal => term.backspace(),
+                    Key::Enter if tab == Tab::Terminal => {
+                        serial::write_byte(b'\n');
+                        term.enter(&hw, &pci);
+                    }
+                    Key::Escape => {
+                        if tab == Tab::Terminal {
+                            term.clear_history();
+                            term.clear_input();
+                        }
+                        sb_dragging = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Procesar cola de ratón ────────────────────────────────────────
+        let mouse_changed = if ms.present && ms_n > 0 {
+            ms.begin_frame();
+            let mut changed = false;
+            for i in 0..ms_n {
+                if ms.feed(ms_buf[i]) { changed = true; }
+            }
+            // Reset inteligente si hay demasiados errores acumulados
+            if ms.error_count >= 25 { ms.intelligent_reset(); }
+            changed
+        } else {
+            false
+        };
+
         if mouse_changed { needs_draw = true; }
 
-        let fw = lay.fw;
+        // ── Lógica de UI con ratón ────────────────────────────────────────
+        let fw  = lay.fw;
         let sb_x = fw.saturating_sub(SCROLLBAR_W) as i32;
 
-        // ── Fin de drag si se soltó el botón ─────────────────────────────────
         if sb_dragging && (ms.left_released() || !ms.left_btn()) {
             sb_dragging = false;
             needs_draw  = true;
         }
 
-        // ── Drag activo de scrollbar ──────────────────────────────────────────
         if sb_dragging && ms.left_btn() && tab == Tab::Terminal {
-            let (hist_top, hist_h, _, max_lines) = terminal_hist_geometry(&lay);
+            let (_, hist_h, _, max_lines) = terminal_hist_geometry(&lay);
             let max_scroll = term.max_scroll(max_lines);
-
             if max_scroll > 0 {
                 let available = term.line_count
                     .saturating_sub(if term.line_count > terminal::TERM_ROWS {
                         term.line_count - terminal::TERM_ROWS
                     } else { 0 });
-                let thumb_h = if available == 0 {
-                    hist_h
-                } else {
-                    (hist_h * max_lines / available).max(10).min(hist_h)
-                };
+                let thumb_h = if available == 0 { hist_h }
+                              else { (hist_h * max_lines / available).max(10).min(hist_h) };
                 let travel = hist_h.saturating_sub(thumb_h) as i32;
-
                 if travel > 0 {
-                    // Mover thumb: dy negativo (arriba) → offset crece (scroll up)
                     let dy = ms.y - sb_drag_y;
-                    // Cuando dy < 0 (arriba), offset debe aumentar → -dy * max / travel
                     let new_offset = sb_drag_offset as i32 - (dy * max_scroll as i32) / travel;
                     term.scroll_offset = new_offset.max(0).min(max_scroll as i32) as usize;
                 }
@@ -830,17 +787,13 @@ extern "C" fn rust_main() -> ! {
             needs_draw = true;
         }
 
-        // ── Clic izquierdo ────────────────────────────────────────────────────
         if mouse_changed && ms.left_clicked() {
-            // 1. ¿Clic en la scrollbar? → iniciar drag
             if tab == Tab::Terminal && ms.x >= sb_x {
                 sb_dragging    = true;
                 sb_drag_y      = ms.y;
                 sb_drag_offset = term.scroll_offset;
                 needs_draw     = true;
-            }
-            // 2. ¿Clic en una tab? → cambiar tab (SOLO aquí, no en hover)
-            else {
+            } else {
                 let hit = lay.tab_hit(ms.x, ms.y);
                 match hit {
                     0 => { tab = Tab::System;   needs_draw = true; }
@@ -851,30 +804,21 @@ extern "C" fn rust_main() -> ! {
             }
         }
 
-        // ── Scroll con rueda — SOLO desde scroll_delta, NUNCA desde Y ─────────
-        //
-        // CORRECCIÓN: este bloque se activa ÚNICAMENTE cuando scroll_delta != 0,
-        // que a su vez solo se activa cuando la rueda fue girada (Z == ±1).
-        // El movimiento en Y del cursor NO afecta scroll_delta gracias al mouse.rs
-        // corregido, por lo que este bloque NUNCA se ejecuta por movimiento Y.
         if mouse_changed && ms.scroll_delta != 0 && tab == Tab::Terminal && !sb_dragging {
-            let (_, _, _, max_lines) = terminal_hist_geometry(&lay);
-            if ms.scroll_delta > 0 {
-                term.scroll_up(terminal::SCROLL_STEP, max_lines);
-            } else {
-                term.scroll_down(terminal::SCROLL_STEP);
-            }
+            let (_, _, _, ml) = terminal_hist_geometry(&lay);
+            if ms.scroll_delta > 0 { term.scroll_up(terminal::SCROLL_STEP, ml); }
+            else                   { term.scroll_down(terminal::SCROLL_STEP); }
             needs_draw = true;
         }
 
-        // ── Cursor parpadeante @ 500ms ────────────────────────────────────────
+        // ── Cursor parpadeante ────────────────────────────────────────────
         if now.wrapping_sub(last_blink_tick) >= 50 {
             last_blink_tick = now;
             term.cursor_vis = !term.cursor_vis;
             if tab == Tab::Terminal { needs_draw = true; }
         }
 
-        // ── Render ────────────────────────────────────────────────────────────
+        // ── Render ────────────────────────────────────────────────────────
         if needs_draw {
             draw_chrome(&mut c, &lay, &hw, tab, ms.x, ms.y);
             match tab {
@@ -887,7 +831,6 @@ extern "C" fn rust_main() -> ! {
             needs_present = true;
         }
 
-        // Blit al LFB limitado a RENDER_HZ para evitar flicker
         if needs_present && now.wrapping_sub(last_render_tick) >= RENDER_INTERVAL {
             c.present();
             last_render_tick = now;
@@ -905,14 +848,10 @@ extern "C" fn rust_main() -> ! {
     halt_loop()
 }
 #[no_mangle] extern "C" fn isr_bound_range() {
-    let mut c = Console::new();
-    draw_exception(&mut c, "#BR  RANGO EXCEDIDO", "Indice fuera de rango.");
-    halt_loop()
+    let mut c = Console::new(); draw_exception(&mut c, "#BR  RANGO EXCEDIDO", "Indice fuera de rango."); halt_loop()
 }
 #[no_mangle] extern "C" fn isr_ud_handler() {
-    let mut c = Console::new();
-    draw_exception(&mut c, "#UD  OPCODE INVALIDO", "Se intento ejecutar una instruccion no definida.");
-    halt_loop()
+    let mut c = Console::new(); draw_exception(&mut c, "#UD  OPCODE INVALIDO", "Instruccion no definida."); halt_loop()
 }
 #[no_mangle] extern "C" fn isr_double_fault() {
     unsafe {
@@ -928,8 +867,7 @@ extern "C" fn rust_main() -> ! {
     let mut c = Console::new();
     let w=c.width(); let h=c.height();
     c.fill_rect(0,0,w,h,Color::new(0,0,60));
-    c.fill_rect(0,0,w,4,Color::RED);
-    c.fill_rect(0,h-4,w,4,Color::RED);
+    c.fill_rect(0,0,w,4,Color::RED); c.fill_rect(0,h-4,w,4,Color::RED);
     c.write_at("#GP  FALLO DE PROTECCION GENERAL", 60, 64, Color::WHITE);
     let mut buf=[0u8;18];
     c.write_at("Codigo de error:", 60, 84, Color::GRAY);
@@ -942,8 +880,7 @@ extern "C" fn rust_main() -> ! {
     let mut c = Console::new();
     let w=c.width(); let h=c.height();
     c.fill_rect(0,0,w,h,Color::new(0,0,60));
-    c.fill_rect(0,0,w,4,Color::RED);
-    c.fill_rect(0,h-4,w,4,Color::RED);
+    c.fill_rect(0,0,w,4,Color::RED); c.fill_rect(0,h-4,w,4,Color::RED);
     c.write_at("#PF  FALLO DE PAGINA", 60, 64, Color::WHITE);
     let mut ba=[0u8;18]; let mut be=[0u8;18];
     c.write_at("CR2:", 60, 84, Color::GRAY); c.write_at(fmt_hex(cr2,&mut ba), 100, 84, Color::YELLOW);
@@ -951,9 +888,7 @@ extern "C" fn rust_main() -> ! {
     c.present(); halt_loop()
 }
 #[no_mangle] extern "C" fn isr_generic_handler() {
-    let mut c = Console::new();
-    draw_exception(&mut c, "FALLO DE CPU", "Excepcion de CPU no manejada.");
-    halt_loop()
+    let mut c = Console::new(); draw_exception(&mut c, "FALLO DE CPU", "Excepcion no manejada."); halt_loop()
 }
 
 #[panic_handler]
@@ -961,8 +896,7 @@ fn panic(info: &PanicInfo) -> ! {
     let mut c = Console::new();
     let w=c.width(); let h=c.height();
     c.fill_rect(0,0,w,h,Color::new(50,0,0));
-    c.fill_rect(0,0,w,4,Color::RED);
-    c.fill_rect(0,h-4,w,4,Color::RED);
+    c.fill_rect(0,0,w,4,Color::RED); c.fill_rect(0,h-4,w,4,Color::RED);
     c.write_at("*** PANIC DE KERNEL ***", w/2-110, 16, Color::RED);
     if let Some(loc) = info.location() {
         c.write_at("Archivo:", 60, 64, Color::GRAY);
@@ -975,7 +909,6 @@ fn panic(info: &PanicInfo) -> ! {
     c.present(); halt_loop()
 }
 
-// ── Stubs de libc ─────────────────────────────────────────────────────────────
 #[no_mangle] pub unsafe extern "C" fn memset(s: *mut u8, cv: i32, n: usize) -> *mut u8 {
     for i in 0..n { core::ptr::write_volatile(s.add(i), cv as u8); } s
 }

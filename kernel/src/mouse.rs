@@ -1,25 +1,25 @@
-// kernel/src/mouse.rs — PORTIX PS/2 Mouse Driver v6.1 (Intelligent Edition)
+// kernel/src/mouse.rs — PORTIX PS/2 Mouse Driver v6.3
 //
-// CAMBIOS:
-//   - Añadido campo 'resets' para telemetría.
-//   - Constructor 'new()' corregido y completo.
-//   - Filtro de "Bit 3" + Timeout de ráfaga (2 ticks).
-//   - Intelligent Reset: cura el driver sin colgar el kernel.
-//   - Movimiento clamp y detección de saltos físicos imposibles.
+// CAMBIOS vs v6.2:
+//   - feed() ahora es pub — el drenado unificado de main lo llama directamente.
+//   - intelligent_reset() ahora es pub — main necesita llamarlo tras el drain.
+//   - begin_frame() nuevo: separa "inicio de ciclo de poll" de la lectura HW.
+//     Antes poll() hacía ambas cosas; ahora el drenado unificado de main
+//     llama begin_frame() + feed(byte) por cada byte de ratón que encuentra.
+//   - poll() eliminado: ya no tiene sentido con el drenado unificado.
+//     Si se necesita compatibilidad temporal, se puede mantener pero NO debe
+//     coexistir con el drenado unificado o habrá doble lectura del buffer.
 
 #![allow(dead_code)]
 use crate::pit;
 
-// --- Puertos I/O del Controlador 8042 ---
 const PS2_DATA:   u16 = 0x60;
 const PS2_STATUS: u16 = 0x64;
 const PS2_CMD:    u16 = 0x64;
 
-// --- Parámetros del Filtro Inteligente ---
-const TELEPORT_THRESHOLD: i32 = 120; // Píxeles máximos permitidos por paquete
-const ERROR_LIMIT: u32 = 25;         // Errores acumulados antes de resetear hardware
+const TELEPORT_THRESHOLD: i32 = 120;
+const ERROR_LIMIT: u32 = 25;
 
-// --- Utilidades de bajo nivel ---
 #[inline(always)] unsafe fn inb(p: u16) -> u8 {
     let v: u8;
     core::arch::asm!("in al, dx", out("al") v, in("dx") p, options(nostack, nomem));
@@ -65,16 +65,15 @@ unsafe fn mouse_cmd_arg(cmd: u8, arg: u8) -> bool {
     inb(PS2_DATA) == 0xFA
 }
 
-// --- Estado del Ratón ---
 pub struct MouseState {
     pub x: i32,
     pub y: i32,
     pub buttons: u8,
     pub prev_buttons: u8,
-    
+
     pkt: [u8; 3],
     pkt_idx: u8,
-    last_tick: u64, 
+    last_tick: u64,
 
     pub max_x: i32,
     pub max_y: i32,
@@ -82,14 +81,12 @@ pub struct MouseState {
     pub has_wheel: bool,
     pub scroll_delta: i32,
 
-    // Monitor de salud y telemetría
     pub error_count: u32,
     pub resets: u32,
     last_reset_tick: u64,
 }
 
 impl MouseState {
-    /// Crea una nueva instancia del estado del ratón (necesaria para el kernel)
     pub const fn new() -> Self {
         Self {
             x: 400, y: 300,
@@ -106,101 +103,30 @@ impl MouseState {
         }
     }
 
-    /// Inicializa el hardware PS/2 en modo estándar (3 bytes)
-    pub fn init(&mut self, sw: usize, sh: usize) -> bool {
-        self.max_x = (sw as i32).saturating_sub(1);
-        self.max_y = (sh as i32).saturating_sub(1);
-        self.x = self.max_x / 2;
-        self.y = self.max_y / 2;
-        self.has_wheel = false; 
-
-        unsafe {
-            drain_kbc();
-            wait_write(); outb(PS2_CMD, 0xA8); // Activar puerto auxiliar
-            
-            // Habilitar IRQ12 en el Command Byte
-            wait_write(); outb(PS2_CMD, 0x20);
-            if !wait_read() { return false; }
-            let cfg = inb(PS2_DATA);
-            wait_write(); outb(PS2_CMD, 0x60);
-            wait_write(); outb(PS2_DATA, (cfg | 0x02) & !0x20);
-
-            mouse_cmd(0xF6); // Set Defaults
-            mouse_cmd_arg(0xF3, 100); // Sample Rate 100Hz
-            if !mouse_cmd(0xF4) { return false; } // Enable Streaming
-
-            drain_kbc();
-            self.present = true;
-            true
-        }
-    }
-
-    /// Limpia el controlador y re-habilita el ratón tras un desync grave
-    fn intelligent_reset(&mut self) {
-        let now = pit::ticks();
-        // Protección contra bucles de reset (máximo 1 cada segundo)
-        if now.saturating_sub(self.last_reset_tick) < 100 { return; }
-
-        unsafe {
-            drain_kbc();
-            mouse_cmd(0xF6); // Reset a defaults
-            mouse_cmd(0xF4); // Re-habilitar
-            drain_kbc();
-        }
-
-        self.resets += 1;
-        self.error_count = 0;
-        self.pkt_idx = 0;
-        self.last_reset_tick = now;
-    }
-
-    /// Función principal de lectura de datos
-    pub fn poll(&mut self) -> bool {
-        self.scroll_delta = 0;
+    /// Llamar UNA VEZ al inicio de cada frame, antes de feed().
+    /// Guarda el estado de botones del frame anterior y resetea scroll_delta.
+    /// Antes esto lo hacía poll() internamente; ahora el drenado unificado
+    /// de main lo llama explícitamente.
+    pub fn begin_frame(&mut self) {
         self.prev_buttons = self.buttons;
-        let mut changed = false;
-        let current_tick = pit::ticks();
-
-        unsafe {
-            loop {
-                let st = inb(PS2_STATUS);
-                if st & 0x01 == 0 { break; } // No hay más datos
-                if st & 0x20 == 0 { // Los datos son del teclado, no del mouse
-                    // Podríamos redirigirlos al driver de teclado aquí si fuera necesario
-                    break; 
-                }
-                
-                let byte = inb(PS2_DATA);
-
-                // --- Mecanismo de Timeout ---
-                // Si el último byte fue hace mucho, el paquete actual está roto.
-                if self.pkt_idx > 0 && current_tick.saturating_sub(self.last_tick) > 2 {
-                    self.pkt_idx = 0;
-                    self.error_count += 1;
-                }
-                self.last_tick = current_tick;
-
-                if self.feed(byte) { changed = true; }
-            }
-        }
-
-        // Si hay demasiados errores acumulados, resetear hardware
-        if self.error_count >= ERROR_LIMIT {
-            self.intelligent_reset();
-        }
-
-        changed
+        self.scroll_delta = 0;
     }
 
-    /// Alimentador del buffer de paquetes
-    fn feed(&mut self, byte: u8) -> bool {
+    /// Procesa un byte ya leído del buffer PS/2 (AUXB=1).
+    /// Devuelve true si el paquete se completó y hubo cambio de estado.
+    /// El caller (main) es responsable de haber verificado AUXB antes de llamar.
+    pub fn feed(&mut self, byte: u8) -> bool {
+        // Sincronización por timeout entre bytes del mismo paquete
+        let current_tick = pit::ticks();
+        if self.pkt_idx > 0 && current_tick.saturating_sub(self.last_tick) > 5 {
+            self.pkt_idx = 0;
+        }
+        self.last_tick = current_tick;
+
         match self.pkt_idx {
             0 => {
-                // Validación del Bit 3: El byte 0 de un paquete PS/2 SIEMPRE tiene el bit 3 en 1.
-                if (byte & 0x08) == 0 {
-                    self.error_count += 1;
-                    return false; 
-                }
+                // Bit 3 siempre a 1 en el byte de flags; si no, estamos desalineados
+                if byte & 0x08 == 0 { return false; }
                 self.pkt[0] = byte;
                 self.pkt_idx = 1;
                 false
@@ -213,55 +139,100 @@ impl MouseState {
             2 => {
                 self.pkt[2] = byte;
                 self.pkt_idx = 0;
-                
-                if self.process() {
-                    // Paquete válido: reducimos el contador de sospecha lentamente
-                    if self.error_count > 0 { self.error_count -= 1; }
-                    true
-                } else {
-                    false
-                }
+                self.process()
             }
             _ => { self.pkt_idx = 0; false }
         }
     }
 
-    /// Procesa el paquete final y aplica el movimiento
+    pub fn init(&mut self, sw: usize, sh: usize) -> bool {
+        self.max_x = (sw as i32).saturating_sub(1);
+        self.max_y = (sh as i32).saturating_sub(1);
+        self.x = self.max_x / 2;
+        self.y = self.max_y / 2;
+        self.has_wheel = false;
+
+        unsafe {
+            drain_kbc();
+            wait_write(); outb(PS2_CMD, 0xA8);
+
+            wait_write(); outb(PS2_CMD, 0x20);
+            if !wait_read() { return false; }
+            let cfg = inb(PS2_DATA);
+            wait_write(); outb(PS2_CMD, 0x60);
+            wait_write(); outb(PS2_DATA, (cfg | 0x02) & !0x20);
+
+            mouse_cmd(0xF6);
+            mouse_cmd_arg(0xF3, 100);
+            if !mouse_cmd(0xF4) { return false; }
+
+            drain_kbc();
+            self.present = true;
+            true
+        }
+    }
+
+    pub fn intelligent_reset(&mut self) {
+        let now = pit::ticks();
+        if now.saturating_sub(self.last_reset_tick) < 100 { return; }
+
+        unsafe {
+            drain_kbc();
+            mouse_cmd(0xF6);
+            mouse_cmd(0xF4);
+            drain_kbc();
+        }
+
+        self.resets += 1;
+        self.error_count = 0;
+        self.pkt_idx = 0;
+        self.last_reset_tick = now;
+    }
+
     fn process(&mut self) -> bool {
         let flags = self.pkt[0];
-        let mut dx = self.pkt[1] as i32;
-        let mut dy = self.pkt[2] as i32;
 
-        // Signos (Bits 4 y 5)
-        if flags & 0x10 != 0 { dx -= 256; }
-        if flags & 0x20 != 0 { dy -= 256; }
-
-        // --- Filtro de Cordura (Teletransporte) ---
-        if dx.abs() > TELEPORT_THRESHOLD || dy.abs() > TELEPORT_THRESHOLD {
-            self.error_count += 5; // Gran penalización por saltos imposibles
+        if flags & 0xC0 != 0 {
+            self.error_count = self.error_count.saturating_add(1);
             return false;
         }
 
-        // --- Detección de Esquinas Pegajosas ---
-        // Si el mouse empuja contra los bordes con valores muy altos, es síntoma de desync.
-        if (self.x >= self.max_x && dx > 60) || (self.x <= 0 && dx < -60) {
-            self.error_count += 1;
+        // Reconstrucción correcta del entero de 9 bits PS/2.
+        // El bit de signo de dx está en flags bit 4 (0x10).
+        // El bit de signo de dy está en flags bit 5 (0x20).
+        // Tratar pkt[1] como i8 directamente es incorrecto para deltas ≥128
+        // con signo positivo: el bit 7 se interpreta como negativo → teleport.
+        let dx: i32 = if flags & 0x10 != 0 {
+            (self.pkt[1] as i32) - 256
+        } else {
+            self.pkt[1] as i32
+        };
+
+        let dy: i32 = if flags & 0x20 != 0 {
+            (self.pkt[2] as i32) - 256
+        } else {
+            self.pkt[2] as i32
+        };
+
+        if dx.abs() > TELEPORT_THRESHOLD || dy.abs() > TELEPORT_THRESHOLD {
+            self.error_count = self.error_count.saturating_add(1);
+            return false;
         }
 
+        self.buttons = flags & 0x07;
+
+        let sensitivity: i32 = 2;
         let old_x = self.x;
         let old_y = self.y;
 
-        self.buttons = flags & 0x07;
-        
-        // Aplicar movimiento y clamp a los límites de la pantalla
-        // Nota: dy se resta porque en PS/2 el eje Y es positivo hacia arriba.
-        self.x = (self.x + dx).clamp(0, self.max_x);
-        self.y = (self.y - dy).clamp(0, self.max_y);
+        self.x = (self.x + dx * sensitivity).clamp(0, self.max_x);
+        self.y = (self.y - dy * sensitivity).clamp(0, self.max_y);
+
+        if self.error_count > 0 { self.error_count -= 1; }
 
         self.x != old_x || self.y != old_y || self.buttons != self.prev_buttons
     }
 
-    // --- Helpers de Estado para el Kernel ---
     #[inline] pub fn left_btn(&self)    -> bool { self.buttons & 0x01 != 0 }
     #[inline] pub fn right_btn(&self)   -> bool { self.buttons & 0x02 != 0 }
     #[inline] pub fn middle_btn(&self)  -> bool { self.buttons & 0x04 != 0 }

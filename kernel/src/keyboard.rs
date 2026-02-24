@@ -1,5 +1,5 @@
-// kernel/src/keyboard.rs - PORTIX PS/2 Keyboard Driver (polling, no IRQ needed)
-// Soporta: letras, números, símbolos, shift/caps, flechas, F1-F10, especiales
+// kernel/src/keyboard.rs - PORTIX PS/2 Keyboard Driver
+// v1.1: añadido feed_byte() para el drenado unificado del buffer PS/2
 #![allow(dead_code)]
 
 const PS2_DATA:   u16 = 0x60;
@@ -15,16 +15,13 @@ unsafe fn inb(port: u16) -> u8 {
 // ── Key enum ──────────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
-    Char(u8),   // ASCII imprimible
+    Char(u8),
     Enter,
     Backspace,
     Tab,
     Escape,
-    // Flechas
     Up, Down, Left, Right,
-    // Funciones
     F1, F2, F3, F4, F5, F6, F7, F8, F9, F10,
-    // Navegación
     Delete, Home, End, PageUp, PageDown, Insert,
 }
 
@@ -35,7 +32,7 @@ pub struct KeyboardState {
     caps:     bool,
     ctrl:     bool,
     alt:      bool,
-    e0_seen:  bool,  // prefijo de tecla extendida 0xE0
+    e0_seen:  bool,
 }
 
 impl KeyboardState {
@@ -50,27 +47,38 @@ impl KeyboardState {
     #[inline(always)] pub fn ctrl(&self) -> bool { self.ctrl }
     #[inline(always)] pub fn alt(&self)  -> bool { self.alt  }
 
-    /// Lee el buffer del controlador PS/2 y devuelve un Key si hay uno.
-    /// Seguro de llamar en cualquier momento (polling sin IRQ).
+    // ── poll() — solo para uso cuando NO se usa el drenado unificado ─────────
+    //
+    // ADVERTENCIA: Este método lee directamente del buffer PS/2. Si se llama
+    // mientras ms.poll() también está activo, los dos compiten por el mismo
+    // registro 0x60 y se pierden bytes mutuamente.
+    // Usar feed_byte() + drenado unificado en main en su lugar.
     pub fn poll(&mut self) -> Option<Key> {
         unsafe {
             let st = inb(PS2_STATUS);
-            // Bit 0: output buffer full; Bit 5: dato de ratón (no teclado)
             if st & 0x01 == 0  { return None; }
-            if st & 0x20 != 0  { let _ = inb(PS2_DATA); return None; }
+            // Si el byte es del ratón (AUXB=1), NO lo consumimos —
+            // lo dejamos para que ms.poll() lo lea.
+            if st & 0x20 != 0  { return None; }
             let sc = inb(PS2_DATA);
             self.decode(sc)
         }
     }
 
+    /// Procesa un byte de scancode ya leído del buffer.
+    /// Usar en el drenado unificado de main: el caller ya leyó el byte,
+    /// ya verificó AUXB=0, y se lo pasa aquí para decodificar.
+    pub fn feed_byte(&mut self, sc: u8) -> Option<Key> {
+        self.decode(sc)
+    }
+
     fn decode(&mut self, sc: u8) -> Option<Key> {
-        // Prefijo tecla extendida
         if sc == 0xE0 { self.e0_seen = true; return None; }
 
         let e0  = self.e0_seen;
         self.e0_seen = false;
 
-        // ── Break codes (tecla soltada, bit 7 a 1) ───────────────────────────
+        // Break codes
         if sc & 0x80 != 0 {
             match (e0, sc & 0x7F) {
                 (false, 0x2A) => self.shift_l = false,
@@ -82,7 +90,7 @@ impl KeyboardState {
             return None;
         }
 
-        // ── Extended make codes ───────────────────────────────────────────────
+        // Extended make codes
         if e0 {
             return match sc {
                 0x48 => Some(Key::Up),    0x50 => Some(Key::Down),
@@ -96,7 +104,7 @@ impl KeyboardState {
             };
         }
 
-        // ── Regular make codes ────────────────────────────────────────────────
+        // Regular make codes
         match sc {
             0x2A => { self.shift_l = true;      None }
             0x36 => { self.shift_r = true;      None }
@@ -127,9 +135,8 @@ impl KeyboardState {
 
     fn sc_to_char(&self, sc: u8) -> u8 {
         let sh  = self.shift_l || self.shift_r;
-        let up  = sh ^ self.caps; // uppercase para letras
+        let up  = sh ^ self.caps;
 
-        // ── Fila numérica ─────────────────────────────────────────────────────
         const NUMS_N: &[u8] = b"1234567890-=";
         const NUMS_S: &[u8] = b"!@#$%^&*()_+";
         if sc >= 0x02 && sc <= 0x0D {
@@ -137,8 +144,6 @@ impl KeyboardState {
             return if sh { NUMS_S[i] } else { NUMS_N[i] };
         }
 
-        // ── Mapa QWERTY completo ──────────────────────────────────────────────
-        // (scancode, normal, shifted/upper)
         const MAP: &[(u8, u8, u8)] = &[
             (0x10,b'q',b'Q'),(0x11,b'w',b'W'),(0x12,b'e',b'E'),(0x13,b'r',b'R'),
             (0x14,b't',b'T'),(0x15,b'y',b'Y'),(0x16,b'u',b'U'),(0x17,b'i',b'I'),

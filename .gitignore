@@ -1,12 +1,47 @@
-# Rust
+# ==========================================
+# PORTIX OS - Master Git Ignore
+# ==========================================
+
+# --- Rust & Compilation ---
+# Bloquea todas las carpetas target sin importar donde estén
+**/target/
 target/
+# Archivos de bloqueo de Cargo (opcional, pero recomendado para kernels)
+Cargo.lock
 
-# Python
+# --- Build System (Carpeta /build) ---
+# Ignoramos todos los binarios y logs generados por los scripts de Python
+build/
+bin/
+*.bin
+*.elf
+*.o
+*.obj
+*.pdb
+
+# --- Disk Images (Formatos de arranque) ---
+*.img
+*.iso
+*.vdi
+*.vmdk
+
+# --- Python (Scripts & Cache) ---
 __pycache__/
-*.pyc
-
-# VSCode
-.vscode/
-
-# logs
+**/__pycache__/
+*.py[cod]
+*$py.class
+# Logs específicos de los scripts
+scripts/logs/
 *.log
+
+# --- VS Code & IDEs ---
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln
+*.swp
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db

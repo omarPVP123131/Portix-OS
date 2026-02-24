@@ -1,3 +1,0 @@
-[23:18:54.964] === ENSAMBLANDO ASM ===
-[23:18:54.965]   > nasm -f bin C:\Users\Omar\Documents\Documentos WEb\Portix\portix\scripts\boot\boot.asm -o C:\Users\Omar\Documents\Documentos WEb\Portix\portix\scripts\build\boot.bin
-[23:18:54.980] [ERROR] Falló con código 1

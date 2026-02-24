@@ -1,16 +1,17 @@
-; boot/boot.asm - Stage1 PORTIX v5 - FIXED
-; BUGS CORREGIDOS:
-;   1. Reset de disco: fallo no fatal (en QEMU IDE puede fallar con CF=1)
-;   2. CHS: geometría de HD (63 sec/pista, 255 cabezas) en vez de floppy
-;   3. LBA: probar primero con 0x80, luego con boot_drive guardado
-;   4. Buffer CHS: usar ES:BX relativo correctamente para 64 sectores
-; nasm -f bin boot.asm -o boot.bin
+; boot/boot.asm - Stage1 PORTIX v6.0
+; CORRECCIONES:
+;   - boot_drive se guarda como PRIMERA instrucción (DL válido al entrar)
+;   - LBA: primero boot_drive ORIGINAL, luego 0x80 como fallback (no al revés)
+;   - boot_drive se pasa a stage2 vía DL justo antes del jmp
+;   - CHS: geometría HD (63 sec/pista, 255 cabezas), no floppy
+;   - Retry ×3 con reset en CHS
+;   - Stage2 se carga en 0x0800:0x0000 = físico 0x8000
 
 BITS 16
 ORG 0x7C00
 
 STAGE2_SECTORS equ 64
-STAGE2_SEG     equ 0x0800    ; 0x0800:0x0000 = dirección física 0x8000
+STAGE2_SEG     equ 0x0800    ; 0x0800:0x0000 = 0x8000 físico
 
 start:
     cli
@@ -21,50 +22,48 @@ start:
     mov sp, 0x7C00
     sti
 
+    ; ── CRÍTICO: guardar DL ANTES de cualquier otra instrucción ───────────
     mov [boot_drive], dl
 
-    ; Imprimir banner ANTES de cualquier disco (para saber si el bootloader arranca)
     mov si, msg_boot
     call print_string
 
-    ; Reset disco — NO fatal si falla (QEMU IDE retorna error en reset a veces)
-    mov ah, 0x00
-    mov dl, 0x80
+    ; Reset disco — ignorar error (QEMU IDE puede fallar aquí)
+    xor ah, ah
+    mov dl, [boot_drive]
     int 0x13
-    ; Ignorar CF — continuar de todas formas
 
     mov si, msg_loading
     call print_string
 
-    ; ── Intentar LBA extendido con drive 0x80 ─────────────────────────────
-    mov ah, 0x41
-    mov bx, 0x55AA
-    mov dl, 0x80
-    int 0x13
-    jc  .try_lba_orig
-    cmp bx, 0xAA55
-    jne .try_lba_orig
-
-    mov byte [boot_drive], 0x80
-    jmp .do_lba
-
-.try_lba_orig:
-    ; Intentar con el boot drive original
+    ; ── A) LBA con boot_drive ORIGINAL (puede ser 0x9F en óptico, 0x80 en HDD) ──
     mov ah, 0x41
     mov bx, 0x55AA
     mov dl, [boot_drive]
     int 0x13
+    jc  .try_lba_80
+    cmp bx, 0xAA55
+    jne .try_lba_80
+    ; Extensiones disponibles en drive original
+    jmp .do_lba
+
+    ; ── B) LBA con 0x80 como fallback (por si el BIOS da DL raro) ────────
+.try_lba_80:
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, 0x80
+    int 0x13
     jc  .use_chs
     cmp bx, 0xAA55
     jne .use_chs
+    mov byte [boot_drive], 0x80   ; actualizar solo si realmente funciona
 
 .do_lba:
-    ; LBA extendido disponible
-    mov word [dap_sectors],  STAGE2_SECTORS
-    mov word [dap_offset],   0x0000
-    mov word [dap_segment],  STAGE2_SEG
-    mov dword [dap_lba_lo],  1
-    mov dword [dap_lba_hi],  0
+    mov word  [dap_sectors],  STAGE2_SECTORS
+    mov word  [dap_offset],   0x0000
+    mov word  [dap_segment],  STAGE2_SEG
+    mov dword [dap_lba_lo],   1        ; stage2 empieza en LBA 1
+    mov dword [dap_lba_hi],   0
 
     mov si, dap
     mov ah, 0x42
@@ -75,34 +74,53 @@ start:
     mov si, msg_chs
     call print_string
 
+    ; ── C) CHS clásico ────────────────────────────────────────────────────
 .use_chs:
-    ; CHS con geometría de HD: 63 sec/pista, 255 cabezas (igual que stage2)
-    mov byte [boot_drive], 0x80
-    mov word [current_lba], 1
-    ; Leer 64 sectores de 512 bytes = 32KB a 0x0800:0000 = 0x8000 físico
     mov ax, STAGE2_SEG
     mov es, ax
     xor bx, bx
+    mov word [current_lba], 1
     mov cx, STAGE2_SECTORS
 
 .read_loop_chs:
     push cx
     push bx
     push es
+
+    ; Calcular CHS del sector actual
     mov ax, [current_lba]
+    call lba_to_chs_hd       ; ch=cilindro, cl=sector|hi_cil, dh=cabeza
+
+    ; Intentar 3 veces con reset
+    mov cx, 3
+.chs_retry:
+    push cx
+    mov  ah, 0x02
+    mov  al, 1
+    mov  dl, [boot_drive]
+    int  0x13
+    pop  cx
+    jnc  .chs_ok
+    ; Reset antes de reintentar
+    push cx
+    xor  ah, ah
+    mov  dl, [boot_drive]
+    int  0x13
+    ; Recalcular CHS (registros destruidos por reset)
+    mov  ax, [current_lba]
     call lba_to_chs_hd
-    mov ah, 0x02
-    mov al, 0x01
-    mov dl, [boot_drive]
-    int 0x13
-    jc  disk_error
+    pop  cx
+    loop .chs_retry
+    jmp  disk_error
+
+.chs_ok:
     pop es
     pop bx
     pop cx
-    ; Avanzar puntero: +512 bytes
+
+    ; Avanzar destino: +512 bytes
     add bx, 512
     jnc .no_wrap
-    ; BX wrapaó (pasó 64KB), ajustar ES
     mov ax, es
     add ax, 0x1000
     mov es, ax
@@ -114,45 +132,50 @@ start:
 .loaded:
     mov si, msg_jump
     call print_string
+
+    ; Pasar boot_drive a stage2 en DL (stage2 lo lee como primera instrucción)
     mov dl, [boot_drive]
     jmp 0x0000:0x8000
 
-; ── LBA → CHS para HD (63 sec/pista, 255 cabezas) ────────────────────────────
-; Entrada: AX = LBA
-; Salida: CH = cilindro, CL = sector (1-63), DH = cabeza
+; ── LBA→CHS HD (63 sec/track, 255 heads) ─────────────────────────────────────
+; Entrada: AX = LBA  |  Salida: CH=cil, CL=sec|hi_cil, DH=cabeza
+; Destruye: AX, BX, DX  (¡no necesita preservar: caller no depende de ellos!)
 lba_to_chs_hd:
-    push ax
-    push bx
-    push dx
-    xor dx, dx
-    mov bx, 63
-    div bx          ; AX = LBA/63 (pista), DX = LBA%63 (sector 0-based)
-    inc dx
-    mov cl, dl      ; CL = sector 1-based
-    and cl, 0x3F
-    xor dx, dx
-    mov bx, 255
-    div bx          ; AX = cilindro, DX = cabeza
-    mov ch, al      ; CH = cilindro (bits 7:0)
-    mov dh, dl      ; DH = cabeza
-    ; Bits 9:8 del cilindro van en CL bits 7:6 (ignoramos cilindros > 255 aquí)
-    pop dx
-    pop bx
-    pop ax
+    push si
+    mov  si, ax           ; si = LBA
+
+    ; sector = (LBA mod 63) + 1
+    xor  dx, dx
+    mov  ax, si
+    mov  bx, 63
+    div  bx               ; ax = LBA/63,  dx = LBA%63
+    inc  dx               ; 1-based
+    mov  cl, dl           ; CL = sector
+
+    ; cabeza y cilindro
+    xor  dx, dx
+    mov  bx, 255
+    div  bx               ; ax = cilindro,  dx = cabeza
+    mov  dh, dl           ; DH = cabeza
+    mov  ch, al           ; CH = cilindro bits 7:0
+    shl  ah, 6
+    or   cl, ah           ; CL bits 7:6 = cilindro bits 9:8
+
+    pop  si
     ret
 
-; ── Print ──────────────────────────────────────────────────────────────────────
+; ── print_string ──────────────────────────────────────────────────────────────
 print_string:
     pusha
 .loop:
     lodsb
     test al, al
-    jz .done
-    mov ah, 0x0E
-    mov bh, 0
-    mov bl, 7
-    int 0x10
-    jmp .loop
+    jz   .done
+    mov  ah, 0x0E
+    mov  bh, 0
+    mov  bl, 7
+    int  0x10
+    jmp  .loop
 .done:
     popa
     ret
@@ -164,10 +187,10 @@ disk_error:
     hlt
 
 ; ── Datos ──────────────────────────────────────────────────────────────────────
-msg_boot    db "PORTIX v0.5", 13, 10, 0
+msg_boot    db "PORTIX v0.6", 13, 10, 0
 msg_loading db "Loading...", 13, 10, 0
 msg_chs     db "CHS fallback", 13, 10, 0
-msg_jump    db "Jumping!", 13, 10, 0
+msg_jump    db "Jumpaaaaaing!", 13, 10, 0
 msg_error   db "DISK ERROR!", 13, 10, 0
 
 boot_drive  db 0x80

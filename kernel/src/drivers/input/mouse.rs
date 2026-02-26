@@ -11,7 +11,7 @@
 //     coexistir con el drenado unificado o habrá doble lectura del buffer.
 
 #![allow(dead_code)]
-use crate::pit;
+use crate::time::pit;
 
 const PS2_DATA:   u16 = 0x60;
 const PS2_STATUS: u16 = 0x64;

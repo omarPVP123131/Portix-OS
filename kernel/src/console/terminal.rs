@@ -145,7 +145,7 @@ impl Terminal {
 
     // ══ Enter ═══════════════════════════════════════════════════════════════════
 
-    pub fn enter(&mut self, hw: &crate::hardware::HardwareInfo, pci: &crate::pci::PciBus) {
+    pub fn enter(&mut self, hw: &crate::arch::hardware::HardwareInfo, pci: &crate::drivers::bus::pci::PciBus) {
         let mut echo = [0u8; INPUT_MAX + 10];
         let plen = PROMPT.len();
         echo[..plen].copy_from_slice(PROMPT);
@@ -184,7 +184,7 @@ impl Terminal {
     }
 
     fn dispatch(&mut self, cmd: &[u8], args: &[u8],
-                hw: &crate::hardware::HardwareInfo, pci: &crate::pci::PciBus) {
+                hw: &crate::arch::hardware::HardwareInfo, pci: &crate::drivers::bus::pci::PciBus) {
         match cmd {
             // ── Ayuda ──────────────────────────────────────────────────────────
             b"help" | b"ayuda" | b"?" | b"h"
@@ -267,11 +267,11 @@ impl Terminal {
             // ── Energía ───────────────────────────────────────────────────────
             b"poweroff" | b"shutdown" | b"apagar" => {
                 self.write_line("  Apagando el sistema...", LineColor::Warning);
-                crate::acpi::poweroff();
+                crate::drivers::bus::acpi::poweroff();
             }
             b"reboot" | b"restart" | b"reiniciar" => {
                 self.write_line("  Reiniciando...", LineColor::Warning);
-                crate::acpi::reboot();
+                crate::drivers::bus::acpi::reboot();
             }
 
             // ── Comando desconocido ────────────────────────────────────────────
@@ -431,7 +431,7 @@ impl Terminal {
     fn cmd_matrix(&mut self) {
         self.write_empty();
         self.write_line("  Despierta, Neo...", LineColor::Success);
-        let seed = crate::pit::ticks() as u32;
+        let seed = crate::time::pit::ticks() as u32;
         let chars = b"01ABCDEF<>{}[]!?#$@*";
         for row in 0..8u32 {
             let mut line = [b' '; TERM_COLS]; let mut lp = 0;
@@ -515,8 +515,8 @@ impl Terminal {
     }
 
     fn cmd_fecha(&mut self) {
-        let (h, m, s) = crate::pit::uptime_hms();
-        let t = crate::pit::ticks();
+        let (h, m, s) = crate::time::pit::uptime_hms();
+        let t = crate::time::pit::ticks();
         let mut buf = [0u8; 80]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Tiempo desde arranque: ");
         append_u32(&mut buf, &mut pos, h); append_str(&mut buf, &mut pos, b"h ");
@@ -532,8 +532,8 @@ impl Terminal {
     }
 
     fn cmd_uptime(&mut self) {
-        let (h, m, s) = crate::pit::uptime_hms();
-        let t = crate::pit::ticks();
+        let (h, m, s) = crate::time::pit::uptime_hms();
+        let t = crate::time::pit::ticks();
         let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Tiempo en linea: ");
         append_u32(&mut buf, &mut pos, h); append_str(&mut buf, &mut pos, b"h ");
@@ -546,7 +546,7 @@ impl Terminal {
     }
 
     fn cmd_ticks(&mut self) {
-        let t = crate::pit::ticks();
+        let t = crate::time::pit::ticks();
         let mut buf = [0u8; 80]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Ticks del PIT: ");
         append_u32(&mut buf, &mut pos, (t & 0xFFFF_FFFF) as u32);
@@ -577,11 +577,11 @@ impl Terminal {
         self.write_empty();
     }
 
-    fn cmd_info(&mut self, hw: &crate::hardware::HardwareInfo) {
+    fn cmd_info(&mut self, hw: &crate::arch::hardware::HardwareInfo) {
         self.cmd_cpu(hw); self.write_empty(); self.cmd_mem(hw);
     }
 
-    fn cmd_cpu(&mut self, hw: &crate::hardware::HardwareInfo) {
+    fn cmd_cpu(&mut self, hw: &crate::arch::hardware::HardwareInfo) {
         self.separador("PROCESADOR (CPU)");
         {
             let mut lb = [0u8; TERM_COLS]; let bl = b"  Modelo     : ";
@@ -623,7 +623,7 @@ impl Terminal {
         self.write_empty();
     }
 
-    fn cmd_mem(&mut self, hw: &crate::hardware::HardwareInfo) {
+    fn cmd_mem(&mut self, hw: &crate::arch::hardware::HardwareInfo) {
         self.separador("MEMORIA RAM (E820)");
         {
             let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -662,7 +662,7 @@ impl Terminal {
         self.write_empty();
     }
 
-    fn cmd_disks(&mut self, hw: &crate::hardware::HardwareInfo) {
+    fn cmd_disks(&mut self, hw: &crate::arch::hardware::HardwareInfo) {
         self.separador("ALMACENAMIENTO (ATA)");
         if hw.disks.count == 0 {
             self.write_line("  No se detectaron unidades ATA.", LineColor::Warning);
@@ -690,7 +690,7 @@ impl Terminal {
         self.write_empty();
     }
 
-    fn cmd_pci(&mut self, pci: &crate::pci::PciBus) {
+    fn cmd_pci(&mut self, pci: &crate::drivers::bus::pci::PciBus) {
         self.separador("BUS PCI");
         if pci.count == 0 {
             self.write_line("  No se encontraron dispositivos PCI.", LineColor::Warning);
@@ -983,8 +983,8 @@ impl Terminal {
             let mut p:u8; core::arch::asm!("in al, 0x61",out("al") p,options(nostack,nomem));
             p|=0x03; core::arch::asm!("out 0x61, al",in("al") p,options(nostack,nomem));
         }
-        let start=crate::pit::ticks();
-        while crate::pit::ticks().wrapping_sub(start)<20 {
+        let start=crate::time::pit::ticks();
+        while crate::time::pit::ticks().wrapping_sub(start)<20 {
             unsafe { core::arch::asm!("pause",options(nostack,nomem)); }
         }
         unsafe {
@@ -1080,7 +1080,7 @@ impl Terminal {
         } else { self.write_line("  Error: decimal invalido",LineColor::Error); }
     }
 
-    fn cmd_neofetch(&mut self, hw: &crate::hardware::HardwareInfo, pci: &crate::pci::PciBus) {
+    fn cmd_neofetch(&mut self, hw: &crate::arch::hardware::HardwareInfo, pci: &crate::drivers::bus::pci::PciBus) {
         self.write_empty();
         let brand=hw.cpu.brand_str(); let brand=if brand.len()>36 { &brand[..36] } else { brand };
         let usable=hw.ram.usable_or_default();
@@ -1137,7 +1137,7 @@ impl Terminal {
           append_str(&mut buf,&mut pos,b" disp.  Discos: ");
           append_u32(&mut buf,&mut pos,hw.disks.count as u32);
           il[n]=buf; ils[n]=pos; n+=1; }
-        { let (h,m,s)=crate::pit::uptime_hms();
+        { let (h,m,s)=crate::time::pit::uptime_hms();
           let mut buf=[0u8;80]; let mut pos=0;
           append_str(&mut buf,&mut pos,b"  Uptime  : ");
           append_u32(&mut buf,&mut pos,h); append_str(&mut buf,&mut pos,b"h ");

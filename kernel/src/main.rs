@@ -24,29 +24,23 @@
 #![no_main]
 #![allow(dead_code)]
 
-mod acpi;
-mod font;
-mod framebuffer;
-mod halt;
-mod hardware;
-mod idt;
-mod keyboard;
-mod mouse;
-mod pit;
-mod pci;
-mod serial;
-mod terminal;
+pub mod drivers;
+pub mod arch;
+pub mod graphics;
+pub mod time;
+pub mod console;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
-use framebuffer::{Color, Console, Layout};
-use halt::halt_loop;
-use keyboard::Key;
-use terminal::LineColor;
+use graphics::framebuffer::{Color, Console, Layout};
+use arch::halt::halt_loop;
+use drivers::input::keyboard::Key;
+use console::terminal::LineColor;
 
 extern "C" {
     static __bss_start: u8;
     static __bss_end:   u8;
+    
 }
 
 global_asm!(
@@ -150,7 +144,7 @@ fn fmt_mib<'a>(mb: u64, buf: &'a mut [u8; 24]) -> &'a str {
     core::str::from_utf8(&buf[..pos]).unwrap_or("?")
 }
 fn fmt_uptime<'a>(buf: &'a mut [u8; 24]) -> &'a str {
-    let (h, m, s) = pit::uptime_hms();
+    let (h, m, s) = time::pit::uptime_hms();
     let mut pos = 0usize;
     macro_rules! push2 { ($n:expr) => {{
         if $n < 10 { buf[pos] = b'0'; pos += 1; }
@@ -169,7 +163,7 @@ fn section_label(c: &mut Console, x: usize, y: usize, title: &str, w: usize) {
     c.write_at(title, x + 6, y + 3, Color::TEAL);
 }
 
-fn draw_chrome(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
+fn draw_chrome(c: &mut Console, lay: &Layout, hw: &arch::hardware::HardwareInfo,
                active: Tab, mx: i32, my: i32) {
     let fw = lay.fw;
     c.fill_rect(0, 0, fw, lay.header_h, Color::HEADER_BG);
@@ -249,7 +243,7 @@ fn draw_chrome(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
     c.write_at(mys, mox + 28 + mxs.len() * 9 + 9, sy, Color::new(44, 60, 80));
 }
 
-fn draw_system_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
+fn draw_system_tab(c: &mut Console, lay: &Layout, hw: &arch::hardware::HardwareInfo,
                    boot_lines: &[(&str, &str, Color)]) {
     let cy  = lay.content_y;
     let ch  = lay.bottom_y.saturating_sub(cy);
@@ -374,7 +368,7 @@ fn terminal_hist_geometry(lay: &Layout) -> (usize, usize, usize, usize) {
 }
 
 fn draw_terminal_tab(c: &mut Console, lay: &Layout,
-                     term: &terminal::Terminal, sb_dragging: bool) {
+                     term: &console::terminal::Terminal, sb_dragging: bool) {
     let cy  = lay.content_y;
     let ch  = lay.bottom_y.saturating_sub(cy);
     let fw  = lay.fw;
@@ -397,8 +391,8 @@ fn draw_terminal_tab(c: &mut Console, lay: &Layout,
         c.fill_rect(sb_x, hist_top, SCROLLBAR_W, hist_h, Color::new(4, 10, 20));
         let max_scroll = term.max_scroll(max_lines);
         let available = term.line_count
-            .saturating_sub(if term.line_count > terminal::TERM_ROWS {
-                term.line_count - terminal::TERM_ROWS
+            .saturating_sub(if term.line_count > console::terminal::TERM_ROWS {
+                term.line_count - console::terminal::TERM_ROWS
             } else { 0 });
         let thumb_h = if available == 0 { hist_h }
                       else { (hist_h * max_lines / available).max(10).min(hist_h) };
@@ -457,8 +451,8 @@ fn draw_terminal_tab(c: &mut Console, lay: &Layout,
     }
 }
 
-fn draw_devices_tab(c: &mut Console, lay: &Layout, hw: &hardware::HardwareInfo,
-                    pci: &pci::PciBus) {
+fn draw_devices_tab(c: &mut Console, lay: &Layout, hw: &arch::hardware::HardwareInfo,
+                    pci: &drivers::bus::pci::PciBus) {
     let cy  = lay.content_y;
     let ch  = lay.bottom_y.saturating_sub(cy);
     let fw  = lay.fw;
@@ -592,31 +586,32 @@ fn draw_exception(c: &mut Console, title: &str, info: &str) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 #[no_mangle]
 extern "C" fn rust_main() -> ! {
-    unsafe { idt::init_idt(); }
-    serial::init();
-    serial::log("PORTIX", "kernel v0.7.4 iniciando");
-    pit::init();
-    serial::log("PIT", "temporizador 100 Hz inicializado");
-    let hw  = hardware::HardwareInfo::detect_all();
-    serial::log("HW", hw.cpu.brand_str());
-    let pci = pci::PciBus::scan();
+    unsafe { arch::idt::init_idt(); }
+    drivers::serial::init();
+
+    drivers::serial::log("PORTIX", "kernel v0.7.4 iniciando");
+    time::pit::init();
+    drivers::serial::log("PIT", "temporizador 100 Hz inicializado");
+    let hw  = arch::hardware::HardwareInfo::detect_all();
+    drivers::serial::log("HW", hw.cpu.brand_str());
+    let pci = drivers::bus::pci::PciBus::scan();
     {
         let mut t = [0u8; 16];
         let s = fmt_u32(pci.count as u32, &mut t);
-        serial::write_str("PCI: "); serial::write_str(s); serial::write_str(" dispositivos\n");
+        drivers::serial::write_str("PCI: "); drivers::serial::write_str(s); drivers::serial::write_str(" dispositivos\n");
     }
 
-    let mut kbd = keyboard::KeyboardState::new();
-    let mut ms  = mouse::MouseState::new();
+    let mut kbd = drivers::input::keyboard::KeyboardState::new();
+    let mut ms  = drivers::input::mouse::MouseState::new();
     let mut c   = Console::new();
     let lay     = Layout::new(c.width(), c.height());
 
     ms.init(lay.fw.max(1), lay.fh.max(1));
     if ms.present {
-        serial::log("MOUSE", if ms.has_wheel { "PS/2 + rueda" } else { "PS/2 sin rueda" });
+        drivers::serial::log("MOUSE", if ms.has_wheel { "PS/2 + rueda" } else { "PS/2 sin rueda" });
     }
 
-    let mut term = terminal::Terminal::new();
+    let mut term = console::terminal::Terminal::new();
     term.write_line("PORTIX v0.7.4  Kernel Bare-Metal", LineColor::Header);
     term.write_line("Escribe 'ayuda' para comandos. Rueda=scroll. Clic en tabs para cambiar.", LineColor::Info);
     term.write_empty();
@@ -648,7 +643,7 @@ extern "C" fn rust_main() -> ! {
     c.clear(Color::PORTIX_BG);
 
     loop {
-        let now = pit::ticks();
+        let now = time::pit::ticks();
 
         // ════════════════════════════════════════════════════════════════════
         // DRENADO UNIFICADO DEL BUFFER PS/2
@@ -723,11 +718,11 @@ extern "C" fn rust_main() -> ! {
                     }
                     Key::Char(ch) if tab == Tab::Terminal => {
                         term.type_char(ch);
-                        serial::write_byte(ch);
+                        drivers::serial::write_byte(ch);
                     }
                     Key::Backspace if tab == Tab::Terminal => term.backspace(),
                     Key::Enter if tab == Tab::Terminal => {
-                        serial::write_byte(b'\n');
+                        drivers::serial::write_byte(b'\n');
                         term.enter(&hw, &pci);
                     }
                     Key::Escape => {
@@ -772,8 +767,8 @@ extern "C" fn rust_main() -> ! {
             let max_scroll = term.max_scroll(max_lines);
             if max_scroll > 0 {
                 let available = term.line_count
-                    .saturating_sub(if term.line_count > terminal::TERM_ROWS {
-                        term.line_count - terminal::TERM_ROWS
+                    .saturating_sub(if term.line_count > console::terminal::TERM_ROWS {
+                        term.line_count - console::terminal::TERM_ROWS
                     } else { 0 });
                 let thumb_h = if available == 0 { hist_h }
                               else { (hist_h * max_lines / available).max(10).min(hist_h) };
@@ -806,8 +801,8 @@ extern "C" fn rust_main() -> ! {
 
         if mouse_changed && ms.scroll_delta != 0 && tab == Tab::Terminal && !sb_dragging {
             let (_, _, _, ml) = terminal_hist_geometry(&lay);
-            if ms.scroll_delta > 0 { term.scroll_up(terminal::SCROLL_STEP, ml); }
-            else                   { term.scroll_down(terminal::SCROLL_STEP); }
+            if ms.scroll_delta > 0 { term.scroll_up(console::terminal::SCROLL_STEP, ml); }
+            else                   { term.scroll_down(console::terminal::SCROLL_STEP); }
             needs_draw = true;
         }
 

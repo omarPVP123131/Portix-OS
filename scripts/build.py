@@ -188,7 +188,7 @@ def assemble_boot():
     assert BOOTBIN.stat().st_size == 512
     log(f"[OK]    boot.bin — 512 bytes")
     run(["nasm", "-f", "elf64",
-         KERNEL_DIR / "src" / "isr.asm", "-o", ISROBJ])
+         KERNEL_DIR / "src" / "arch" / "isr.asm", "-o", ISROBJ])
     log(f"[OK]    isr.o — {ISROBJ.stat().st_size} bytes")
 
 def build_kernel() -> int:

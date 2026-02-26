@@ -446,7 +446,7 @@ impl Console {
     fn draw_char(&self, x: usize, y: usize, ch: char, fg: Color, bg: Color) {
         let a = ch as usize;
         if a < 32 || a > 127 { return; }
-        let glyph = crate::font::FONT_8X8[a - 32];
+        let glyph = crate::graphics::font::FONT_8X8[a - 32];
         for (row, &byte) in glyph.iter().enumerate() {
             for col in 0..8usize {
                 let on = (byte & (1u8 << col)) != 0;
@@ -462,7 +462,7 @@ impl Console {
     pub fn draw_char_tall(&self, x: usize, y: usize, ch: char, fg: Color, bg: Color) {
         let a = ch as usize;
         if a < 32 || a > 127 { return; }
-        let glyph = crate::font::FONT_8X8[a - 32];
+        let glyph = crate::graphics::font::FONT_8X8[a - 32];
         for (row, &byte) in glyph.iter().enumerate() {
             for col in 0..8usize {
                 let on = (byte & (1u8 << col)) != 0;

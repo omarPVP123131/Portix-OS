@@ -1,3 +1,2 @@
-pub mod framebuffer;
-pub mod font;
-pub mod vga;
+pub mod driver;
+pub mod render;

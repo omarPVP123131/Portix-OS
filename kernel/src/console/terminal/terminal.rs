@@ -1,4 +1,4 @@
-// kernel/src/terminal.rs — PORTIX Terminal v7
+// kernel/src/console/terminal.rs
 //
 // CAMBIOS vs v6:
 //   - Comandos en INGLÉS (nombres originales: help, cpu, mem, disks, pci, etc.)

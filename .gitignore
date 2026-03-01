@@ -8,7 +8,9 @@
 target/
 # Archivos de bloqueo de Cargo (opcional, pero recomendado para kernels)
 Cargo.lock
-
+kernel/target/
+# Rust
+target/
 # --- Build System (Carpeta /build) ---
 # Ignoramos todos los binarios y logs generados por los scripts de Python
 build/

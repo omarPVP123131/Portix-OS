@@ -30,6 +30,7 @@ use ui::tabs::terminal::terminal_hist_geometry;
 extern "C" {
     static __bss_start: u8;
     static __bss_end:   u8;
+    static __stack_top: u8;   // ← agregar esto
 }
 
 global_asm!(
@@ -39,7 +40,7 @@ global_asm!(
     "_start:",
     "    cli",
     "    cld",
-    "    mov rsp, 0x7FF00",
+    "    lea rsp, [rip + {STACK_TOP}]",   // ← reemplaza el mov rsp hardcodeado
     "    xor rbp, rbp",
     "    lea rdi, [rip + {BSS_START}]",
     "    lea rcx, [rip + {BSS_END}]",
@@ -53,6 +54,7 @@ global_asm!(
     "    call {RUST_MAIN}",
     "2:  hlt",
     "    jmp 2b",
+    STACK_TOP = sym __stack_top,
     BSS_START = sym __bss_start,
     BSS_END   = sym __bss_end,
     RUST_MAIN = sym rust_main,

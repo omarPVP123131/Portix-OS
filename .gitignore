@@ -1,49 +1,121 @@
-# ==========================================
-# PORTIX OS - Master Git Ignore
-# ==========================================
+# =====================================================
+# PORTIX OS — HARDENED GITIGNORE (Kernel Development)
+# =====================================================
 
-# --- Rust & Compilation ---
-# Bloquea todas las carpetas target sin importar donde estén
-**/target/
-target/
-# Archivos de bloqueo de Cargo (opcional, pero recomendado para kernels)
-Cargo.lock
-kernel/target/
-# Rust
-target/
-# --- Build System (Carpeta /build) ---
-# Ignoramos todos los binarios y logs generados por los scripts de Python
-build/
-bin/
+#######################################################
+# 🔥 BUILD OUTPUTS (NUNCA VERSIONAR)
+#######################################################
+
+# Carpeta build global
+/build/
+/bin/
+/dist/
+
+# Binarios
 *.bin
 *.elf
 *.o
 *.obj
+*.a
+*.lib
 *.pdb
+*.map
 
-# --- Disk Images (Formatos de arranque) ---
+#######################################################
+# 💿 DISK IMAGES (SIEMPRE GENERADAS)
+#######################################################
+
 *.img
 *.iso
 *.vdi
 *.vmdk
+*.qcow2
 
-# --- Python (Scripts & Cache) ---
+#######################################################
+# 🦀 RUST (CRÍTICO)
+#######################################################
+
+# TODOS los targets sin excepción
+**/target/
+
+# Cargo lock NO necesario para kernel freestanding
+Cargo.lock
+
+# Rust artifacts
+*.rlib
+*.rmeta
+*.d
+
+#######################################################
+# 🧠 LLVM / LLD / NASM
+#######################################################
+
+*.ll
+*.bc
+*.s
+*.lst
+
+#######################################################
+# 🐍 PYTHON
+#######################################################
+
 __pycache__/
 **/__pycache__/
 *.py[cod]
 *$py.class
-# Logs específicos de los scripts
-scripts/logs/
-*.log
+*.pyo
 
-# --- VS Code & IDEs ---
+# virtualenvs
+.venv/
+venv/
+env/
+
+#######################################################
+# 📜 LOGS & DEBUG
+#######################################################
+
+*.log
+logs/
+debug/
+serial.log
+
+#######################################################
+# 🧰 IDEs / EDITORS
+#######################################################
+
 .vscode/
 .idea/
-*.suo
-*.user
-*.sln
 *.swp
+*.swo
+*.tmp
+*.cache
 
-# --- OS Specific ---
+#######################################################
+# 🪟 OS FILES
+#######################################################
+
 .DS_Store
 Thumbs.db
+desktop.ini
+
+#######################################################
+# 🚨 PROTECCIÓN EXTRA (ANTI-DOLOR)
+#######################################################
+
+# Archivos temporales accidentales
+*.bak
+*.old
+*.temp
+
+# Dumps
+*.stackdump
+*.core
+
+#######################################################
+# 🔒 NUNCA IGNORAR (Whitelist mental)
+#######################################################
+# boot/
+# kernel/src/
+# scripts/
+# linker.ld
+# Cargo.toml

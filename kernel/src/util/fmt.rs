@@ -16,6 +16,10 @@ pub fn fmt_u64<'a>(mut n: u64, buf: &'a mut [u8; 20]) -> &'a str {
     core::str::from_utf8(&buf[..i]).unwrap_or("?")
 }
 
+pub fn fmt_u16<'a>(n: u16, buf: &'a mut [u8; 16]) -> &'a str {
+    fmt_u32(n as u32, buf)
+}
+
 pub fn fmt_hex<'a>(mut v: u64, buf: &'a mut [u8; 18]) -> &'a str {
     buf[0] = b'0'; buf[1] = b'x';
     const H: &[u8] = b"0123456789ABCDEF";

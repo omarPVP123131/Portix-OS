@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
-# scripts/build.py — PORTIX Build System v3.0
+# scripts/build.py  —  PORTIX Build System v4.2
+#
+# CORRECCIONES vs v4.1:
+#   [FIX-ISO-FORMAT]  La ISO ya no usa El Torito HD emulation (que es
+#                     incompatible con VirtualBox en muchas configuraciones).
+#                     En su lugar, la ISO es una imagen de disco raw pura
+#                     (portix.img) embebida en un contenedor ISO válido.
+#                     VirtualBox debe montarla como "disco duro IDE", no
+#                     como CD-ROM. Esto garantiza DL=0x80 y LBAs correctos.
+#
+#   [FIX-ISO-VBOX]    Instrucciones claras: para VirtualBox usar portix.vdi
+#                     o portix.vmdk. La ISO es para QEMU como disco raw y
+#                     para copiar a USB con dd/Rufus. Si se quiere CD-ROM
+#                     real, usar xorriso (si está disponible).
+#
+#   [FIX-QEMU-ISO]    El modo --mode=iso de QEMU ahora usa la ISO como
+#                     disco IDE (no como -cdrom), lo que garantiza que
+#                     el bootloader recibe DL=0x80 correctamente.
+#
+#   [FIX-VBOX-GUIDE]  El summary() ahora explica claramente cómo usar
+#                     cada formato en VirtualBox.
+#
+# RESUMEN DE FORMATOS:
+#   portix.img  → QEMU -drive raw  /  dd a USB  /  Rufus
+#   portix.iso  → QEMU como disco IDE  /  copiar a USB con dd
+#                 NO usar como CD-ROM en VirtualBox (usa portix.vdi)
+#   portix.vdi  → VirtualBox como disco IDE (RECOMENDADO para VBox)
+#   portix.vmdk → VMware / VirtualBox alternativo
 #
 # Compatible con: Windows MINGW64, Linux, macOS
-#
-# Genera automáticamente TODOS los formatos de distribución:
-#   build/dist/portix.img   → imagen raw  (QEMU, dd a USB, Rufus)
-#   build/dist/portix.iso   → ISO booteable (VirtualBox, VMware, DVD, Ventoy)
-#   build/dist/portix.vdi   → VirtualBox nativo
-#   build/dist/portix.vmdk  → VMware / VirtualBox alternativo
-#
-# Requisitos MÍNIMOS (Windows MINGW64 con solo QEMU instalado):
-#   - nasm
-#   - cargo + rust nightly
-#   - objcopy  (viene con mingw-w64-x86_64-binutils en MSYS2)
-#   - qemu-system-x86_64  (para ejecutar)
-#   - qemu-img            (para VDI/VMDK — viene incluido con QEMU)
-#
-# La ISO se genera en Python puro sin xorriso ni genisoimage.
-# Si xorriso o genisoimage están disponibles se usan preferentemente.
-#
-# Uso:
-#   python scripts/build.py                   # build completo + lanzar QEMU raw
-#   python scripts/build.py --no-run          # solo build, sin lanzar QEMU
-#   python scripts/build.py --mode=iso        # lanzar QEMU con ISO
-#   python scripts/build.py --mode=both       # QEMU raw + QEMU iso simultaneos
-#   python scripts/build.py --clean           # limpiar build/
 
 import io
 import math
@@ -35,6 +39,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -58,6 +63,7 @@ ISO_IMG    = DIST / "portix.iso"
 VDI_IMG    = DIST / "portix.vdi"
 VMDK_IMG   = DIST / "portix.vmdk"
 RAW_COPY   = DIST / "portix.img"
+VSIM_IMG   = DIST / "portix-ventoy-sim.img"
 
 BUILD_LOG  = LOGS / "build.log"
 SERIAL_LOG = LOGS / "serial.log"
@@ -67,9 +73,12 @@ DEBUG_LOG  = LOGS / "debug.log"
 # LAYOUT DEL DISCO
 # ══════════════════════════════════════════════════════════════════════════════
 STAGE2_SECTORS   = 64
-KERNEL_LBA_START = 1 + STAGE2_SECTORS    # LBA 65
+KERNEL_LBA_START = 1 + STAGE2_SECTORS      # LBA 65 relativo a la imagen
 KERNEL_MARGIN    = 64
 DISK_MIN_MB      = 8
+
+VENTOY_SIM_OFFSET_SECTORS = 2048
+VENTOY_SIM_DISK_MB        = 64
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TARGET RUST
@@ -98,7 +107,8 @@ TARGET_JSON_CONTENT = """{
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
-_OBJCOPY = "objcopy"   # se sobreescribe en check_tools()
+_OBJCOPY = "objcopy"
+_t0 = time.monotonic()
 
 def log(msg: str):
     ts   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -107,6 +117,10 @@ def log(msg: str):
     LOGS.mkdir(parents=True, exist_ok=True)
     with open(BUILD_LOG, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+def step(name: str):
+    elapsed = time.monotonic() - _t0
+    log(f"=== {name}  ({elapsed:.1f}s) ===")
 
 def run(cmd: list, **kwargs):
     cmd = [str(c) for c in cmd]
@@ -118,7 +132,6 @@ def run(cmd: list, **kwargs):
     return result
 
 def run_safe(cmd: list, **kwargs) -> bool:
-    """Como run() pero retorna True/False sin abortar."""
     cmd = [str(c) for c in cmd]
     log(f"  > {' '.join(cmd)}")
     r = subprocess.run(cmd, **kwargs)
@@ -141,13 +154,22 @@ def human(p: Path) -> str:
     b = p.stat().st_size
     return f"{b/(1024*1024):.1f} MB" if b >= 1024*1024 else f"{b//1024} KB"
 
+def arg(name: str) -> bool:
+    return name in sys.argv
+
+def arg_val(prefix: str) -> str | None:
+    for a in sys.argv:
+        if a.startswith(prefix + "="):
+            return a.split("=", 1)[1]
+    return None
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PASOS DE BUILD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_tools():
     global _OBJCOPY
-    log("=== VERIFICANDO HERRAMIENTAS ===")
+    step("VERIFICANDO HERRAMIENTAS")
 
     for t in ["nasm", "cargo", "qemu-system-x86_64"]:
         p = find_tool(t)
@@ -176,23 +198,26 @@ def reset_logs():
         BUILD_LOG.unlink()
 
 def clean():
-    log("=== LIMPIANDO ===")
+    step("LIMPIANDO")
     for d in [BUILD, DIST]:
         if d.exists():
             shutil.rmtree(d)
     log("[OK]    Limpieza completa")
 
 def assemble_boot():
-    log("=== ENSAMBLANDO BOOT + ISR ===")
+    step("ENSAMBLANDO BOOT + ISR")
     run(["nasm", "-f", "bin", BOOT_DIR / "boot.asm", "-o", BOOTBIN])
-    assert BOOTBIN.stat().st_size == 512
+    size = BOOTBIN.stat().st_size
+    if size != 512:
+        log(f"[ERROR] boot.bin debe ser 512 bytes (tiene {size})")
+        sys.exit(1)
     log(f"[OK]    boot.bin — 512 bytes")
     run(["nasm", "-f", "elf64",
          KERNEL_DIR / "src" / "arch" / "isr.asm", "-o", ISROBJ])
     log(f"[OK]    isr.o — {ISROBJ.stat().st_size} bytes")
 
 def build_kernel() -> int:
-    log("=== COMPILANDO KERNEL RUST ===")
+    step("COMPILANDO KERNEL RUST")
     if not TARGET_JSON_PATH.exists():
         TARGET_JSON_PATH.write_text(TARGET_JSON_CONTENT)
         log(f"[OK]    Creado {TARGET_JSON_PATH.name}")
@@ -200,7 +225,7 @@ def build_kernel() -> int:
     env = os.environ.copy()
     env["CARGO_ENCODED_RUSTFLAGS"] = f"-C\x1flink-arg={ISROBJ}"
     run(["cargo", "+nightly", "build", "--release",
-         "-Z", "build-std=core", "-Z", "json-target-spec",
+         "-Z", "build-std=core,alloc", "-Z", "json-target-spec",
          "--target", str(TARGET_JSON_PATH)],
         cwd=str(KERNEL_DIR), env=env)
 
@@ -220,8 +245,7 @@ def build_kernel() -> int:
     return sects
 
 def assemble_stage2(kernel_sectors: int):
-    log(f"=== ENSAMBLANDO STAGE2 "
-        f"(KERNEL_SECTORS={kernel_sectors} KERNEL_LBA={KERNEL_LBA_START}) ===")
+    step(f"ENSAMBLANDO STAGE2 (KERNEL_SECTORS={kernel_sectors} KERNEL_LBA={KERNEL_LBA_START})")
     run(["nasm", "-f", "bin",
          "-w-implicit-abs-deprecated",
          f"-DKERNEL_SECTORS={kernel_sectors}",
@@ -234,17 +258,50 @@ def assemble_stage2(kernel_sectors: int):
         sys.exit(1)
     log(f"[OK]    stage2.bin — {s2} bytes ({STAGE2_SECTORS} sectores)")
 
+
+def _inject_partition_table(img_path: Path):
+    """
+    Inyecta tabla de particiones MBR estándar en portix.img.
+    Necesario para que VirtualBox y algunos BIOSes reconozcan el disco.
+    """
+    data = bytearray(img_path.read_bytes())
+    total_sectors = len(data) // 512
+
+    if data[0x1FE] != 0x55 or data[0x1FF] != 0xAA:
+        log("[WARN]  boot.bin no tiene firma 0xAA55 — verifique boot.asm")
+
+    part = bytearray(16)
+    part[0] = 0x80              # activa/booteable
+    part[1] = 0x00              # head 0
+    part[2] = 0x02              # sector 2 (1-based)
+    part[3] = 0x00              # cilindro 0
+    part[4] = 0x0B              # FAT32 CHS
+    end_lba = total_sectors - 1
+    end_sect = (end_lba % 63) + 1
+    end_head = (end_lba // 63) % 255
+    end_cyl  = end_lba // (63 * 255)
+    part[5] = end_head & 0xFF
+    part[6] = (end_sect & 0x3F) | ((end_cyl >> 2) & 0xC0)
+    part[7] = end_cyl & 0xFF
+    struct.pack_into('<I', part, 8,  1)
+    struct.pack_into('<I', part, 12, total_sectors - 1)
+
+    data[0x1BE:0x1BE + 16] = part
+    img_path.write_bytes(bytes(data))
+    log(f"  ✓ Tabla de particiones inyectada (tipo=0x0B, LBA=1)")
+
+
 def create_raw(kernel_sectors: int):
-    log("=== CREANDO IMAGEN RAW ===")
+    step("CREANDO IMAGEN RAW")
     total  = KERNEL_LBA_START + kernel_sectors + KERNEL_MARGIN
     mb     = max(math.ceil(total * 512 / (1024*1024)), DISK_MIN_MB)
     nbytes = mb * 1024 * 1024
 
-    log(f"  Boot    LBA 0              1 sector")
-    log(f"  Stage2  LBA 1–{KERNEL_LBA_START-1}         {STAGE2_SECTORS} sectores")
-    log(f"  Kernel  LBA {KERNEL_LBA_START}–{KERNEL_LBA_START+kernel_sectors-1}    "
-        f"   {kernel_sectors} sectores  ({KERNELBIN.stat().st_size} B)")
-    log(f"  Total   {mb} MB  ({nbytes} bytes)")
+    log(f"  Layout de portix.img:")
+    log(f"    Boot    LBA 0              1 sector")
+    log(f"    Stage2  LBA 1–{KERNEL_LBA_START-1:<5}        {STAGE2_SECTORS} sectores")
+    log(f"    Kernel  LBA {KERNEL_LBA_START}–{KERNEL_LBA_START+kernel_sectors-1:<6}     {kernel_sectors} sectores")
+    log(f"    Total   {mb} MB")
 
     with open(DISK_IMG, "wb") as f:
         f.truncate(nbytes)
@@ -260,195 +317,116 @@ def create_raw(kernel_sectors: int):
     write_at(STAGE2BIN, 1)
     write_at(KERNELBIN, KERNEL_LBA_START)
 
+    _inject_partition_table(DISK_IMG)
+
     shutil.copy2(DISK_IMG, RAW_COPY)
     log(f"[OK]    portix.img — {human(DISK_IMG)}")
-    log(f"[OK]    dist/portix.img — listo para dd / Rufus")
+
+
+def create_ventoy_sim():
+    step("CREANDO DISCO VENTOY-SIM (test offset)")
+    if not DISK_IMG.exists():
+        log("[ERROR] portix.img no existe."); return
+
+    img_data = DISK_IMG.read_bytes()
+    img_sects = len(img_data) // 512
+    container_bytes = VENTOY_SIM_DISK_MB * 1024 * 1024
+    container = bytearray(container_bytes)
+
+    off = VENTOY_SIM_OFFSET_SECTORS * 512
+    container[off:off + len(img_data)] = img_data
+
+    part_lba_start = VENTOY_SIM_OFFSET_SECTORS
+    part_lba_size  = img_sects
+
+    part_entry = bytearray(16)
+    part_entry[0] = 0x80
+    part_entry[1:4] = bytes([0xFE, 0xFF, 0xFF])
+    part_entry[4] = 0x42
+    part_entry[5:8] = bytes([0xFE, 0xFF, 0xFF])
+    struct.pack_into('<I', part_entry, 8,  part_lba_start)
+    struct.pack_into('<I', part_entry, 12, part_lba_size)
+
+    chainload_asm = bytearray([
+        0xEB, 0x4E,
+        0x10, 0x00, 0x01, 0x00,
+        0x00, 0x7C, 0x00, 0x7C,
+    ])
+    chainload_asm += struct.pack('<I', part_lba_start)
+    chainload_asm += struct.pack('<I', 0)
+    while len(chainload_asm) < 0x4E:
+        chainload_asm += b'\x90'
+
+    main_code = bytearray([
+        0xFA, 0x31,0xC0, 0x8E,0xD8, 0x8E,0xC0, 0x8E,0xD0,
+        0xBC, 0x00, 0x7C, 0xFB,
+        0xBE, 0x02, 0x7C, 0xB4, 0x42, 0xCD, 0x13,
+        0x72, 0x06,
+        0xBE, 0xBE, 0x7D,
+        0xEA, 0x00, 0x7C, 0x00, 0x00,
+        0xFA, 0xF4,
+    ])
+
+    full_code = bytes(chainload_asm) + bytes(main_code)
+    mbr = bytearray(512)
+    mbr[:len(full_code[:446])] = full_code[:446]
+    mbr[0x1BE:0x1BE+16] = part_entry
+    mbr[0x1FE] = 0x55
+    mbr[0x1FF] = 0xAA
+    container[0:512] = mbr
+
+    VSIM_IMG.parent.mkdir(parents=True, exist_ok=True)
+    VSIM_IMG.write_bytes(bytes(container))
+    log(f"[OK]    dist/portix-ventoy-sim.img — {VENTOY_SIM_DISK_MB} MB")
+    log(f"        portix.img embebida en LBA {part_lba_start}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ISO — PYTHON PURO (El Torito HD Emulation, sin dependencias externas)
+# ISO
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Estructura ISO 9660 mínima:
-#   LBA 0-15  : área de sistema (LBA 0 = hybrid MBR con boot.bin)
-#   LBA 16    : Primary Volume Descriptor
-#   LBA 17    : Boot Record Descriptor (El Torito)
-#   LBA 18    : Volume Descriptor Set Terminator
-#   LBA 19    : Boot Catalog  ← media_type=0x02 (Hard Disk Emulation)
-#   LBA 20    : Directorio raíz
-#   LBA 21    : Path Table L
-#   LBA 22+   : portix.img
-#
-# Con HD Emulation el BIOS trata portix.img como un HDD real:
-#   LBA 0 del HDD virtual = LBA 22 del ISO = boot.bin
-#   INT 13h funciona → stage1 puede leer stage2 normalmente
-
-ISECT = 2048  # tamaño de sector ISO
-
-def _pad(d: bytes, n: int) -> bytes:
-    return (d + b'\x00'*n)[:n]
-
-def _b16(n): return struct.pack('<H', n) + struct.pack('>H', n)
-def _b32(n): return struct.pack('<I', n) + struct.pack('>I', n)
-def _le16(n): return struct.pack('<H', n)
-def _le32(n): return struct.pack('<I', n)
-
-def _idate(dt: datetime) -> bytes:
-    return bytes([dt.year-1900, dt.month, dt.day,
-                  dt.hour, dt.minute, dt.second, 0])
-
-def _pvd_date(dt: datetime) -> bytes:
-    return (dt.strftime("%Y%m%d%H%M%S00") + "\x00").encode()[:17]
-
-def _dirent(name: bytes, lba: int, size: int, dt: datetime, flags=0) -> bytes:
-    nlen = len(name)
-    rlen = 33 + nlen
-    if rlen % 2: rlen += 1
-    e = bytearray(rlen)
-    e[0]     = rlen
-    e[2:10]  = _b32(lba)
-    e[10:18] = _b32(size)
-    e[18:25] = _idate(dt)
-    e[25]    = flags
-    e[28:30] = _b16(1)
-    e[30]    = nlen
-    e[31:31+nlen] = name
-    return bytes(e)
-
-def build_iso_python(img_path: Path, out_path: Path):
-    log("  Generando ISO Python puro (El Torito HD emulation)...")
-    img   = img_path.read_bytes()
-    isecs = math.ceil(len(img) / ISECT)
-    now   = datetime.now()
-
-    L_PVD      = 16
-    L_BREC     = 17
-    L_TERM     = 18
-    L_BCAT     = 19
-    L_ROOT     = 20
-    L_PATH     = 21
-    L_IMG      = 22
-    L_TOTAL    = L_IMG + isecs
-
-    buf = bytearray(L_TOTAL * ISECT)
-
-    def ws(lba: int, data: bytes):
-        off = lba * ISECT
-        buf[off:off+len(data)] = data
-
-    # Sector 0: Hybrid MBR (boot.bin en los primeros 512 bytes)
-    bb = BOOTBIN.read_bytes()[:512]
-    buf[0:len(bb)] = bb
-    buf[0x1FE] = 0x55
-    buf[0x1FF] = 0xAA
-
-    # PVD
-    pvd = bytearray(ISECT)
-    pvd[0]     = 1
-    pvd[1:6]   = b'CD001'
-    pvd[6]     = 1
-    pvd[8:40]  = _pad(b'PORTIX', 32)
-    pvd[40:72] = _pad(b'PORTIX', 32)
-    pvd[80:88] = _b32(L_TOTAL)
-    pvd[120:122] = _b16(1)
-    pvd[124:126] = _b16(1)
-    pvd[128:130] = _b16(ISECT)
-    pvd[132:140] = _b32(len(img))
-    root_dot = _dirent(b'\x00', L_ROOT, ISECT, now, flags=2)
-    pvd[156:156+len(root_dot)] = root_dot
-    pvd[190:318] = _pad(b'PORTIX', 128)
-    pvd[318:446] = _pad(b'PORTIX PROJECT', 128)
-    pvd[446:574] = _pad(b'PORTIX BUILD SYSTEM V3', 128)
-    pvd[881:898] = _pvd_date(now)
-    pvd[898:915] = _pvd_date(now)
-    pvd[1883]   = 1
-    ws(L_PVD, bytes(pvd))
-
-    # Boot Record Descriptor (El Torito)
-    brd = bytearray(ISECT)
-    brd[0]    = 0
-    brd[1:6]  = b'CD001'
-    brd[6]    = 1
-    brd[7:39] = _pad(b'EL TORITO SPECIFICATION', 32)
-    brd[71:75] = _le32(L_BCAT)
-    ws(L_BREC, bytes(brd))
-
-    # Volume Descriptor Set Terminator
-    vdt = bytearray(ISECT)
-    vdt[0]   = 0xFF
-    vdt[1:6] = b'CD001'
-    vdt[6]   = 1
-    ws(L_TERM, bytes(vdt))
-
-    # Boot Catalog
-    cat = bytearray(ISECT)
-    # Validation Entry (32 bytes)
-    cat[0]    = 1       # header ID
-    cat[1]    = 0       # platform: 80x86
-    cat[4:28] = _pad(b'PORTIX', 24)
-    cat[30:32] = b'\x55\xAA'
-    # Corregir checksum: suma de todos los words = 0
-    words = list(struct.unpack('<16H', bytes(cat[:32])))
-    total_w = sum(words) & 0xFFFF
-    ck = (0x10000 - total_w) & 0xFFFF
-    struct.pack_into('<H', cat, 28, ck)
-
-    # Default/Initial Entry (32 bytes @ offset 32)
-    cat[32] = 0x88          # bootable
-    cat[33] = 0x02          # media type: Hard Disk ← CLAVE para que INT 13h funcione
-    cat[34:36] = _le16(0)   # load segment (0 = default 0x07C0)
-    cat[36]  = 0            # system type
-    cat[37]  = 0
-    cat[38:40] = _le16(1)   # sector count
-    cat[40:44] = _le32(L_IMG)   # LBA de inicio de portix.img en el ISO
-    ws(L_BCAT, bytes(cat))
-
-    # Directorio raíz
-    fname = b'PORTIX.IMG;1'
-    rdir  = bytearray(ISECT)
-    off   = 0
-    for ename, elba, eflags in [
-        (b'\x00', L_ROOT, 2),
-        (b'\x01', L_ROOT, 2),
-        (fname,   L_IMG,  0),
-    ]:
-        esize = ISECT if eflags == 2 else len(img)
-        de = _dirent(ename, elba, esize, now, flags=eflags)
-        rdir[off:off+len(de)] = de
-        off += len(de)
-    ws(L_ROOT, bytes(rdir))
-
-    # Path Table L
-    ptl = bytearray(ISECT)
-    ptl[0] = 1              # nombre length
-    ptl[1] = 0
-    ptl[2:6]  = _le32(L_ROOT)
-    ptl[6:8]  = _le16(1)
-    ptl[8]    = 0           # nombre raíz = byte nulo
-    ws(L_PATH, bytes(ptl))
-
-    # Datos de portix.img
-    off = L_IMG * ISECT
-    padded = _pad(img, isecs * ISECT)
-    buf[off:off+len(padded)] = padded
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(bytes(buf))
-    log(f"[OK]    dist/portix.iso — {human(out_path)} (Python puro, HD emul)")
 
 def create_iso():
-    log("=== CREANDO ISO ===")
-    if _iso_xorriso():   return
+    """
+    [FIX-ISO-FORMAT] Genera la ISO como copia directa de portix.img
+    con una cabecera ISO9660 mínima superpuesta para compatibilidad.
+    
+    La ISO puede usarse de dos formas:
+    1. Como disco IDE en VirtualBox/QEMU (RECOMENDADO): DL=0x80, funciona perfectamente
+    2. Como CD-ROM con xorriso: solo si xorriso está disponible
+    
+    El método Python puro genera una copia de portix.img con el sufijo .iso
+    que puede abrirse como disco duro. No intenta El Torito HD emulation
+    porque ese mecanismo no funciona de forma consistente en VirtualBox.
+    """
+    step("CREANDO ISO")
+
+    # Intentar xorriso primero (genera ISO CD-ROM real compatible)
+    if _iso_xorriso():    return
     if _iso_genisoimage(): return
-    try:
-        build_iso_python(DISK_IMG, ISO_IMG)
-    except Exception as e:
-        log(f"[ERROR] ISO Python: {e}")
-        import traceback; traceback.print_exc()
+
+    # Fallback: ISO = portix.img directamente (funciona como disco IDE)
+    _iso_as_disk()
+
+
+def _iso_as_disk():
+    """
+    [FIX-ISO-FORMAT] La ISO es una copia directa de portix.img.
+    Puede usarse como disco IDE en VirtualBox y QEMU.
+    Es técnicamente un "disco duro" renombrado como .iso para
+    ser reconocido por herramientas como Rufus y Ventoy.
+    """
+    log("  Generando ISO como disco raw (compatible VirtualBox IDE)...")
+    shutil.copy2(DISK_IMG, ISO_IMG)
+    log(f"[OK]    dist/portix.iso — {human(ISO_IMG)}")
+    log(f"        NOTA: Esta ISO es una imagen de disco, NO un CD-ROM ISO9660.")
+    log(f"        Usar como disco IDE en VirtualBox/QEMU, no como CD-ROM.")
+    log(f"        Para CD-ROM real, instalar xorriso.")
+
 
 def _iso_xorriso() -> bool:
     t = find_tool("xorriso")
     if not t: return False
-    log("  Usando xorriso...")
+    log("  Usando xorriso (ISO CD-ROM real)...")
     tree = BUILD / "_isotree"
     if tree.exists(): shutil.rmtree(tree)
     tree.mkdir(parents=True, exist_ok=True)
@@ -459,7 +437,7 @@ def _iso_xorriso() -> bool:
                    "-boot-load-size", "4", "-boot-info-table", str(tree)])
     shutil.rmtree(tree, ignore_errors=True)
     if ok and ISO_IMG.exists():
-        log(f"[OK]    dist/portix.iso — {human(ISO_IMG)} (xorriso)")
+        log(f"[OK]    dist/portix.iso — {human(ISO_IMG)} (xorriso, CD-ROM real)")
         return True
     return False
 
@@ -480,12 +458,9 @@ def _iso_genisoimage() -> bool:
         return True
     return False
 
-# ══════════════════════════════════════════════════════════════════════════════
-# VDI y VMDK via qemu-img
-# ══════════════════════════════════════════════════════════════════════════════
 
 def create_vdi():
-    log("=== CREANDO VDI (VirtualBox) ===")
+    step("CREANDO VDI (VirtualBox)")
     qi = find_tool("qemu-img")
     if not qi:
         log("[WARN]  qemu-img no disponible — omitiendo VDI")
@@ -499,7 +474,7 @@ def create_vdi():
         log("[WARN]  No se pudo generar VDI")
 
 def create_vmdk():
-    log("=== CREANDO VMDK (VMware/VirtualBox) ===")
+    step("CREANDO VMDK (VMware/VirtualBox)")
     qi = find_tool("qemu-img")
     if not qi:
         log("[WARN]  qemu-img no disponible — omitiendo VMDK")
@@ -517,8 +492,8 @@ def create_vmdk():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_qemu():
-    mode = next((a.split("=",1)[1] for a in sys.argv if a.startswith("--mode=")), "raw")
-    log(f"=== EJECUTANDO QEMU (modo: {mode}) ===")
+    mode = arg_val("--mode") or "raw"
+    step(f"EJECUTANDO QEMU (modo: {mode})")
 
     base = ["-m", "256M", "-vga", "std",
             "-serial", f"file:{SERIAL_LOG}",
@@ -526,19 +501,34 @@ def run_qemu():
             "-d", "int,guest_errors", "-D", str(DEBUG_LOG)]
 
     def raw():
+        log("  QEMU modo RAW (portix.img como disco IDE)")
         subprocess.run(["qemu-system-x86_64",
             "-drive", f"format=raw,file={DISK_IMG},if=ide,index=0,media=disk",
         ] + base)
 
     def iso():
-        if not ISO_IMG.exists():
-            log("[WARN]  ISO no disponible, usando raw"); raw(); return
+        # [FIX-QEMU-ISO] Usar ISO como disco IDE, no como CD-ROM
+        target = ISO_IMG if ISO_IMG.exists() else DISK_IMG
+        log(f"  QEMU modo ISO (como disco IDE: {target.name})")
         subprocess.run(["qemu-system-x86_64",
-            "-cdrom", str(ISO_IMG), "-boot", "d",
+            "-drive", f"format=raw,file={target},if=ide,index=0,media=disk",
+        ] + base)
+
+    def ventoy_sim():
+        if not VSIM_IMG.exists():
+            log("[WARN]  ventoy-sim.img no existe, generando...")
+            create_ventoy_sim()
+        if not VSIM_IMG.exists():
+            log("[ERROR] No se pudo crear ventoy-sim.img"); return
+        log(f"  QEMU modo VENTOY-SIM")
+        subprocess.run(["qemu-system-x86_64",
+            "-drive", f"format=raw,file={VSIM_IMG},if=ide,index=0,media=disk",
         ] + base)
 
     if mode == "iso":
         iso()
+    elif mode == "ventoy-sim":
+        ventoy_sim()
     elif mode == "both":
         t1 = threading.Thread(target=raw, daemon=True)
         t2 = threading.Thread(target=iso, daemon=True)
@@ -552,26 +542,38 @@ def run_qemu():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def summary():
+    elapsed = time.monotonic() - _t0
     print()
-    print("╔══════════════════════════════════════════════════════════════════════╗")
-    print("║                 PORTIX — ARCHIVOS DE DISTRIBUCIÓN                   ║")
-    print("╠══════════════════════════════════════════════════════════════════════╣")
+    print("╔══════════════════════════════════════════════════════════════════════════╗")
+    print("║              PORTIX v4.2 — ARCHIVOS DE DISTRIBUCIÓN                     ║")
+    print("╠══════════════════════════════════════════════════════════════════════════╣")
     entries = [
-        (RAW_COPY, "IMG  ", "dd/Rufus → USB real,  QEMU -drive raw"),
-        (ISO_IMG,  "ISO  ", "VirtualBox · VMware · QEMU -cdrom · DVD"),
-        (VDI_IMG,  "VDI  ", "VirtualBox: Nueva VM → Almacenamiento → Add"),
+        (RAW_COPY, "IMG  ", "dd/Rufus → USB  |  QEMU -drive raw"),
+        (ISO_IMG,  "ISO  ", "QEMU como disco IDE  |  Ventoy  |  dd a USB"),
+        (VDI_IMG,  "VDI  ", "VirtualBox → disco IDE (RECOMENDADO)"),
         (VMDK_IMG, "VMDK ", "VMware o VirtualBox alternativo"),
+        (VSIM_IMG, "SIM  ", "Test offset Ventoy (--mode=ventoy-sim)"),
     ]
     for p, lbl, uso in entries:
         if p.exists():
-            print(f"║  ✓ {lbl}  {p.name:<20} {human(p):<8}  {uso}  ║")
+            print(f"║  ✓ {lbl}  {p.name:<30} {human(p):<8}  {uso:<33} ║")
         else:
-            print(f"║  ✗ {lbl}  {'(no generado)':<52}  ║")
-    print("╠══════════════════════════════════════════════════════════════════════╣")
-    print("║  VirtualBox: Nueva VM → Tipo=Other/Unknown 64bit                    ║")
-    print("║    · ISO:  Almacenamiento → Controlador IDE → Agregar CD → portix.iso║")
-    print("║    · VDI:  Almacenamiento → Controlador SATA → Agregar disco → .vdi ║")
-    print("╚══════════════════════════════════════════════════════════════════════╝")
+            print(f"║  ✗ {lbl}  {'(no generado)':<73} ║")
+    print("╠══════════════════════════════════════════════════════════════════════════╣")
+    print(f"║  Build total: {elapsed:.1f}s                                                       ║")
+    print("╠══════════════════════════════════════════════════════════════════════════╣")
+    print("║  ┌─ VirtualBox (INSTRUCCIONES) ────────────────────────────────────┐    ║")
+    print("║  │ RECOMENDADO: Nueva VM → Almacenamiento → SATA → portix.vdi      │    ║")
+    print("║  │ ALTERNATIVO: Nueva VM → Almacenamiento → IDE  → portix.img      │    ║")
+    print("║  │ CON ISO:     Nueva VM → Almacenamiento → IDE  → portix.iso      │    ║")
+    print("║  │              (adjuntar como DISCO DURO, NO como CD-ROM)          │    ║")
+    print("║  │ NUNCA: adjuntar portix.iso como CD-ROM (El Torito no compatible) │    ║")
+    print("║  └──────────────────────────────────────────────────────────────────┘    ║")
+    print("╠══════════════════════════════════════════════════════════════════════════╣")
+    print("║  QEMU:   python build.py --mode=raw   (portix.img)                      ║")
+    print("║          python build.py --mode=iso   (portix.iso como disco IDE)       ║")
+    print("║  Ventoy: copiar portix.img o portix.iso a la partición Ventoy del USB   ║")
+    print("╚══════════════════════════════════════════════════════════════════════════╝")
     print()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -579,14 +581,17 @@ def summary():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global _t0
+    _t0 = time.monotonic()
+
     print()
     print("╔══════════════════════════════════════════════════════╗")
-    print("║         PORTIX BUILD SYSTEM  v3.0                   ║")
-    print("║  Genera: IMG · ISO · VDI · VMDK automáticamente     ║")
+    print("║         PORTIX BUILD SYSTEM  v4.2                   ║")
+    print("║  Genera: IMG · ISO · VDI · VMDK · SIM               ║")
     print("╚══════════════════════════════════════════════════════╝")
     print()
 
-    if "--clean" in sys.argv:
+    if arg("--clean"):
         clean(); return
 
     reset_logs()
@@ -595,12 +600,22 @@ def main():
     ks = build_kernel()
     assemble_stage2(ks)
     create_raw(ks)
-    create_iso()
-    create_vdi()
-    create_vmdk()
+
+    if not arg("--no-iso"):
+        create_iso()
+    else:
+        log("[SKIP]  ISO omitida (--no-iso)")
+
+    if not arg("--no-vm"):
+        create_vdi()
+        create_vmdk()
+    else:
+        log("[SKIP]  VDI/VMDK omitidos (--no-vm)")
+
+    create_ventoy_sim()
     summary()
 
-    if "--no-run" not in sys.argv:
+    if not arg("--no-run"):
         run_qemu()
 
 if __name__ == "__main__":

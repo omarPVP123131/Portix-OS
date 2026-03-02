@@ -3,10 +3,10 @@
 pub mod chrome;
 pub mod exception;
 pub mod tabs;
+pub mod input;
 
 // Re-exportamos para facilitar el uso desde main.rs
 pub use chrome::{section_label, draw_chrome};
-pub use exception::draw_exception;
 pub use tabs::{draw_system_tab, draw_terminal_tab, draw_devices_tab, draw_ide_tab, draw_explorer_tab};
 pub use tabs::terminal::terminal_hist_geometry;
 

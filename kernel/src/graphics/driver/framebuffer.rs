@@ -76,13 +76,13 @@ impl Color {
 pub struct Layout {
     pub fw:        usize,
     pub fh:        usize,
-    pub header_h:  usize,
-    pub gold_h:    usize,
-    pub tab_h:     usize,
-    pub tab_y:     usize,
-    pub tab_w:     usize,
-    pub content_y: usize,
-    pub bottom_y:  usize,
+    pub header_h:  usize,  // altura de cabecera
+    pub gold_h:    usize,  // línea dorada
+    pub tab_h:     usize,  // altura de la barra de tabs
+    pub tab_y:     usize,  // y donde empiezan las tabs
+    pub tab_w:     usize,  // ancho de cada tab (para hit-testing)
+    pub content_y: usize,  // y donde empieza el área de contenido
+    pub bottom_y:  usize,  // y donde empieza la status bar inferior
     pub pad:       usize,
     pub col_div:   usize,
     pub right_x:   usize,
@@ -91,38 +91,49 @@ pub struct Layout {
     pub font_h:    usize,
 }
 
+
 impl Layout {
     pub fn new(fw: usize, fh: usize) -> Self {
-        let header_h  = clamp(fh / 14, 44, 60);
-        let gold_h    = 3;
-        let tab_h     = clamp(fh / 32, 20, 28);
-        let tab_y     = header_h + gold_h;
-        let content_y = tab_y + tab_h + 2;
-        let bottom_y  = fh.saturating_sub(clamp(fh / 34, 18, 24));
-        let pad       = clamp(fw / 56, 10, 30);
-        let col_div   = fw * 5 / 12;
-        let tab_w     = 152;
+        // Tamaños fijos y razonables para VESA 1024×768
+        let header_h  = 48usize;
+        let gold_h    = 3usize;
+        let tab_h     = 26usize;
+        let tab_y     = header_h + gold_h;            // 51
+        let content_y = tab_y + tab_h;                // 77
+        // Status bar: 20px fijos al fondo
+        let status_h  = 20usize;
+        let bottom_y  = fh.saturating_sub(status_h);  // 748 en 768px
+
+        let pad     = 12usize;
+        let col_div = fw * 5 / 12;
+        let tab_w   = fw / 5; // 5 pestañas iguales
+
         Layout {
-            fw, fh, header_h, gold_h, tab_h, tab_y, tab_w,
-            content_y, bottom_y, pad,
-            col_div, right_x: col_div + pad + 4,
-            line_h: 15, font_w: 8, font_h: 8,
+            fw, fh,
+            header_h, gold_h, tab_h, tab_y, tab_w,
+            content_y, bottom_y,
+            pad,
+            col_div,
+            right_x: col_div + pad + 4,
+            line_h:  15,
+            font_w:  8,
+            font_h:  8,
         }
     }
-    pub fn left_w(&self)    -> usize { self.col_div.saturating_sub(self.pad * 2) }
-    pub fn right_w(&self)   -> usize { self.fw.saturating_sub(self.right_x + self.pad) }
-    pub fn content_h(&self) -> usize { self.bottom_y.saturating_sub(self.content_y) }
+
+    pub fn left_w(&self)      -> usize { self.col_div.saturating_sub(self.pad * 2) }
+    pub fn right_w(&self)     -> usize { self.fw.saturating_sub(self.right_x + self.pad) }
+    pub fn content_h(&self)   -> usize { self.bottom_y.saturating_sub(self.content_y) }
     pub fn content_lines(&self) -> usize { self.content_h() / self.line_h }
 
     pub fn tab_hit(&self, mx: i32, my: i32) -> i32 {
         let x = mx as usize;
         let y = my as usize;
-        if y < self.tab_y || y >= self.tab_y + self.tab_h + 2 { return -1; }
+        if y < self.tab_y || y >= self.tab_y + self.tab_h { return -1; }
         let idx = x / self.tab_w;
-        if idx < 3 { idx as i32 } else { -1 }
+        if idx < 5 { idx as i32 } else { -1 }
     }
 }
-
 fn clamp(v: usize, lo: usize, hi: usize) -> usize { v.max(lo).min(hi) }
 
 // ── Framebuffer con doble buffer ──────────────────────────────────────────────

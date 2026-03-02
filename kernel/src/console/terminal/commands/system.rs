@@ -25,6 +25,14 @@ pub fn cmd_help(t: &mut Terminal) {
     t.write_line("    date          Fecha/hora desde el arranque",                LineColor::Normal);
     t.write_empty();
 
+    t.write_line("  DISCO ATA:", LineColor::Info);
+    t.write_line("    diskinfo                  Listar drives ATA detectados",    LineColor::Normal);
+    t.write_line("    diskread [lba] [drive]    Hexdump de sector (sin editar)",  LineColor::Normal);
+    t.write_line("    diskedit [lba] [drive]    Editor hexadecimal interactivo",  LineColor::Normal);
+    t.write_line("    diskwrite <lba> <0xPAT>   Rellenar sector (QEMU/debug)",    LineColor::Normal);
+    t.write_line("    drive: 0=ATA0-M 1=ATA0-S 2=ATA1-M 3=ATA1-S",              LineColor::Normal);
+    t.write_empty();
+
     t.write_line("  HARDWARE Y DEPURACION:", LineColor::Info);
     t.write_line("    hexdump <dir> [bytes]  Volcado hexadecimal de memoria",     LineColor::Normal);
     t.write_line("    peek <dir>             Leer 8 bytes en direccion fisica",   LineColor::Normal);
@@ -172,7 +180,6 @@ pub fn cmd_info(t: &mut Terminal, hw: &crate::arch::hardware::HardwareInfo) {
 
 pub fn cmd_cpu(t: &mut Terminal, hw: &crate::arch::hardware::HardwareInfo) {
     t.separador("PROCESADOR (CPU)");
-    // Modelo
     {
         let mut lb = [0u8; TERM_COLS]; let bl = b"  Modelo     : ";
         lb[..bl.len()].copy_from_slice(bl);
@@ -181,7 +188,6 @@ pub fn cmd_cpu(t: &mut Terminal, hw: &crate::arch::hardware::HardwareInfo) {
         lb[bl.len()..bl.len() + nl].copy_from_slice(&n[..nl]);
         t.write_bytes(&lb[..bl.len() + nl], LineColor::Normal);
     }
-    // Núcleos
     {
         let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Nucleos    : ");
@@ -191,7 +197,6 @@ pub fn cmd_cpu(t: &mut Terminal, hw: &crate::arch::hardware::HardwareInfo) {
         append_str(&mut buf, &mut pos, b" logicos");
         t.write_bytes(&buf[..pos], LineColor::Normal);
     }
-    // Frecuencia
     {
         let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Frecuencia : max ");
@@ -202,7 +207,6 @@ pub fn cmd_cpu(t: &mut Terminal, hw: &crate::arch::hardware::HardwareInfo) {
         }
         t.write_bytes(&buf[..pos], LineColor::Normal);
     }
-    // Extensiones ISA
     {
         let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Extensiones:");
@@ -344,7 +348,6 @@ pub fn cmd_neofetch(
         "                                            ",
     ];
 
-    // Build info lines into a fixed-size array
     let mut il:  [[u8; 80]; 14] = [[0u8; 80]; 14];
     let mut ils: [usize; 14]    = [0; 14];
     let mut n = 0usize;
@@ -411,25 +414,21 @@ pub fn cmd_neofetch(
       append_u32(&mut buf, &mut pos, s); append_str(&mut buf, &mut pos, b"s");
       il[n] = buf; ils[n] = pos; n += 1; }
 
-   let rows = LOGO.len().max(n);
-for row in 0..rows {
-    let mut combined = [0u8; TERM_COLS];
-    
-    if row < LOGO.len() {
-        let lb = LOGO[row].as_bytes(); let ll = lb.len().min(44);
-        combined[..ll].copy_from_slice(&lb[..ll]);
+    let rows = LOGO.len().max(n);
+    for row in 0..rows {
+        let mut combined = [0u8; TERM_COLS];
+        if row < LOGO.len() {
+            let lb = LOGO[row].as_bytes(); let ll = lb.len().min(44);
+            combined[..ll].copy_from_slice(&lb[..ll]);
+        }
+        let mut cp = 46;
+        if row < n {
+            let l = ils[row].min(TERM_COLS.saturating_sub(cp));
+            combined[cp..cp + l].copy_from_slice(&il[row][..l]);
+            cp += l;
+        }
+        let col = if row < LOGO.len() { LineColor::Header } else { LineColor::Normal };
+        if cp > 0 { t.write_bytes(&combined[..cp], col); }
     }
-
-    let mut cp = 46; 
-    
-    if row < n {
-        let l = ils[row].min(TERM_COLS.saturating_sub(cp));
-        combined[cp..cp + l].copy_from_slice(&il[row][..l]); 
-        cp += l;
-    }
-    
-    let col = if row < LOGO.len() { LineColor::Header } else { LineColor::Normal };
-    if cp > 0 { t.write_bytes(&combined[..cp], col); }
-}
     t.write_empty();
 }

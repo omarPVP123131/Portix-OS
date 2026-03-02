@@ -1,11 +1,17 @@
 // kernel/src/main.rs — PORTIX Kernel v0.7.4
 //
-// Este archivo contiene únicamente:
-//   - Declaración de módulos
-//   - Ensamblado de arranque (_start)
-//   - Constantes globales del kernel
-//   - Drenado unificado del buffer PS/2 (ver comentario en el loop)
-//   - Lógica principal del loop de eventos
+// FIX RAÍZ: El kernel binario era ~2 MB más grande de lo esperado porque
+// PAGE_POOL en ide.rs era un static con inicializador no-cero (next:-1, prev:-1),
+// lo que Rust emite en .data en lugar de .bss → 2 MB en el ELF.
+// El bootloader no podía cargar el kernel completo → saltaba a código incompleto → #UD.
+//
+// SOLUCIÓN en ide.rs:
+//   static mut PAGE_POOL: MaybeUninit<[Page; 64]> = MaybeUninit::uninit();
+//   → Todo ceros → va a .bss → 0 bytes en el binario
+//   → Se inicializa en runtime con init_page_pool() al inicio de rust_main()
+//
+// El stack (0x7FF00) y los MaybeUninit de IdeState/ExplorerState son correctos
+// y se mantienen igual.
 
 #![no_std]
 #![no_main]
@@ -23,13 +29,16 @@ use core::arch::global_asm;
 use graphics::driver::framebuffer::{Color, Console, Layout};
 use drivers::input::keyboard::Key;
 use console::terminal::LineColor;
+use console::terminal::editor::draw_editor_tab;
 use ui::{Tab, SCROLLBAR_W, draw_chrome, draw_system_tab, draw_terminal_tab,
-         draw_devices_tab};
-use ui::tabs::terminal::terminal_hist_geometry;
+         draw_devices_tab, draw_ide_tab, draw_explorer_tab, terminal_hist_geometry};
+use ui::tabs::ide::{IdeState, init_page_pool};
+use ui::tabs::explorer::ExplorerState;
 
 extern "C" {
     static __bss_start: u8;
     static __bss_end:   u8;
+    static __stack_top: u8;   // ← agregar esto
 }
 
 global_asm!(
@@ -39,7 +48,7 @@ global_asm!(
     "_start:",
     "    cli",
     "    cld",
-    "    mov rsp, 0x7FF00",
+    "    lea rsp, [rip + {STACK_TOP}]",   // ← reemplaza el mov rsp hardcodeado
     "    xor rbp, rbp",
     "    lea rdi, [rip + {BSS_START}]",
     "    lea rcx, [rip + {BSS_END}]",
@@ -53,6 +62,7 @@ global_asm!(
     "    call {RUST_MAIN}",
     "2:  hlt",
     "    jmp 2b",
+    STACK_TOP = sym __stack_top,
     BSS_START = sym __bss_start,
     BSS_END   = sym __bss_end,
     RUST_MAIN = sym rust_main,
@@ -63,7 +73,6 @@ global_asm!(
 const RENDER_HZ:       u64 = 30;
 const RENDER_INTERVAL: u64 = 100 / RENDER_HZ;
 
-/// Registros del controlador PS/2 8042 (solo usados en el drenado unificado)
 const PS2_STATUS: u16 = 0x64;
 const PS2_DATA:   u16 = 0x60;
 
@@ -74,15 +83,27 @@ unsafe fn ps2_inb(p: u16) -> u8 {
     v
 }
 
-// ── Punto de entrada del kernel ───────────────────────────────────────────────
+// ── Almacenamiento estático para estructuras grandes ─────────────────────────
+//
+// ExplorerState (~80 KB) e IdeState se guardan en BSS como MaybeUninit.
+// PAGE_POOL (~2 MB) también en BSS gracias al fix en ide.rs.
+
+static mut IDE_STORAGE:      core::mem::MaybeUninit<IdeState>      = core::mem::MaybeUninit::uninit();
+static mut EXPLORER_STORAGE: core::mem::MaybeUninit<ExplorerState> = core::mem::MaybeUninit::uninit();
+
+// ── Punto de entrada ──────────────────────────────────────────────────────────
 
 #[no_mangle]
 extern "C" fn rust_main() -> ! {
+    // CRÍTICO: init_page_pool() DEBE ir primero, antes de cualquier IdeState::new().
+    // Escribe los valores de sentinel (-1) en next/prev del PAGE_POOL,
+    // que el BSS clear dejó a ceros.
+    unsafe { init_page_pool(); }
+
     unsafe { arch::idt::init_idt(); }
     drivers::serial::init();
-    drivers::serial::log("PORTIX", "kernel v0.7.4 iniciando");
-
     time::pit::init();
+    unsafe { core::arch::asm!("sti", options(nostack, preserves_flags)); }
     drivers::serial::log("PIT", "temporizador 100 Hz inicializado");
 
     let hw  = arch::hardware::HardwareInfo::detect_all();
@@ -97,21 +118,42 @@ extern "C" fn rust_main() -> ! {
         drivers::serial::write_str(" dispositivos\n");
     }
 
+    {
+        let ata = drivers::storage::ata::AtaBus::scan();
+        drivers::storage::ata::log_drives(&ata);
+    }
+
     let mut kbd = drivers::input::keyboard::KeyboardState::new();
     let mut ms  = drivers::input::mouse::MouseState::new();
     let mut c   = Console::new();
     let lay     = Layout::new(c.width(), c.height());
 
     ms.init(lay.fw.max(1), lay.fh.max(1));
-    if ms.present {
-        drivers::serial::log("MOUSE",
-            if ms.has_wheel { "PS/2 + rueda" } else { "PS/2 sin rueda" });
-    }
 
     let mut term = console::terminal::Terminal::new();
     term.write_line("PORTIX v0.7.4  Kernel Bare-Metal", LineColor::Header);
-    term.write_line("Escribe 'ayuda' para comandos. Rueda=scroll. Clic en tabs para cambiar.", LineColor::Info);
+    term.write_line("Escribe 'ayuda' para comandos.", LineColor::Info);
     term.write_empty();
+
+    // Inicializar IDE y Explorer en BSS (NO variables locales — desbordarían el stack)
+    unsafe {
+        IDE_STORAGE.write(IdeState::new());
+        EXPLORER_STORAGE.write(ExplorerState::new(2));
+    }
+    let ide:      &mut IdeState      = unsafe { IDE_STORAGE.assume_init_mut() };
+    let explorer: &mut ExplorerState = unsafe { EXPLORER_STORAGE.assume_init_mut() };
+
+    // Intentar montar FAT32 para obtener el clúster raíz real
+    {
+        let ata = drivers::storage::ata::AtaBus::scan();
+        if let Some(drive) = ata.drive(drivers::storage::ata::DriveId::Primary0) {
+            if let Ok(vol) = drivers::storage::fat32::Fat32Volume::mount(drive) {
+                unsafe {
+                    EXPLORER_STORAGE.write(ExplorerState::new(vol.root_cluster()));
+                }
+            }
+        }
+    }
 
     let mut tab = Tab::System;
     let mut sb_dragging:    bool  = false;
@@ -142,31 +184,18 @@ extern "C" fn rust_main() -> ! {
     loop {
         let now = time::pit::ticks();
 
-        // ════════════════════════════════════════════════════════════════════
-        // DRENADO UNIFICADO DEL BUFFER PS/2
-        //
-        // El 8042 tiene UN SOLO registro de datos (0x60) compartido entre
-        // teclado y ratón. El bit AUXB (bit 5 de 0x64) indica el origen:
-        //   AUXB = 0 → teclado  →  cola kbd_buf
-        //   AUXB = 1 → ratón    →  cola ms_buf
-        //
-        // Leemos aquí TODOS los bytes disponibles y los enrutamos. Ningún
-        // driver toca 0x60 directamente durante el resto del frame.
-        // ════════════════════════════════════════════════════════════════════
-        let mut kbd_buf = [0u8; 32];
-        let mut kbd_n   = 0usize;
-        let mut ms_buf  = [0u8; 32];
-        let mut ms_n    = 0usize;
-
+        // ── Drenado unificado PS/2 ────────────────────────────────────────
+        let mut kbd_buf = [0u8; 32]; let mut kbd_n = 0usize;
+        let mut ms_buf  = [0u8; 32]; let mut ms_n  = 0usize;
         unsafe {
             loop {
                 let st = ps2_inb(PS2_STATUS);
                 if st & 0x01 == 0 { break; }
                 let byte = ps2_inb(PS2_DATA);
                 if st & 0x20 != 0 {
-                    if ms_n  < 32 { ms_buf[ms_n]   = byte; ms_n  += 1; }
+                    if ms_n  < 32 { ms_buf[ms_n]  = byte; ms_n  += 1; }
                 } else {
-                    if kbd_n < 32 { kbd_buf[kbd_n]  = byte; kbd_n += 1; }
+                    if kbd_n < 32 { kbd_buf[kbd_n] = byte; kbd_n += 1; }
                 }
             }
         }
@@ -175,17 +204,45 @@ extern "C" fn rust_main() -> ! {
         for i in 0..kbd_n {
             if let Some(key) = kbd.feed_byte(kbd_buf[i]) {
                 needs_draw = true;
+
+                if term.editor.is_some() {
+                    let should_exit = {
+                        let ed = term.editor.as_mut().unwrap();
+                        ed.handle_key(key);
+                        ed.exit
+                    };
+                    if should_exit {
+                        term.editor = None;
+                        term.write_line("  Editor cerrado.", LineColor::Info);
+                        tab = Tab::Terminal;
+                    }
+                    continue;
+                }
+
+                let ctrl = false;
+
                 match key {
                     Key::F1  => tab = Tab::System,
                     Key::F2  => tab = Tab::Terminal,
                     Key::F3  => tab = Tab::Devices,
-                    Key::Tab => {
+                    Key::F4  => tab = Tab::Ide,
+                    Key::F5  => {
+                        if tab == Tab::Explorer {
+                            explorer.needs_refresh = true;
+                        } else {
+                            tab = Tab::Explorer;
+                        }
+                    }
+                    Key::Tab if !ctrl => {
                         tab = match tab {
                             Tab::System   => Tab::Terminal,
                             Tab::Terminal => Tab::Devices,
-                            Tab::Devices  => Tab::System,
+                            Tab::Devices  => Tab::Ide,
+                            Tab::Ide      => Tab::Explorer,
+                            Tab::Explorer => Tab::System,
                         };
                     }
+
                     Key::PageUp if tab == Tab::Terminal => {
                         let (_, _, _, ml) = terminal_hist_geometry(&lay);
                         term.scroll_up(10, ml);
@@ -208,7 +265,31 @@ extern "C" fn rust_main() -> ! {
                     Key::Enter if tab == Tab::Terminal => {
                         drivers::serial::write_byte(b'\n');
                         term.enter(&hw, &pci);
+                        if term.editor.is_some() { tab = Tab::Terminal; }
                     }
+
+                    _ if tab == Tab::Ide => {
+                        let ch_px  = lay.font_h;
+                        let lh     = ch_px + 2;
+                        let tab_bh = ch_px + 6;
+                        let st_h   = ch_px + 6;
+                        let edit_h = lay.fh.saturating_sub(lay.content_y + tab_bh + 1 + st_h);
+                        let vis_r  = edit_h / lh;
+                        ide.handle_key(key, ctrl, vis_r);
+                    }
+
+                    _ if tab == Tab::Explorer => {
+                        explorer.handle_key(key);
+                        if explorer.open_request {
+                            explorer.open_request = false;
+                            let name = core::str::from_utf8(
+                                &explorer.open_name[..explorer.open_name_len]
+                            ).unwrap_or("archivo");
+                            ide.open_new(name);
+                            tab = Tab::Ide;
+                        }
+                    }
+
                     Key::Escape => {
                         if tab == Tab::Terminal {
                             term.clear_history();
@@ -225,88 +306,99 @@ extern "C" fn rust_main() -> ! {
         let mouse_changed = if ms.present && ms_n > 0 {
             ms.begin_frame();
             let mut changed = false;
-            for i in 0..ms_n {
-                if ms.feed(ms_buf[i]) { changed = true; }
-            }
+            for i in 0..ms_n { if ms.feed(ms_buf[i]) { changed = true; } }
             if ms.error_count >= 25 { ms.intelligent_reset(); }
             changed
-        } else {
-            false
-        };
+        } else { false };
 
         if mouse_changed { needs_draw = true; }
 
-        // ── Lógica de UI con ratón ────────────────────────────────────────
-        let fw   = lay.fw;
-        let sb_x = fw.saturating_sub(SCROLLBAR_W) as i32;
+        // ── UI con ratón ──────────────────────────────────────────────────
+        if term.editor.is_none() {
+            let fw   = lay.fw;
+            let sb_x = fw.saturating_sub(SCROLLBAR_W) as i32;
 
-        if sb_dragging && (ms.left_released() || !ms.left_btn()) {
-            sb_dragging = false;
-            needs_draw  = true;
-        }
+            if sb_dragging && (ms.left_released() || !ms.left_btn()) {
+                sb_dragging = false; needs_draw = true;
+            }
 
-        if sb_dragging && ms.left_btn() && tab == Tab::Terminal {
-            let (_, hist_h, _, max_lines) = terminal_hist_geometry(&lay);
-            let max_scroll = term.max_scroll(max_lines);
-            if max_scroll > 0 {
-                let available = term.line_count.saturating_sub(
-                    if term.line_count > console::terminal::TERM_ROWS {
-                        term.line_count - console::terminal::TERM_ROWS
-                    } else { 0 }
-                );
-                let thumb_h = if available == 0 { hist_h }
-                              else { (hist_h * max_lines / available).max(10).min(hist_h) };
-                let travel = hist_h.saturating_sub(thumb_h) as i32;
-                if travel > 0 {
-                    let dy        = ms.y - sb_drag_y;
-                    let new_offset = sb_drag_offset as i32 - (dy * max_scroll as i32) / travel;
-                    term.scroll_offset = new_offset.max(0).min(max_scroll as i32) as usize;
+            if sb_dragging && ms.left_btn() && tab == Tab::Terminal {
+                let (_, hist_h, _, max_lines) = terminal_hist_geometry(&lay);
+                let max_scroll = term.max_scroll(max_lines);
+                if max_scroll > 0 {
+                    let available = term.line_count.saturating_sub(
+                        if term.line_count > console::terminal::TERM_ROWS {
+                            term.line_count - console::terminal::TERM_ROWS
+                        } else { 0 }
+                    );
+                    let thumb_h = if available == 0 { hist_h }
+                                  else { (hist_h * max_lines / available).max(10).min(hist_h) };
+                    let travel = hist_h.saturating_sub(thumb_h) as i32;
+                    if travel > 0 {
+                        let dy = ms.y - sb_drag_y;
+                        let new_offset = sb_drag_offset as i32 - (dy * max_scroll as i32) / travel;
+                        term.scroll_offset = new_offset.max(0).min(max_scroll as i32) as usize;
+                    }
+                }
+                needs_draw = true;
+            }
+
+            if mouse_changed && ms.left_clicked() {
+                if tab == Tab::Terminal && ms.x >= sb_x {
+                    sb_dragging    = true;
+                    sb_drag_y      = ms.y;
+                    sb_drag_offset = term.scroll_offset;
+                    needs_draw     = true;
+                } else {
+                    match lay.tab_hit(ms.x, ms.y) {
+                        0 => { tab = Tab::System;   needs_draw = true; }
+                        1 => { tab = Tab::Terminal; needs_draw = true; }
+                        2 => { tab = Tab::Devices;  needs_draw = true; }
+                        3 => { tab = Tab::Ide;      needs_draw = true; }
+                        4 => { tab = Tab::Explorer; needs_draw = true; }
+                        _ => {}
+                    }
                 }
             }
-            needs_draw = true;
-        }
 
-        if mouse_changed && ms.left_clicked() {
-            if tab == Tab::Terminal && ms.x >= sb_x {
-                sb_dragging    = true;
-                sb_drag_y      = ms.y;
-                sb_drag_offset = term.scroll_offset;
-                needs_draw     = true;
-            } else {
-                match lay.tab_hit(ms.x, ms.y) {
-                    0 => { tab = Tab::System;   needs_draw = true; }
-                    1 => { tab = Tab::Terminal; needs_draw = true; }
-                    2 => { tab = Tab::Devices;  needs_draw = true; }
-                    _ => {}
+            if mouse_changed && ms.scroll_delta != 0 && tab == Tab::Terminal && !sb_dragging {
+                let (_, _, _, ml) = terminal_hist_geometry(&lay);
+                if ms.scroll_delta > 0 {
+                    term.scroll_up(console::terminal::SCROLL_STEP, ml);
+                } else {
+                    term.scroll_down(console::terminal::SCROLL_STEP);
                 }
+                needs_draw = true;
             }
-        }
-
-        if mouse_changed && ms.scroll_delta != 0 && tab == Tab::Terminal && !sb_dragging {
-            let (_, _, _, ml) = terminal_hist_geometry(&lay);
-            if ms.scroll_delta > 0 {
-                term.scroll_up(console::terminal::SCROLL_STEP, ml);
-            } else {
-                term.scroll_down(console::terminal::SCROLL_STEP);
-            }
-            needs_draw = true;
         }
 
         // ── Cursor parpadeante ────────────────────────────────────────────
-        if now.wrapping_sub(last_blink_tick) >= 50 {
-            last_blink_tick  = now;
-            term.cursor_vis  = !term.cursor_vis;
-            if tab == Tab::Terminal { needs_draw = true; }
+        if term.editor.is_none() {
+            if now.wrapping_sub(last_blink_tick) >= 50 {
+                last_blink_tick = now;
+                term.cursor_vis = !term.cursor_vis;
+                if tab == Tab::Terminal { needs_draw = true; }
+            }
         }
 
         // ── Render ────────────────────────────────────────────────────────
         if needs_draw {
             draw_chrome(&mut c, &lay, &hw, tab, ms.x, ms.y);
+
             match tab {
                 Tab::System   => draw_system_tab(&mut c, &lay, &hw, boot_lines),
-                Tab::Terminal => draw_terminal_tab(&mut c, &lay, &term, sb_dragging),
+                Tab::Terminal => {
+                    if let Some(ref ed) = term.editor {
+                        draw_editor_tab(&mut c, &lay, ed);
+                    } else {
+                        draw_terminal_tab(&mut c, &lay, &term, sb_dragging);
+                    }
+                }
                 Tab::Devices  => draw_devices_tab(&mut c, &lay, &hw, &pci),
+                Tab::Ide      => draw_ide_tab(&mut c, &lay, ide),
+                Tab::Explorer => draw_explorer_tab(&mut c, &lay, explorer),
             }
+
             if ms.present { c.draw_cursor(ms.x, ms.y); }
             needs_draw    = false;
             needs_present = true;

@@ -7,11 +7,13 @@
 //
 // Los comandos viven en el submódulo `commands/`.
 // Los helpers de formato viven en `fmt`.
+// El editor hexadecimal vive en `editor`.
 
 #![allow(dead_code)]
 
 pub mod fmt;
 pub mod commands;
+pub mod editor;
 
 // ── Constantes públicas ───────────────────────────────────────────────────────
 
@@ -54,6 +56,8 @@ pub struct Terminal {
     pub(crate) hist_cmds:  [[u8; INPUT_MAX]; 16],
     pub(crate) hist_lens:  [usize; 16],
     pub(crate) hist_count: usize,
+    // Editor hexadecimal de disco (Some = editor activo, None = terminal normal)
+    pub editor: Option<editor::EditorState>,
 }
 
 impl Terminal {
@@ -68,6 +72,7 @@ impl Terminal {
             hist_cmds:     [[0u8; INPUT_MAX]; 16],
             hist_lens:     [0usize; 16],
             hist_count:    0,
+            editor:        None,
         }
     }
 
@@ -148,7 +153,6 @@ impl Terminal {
     pub fn at_bottom(&self)  -> bool   { self.scroll_offset == 0 }
 
     /// Retorna `(inicio_lógico, cantidad)` para el render.
-    /// Uso: `for i in 0..count { let line = term.line_at(start + i); ... }`
     pub fn visible_range(&self, max_visible: usize) -> (usize, usize) {
         if self.line_count == 0 { return (0, 0); }
         let oldest          = self.oldest_logical();

@@ -5,6 +5,7 @@ pub mod system;
 pub mod debug;
 pub mod convert;
 pub mod fun;
+pub mod disk;
 
 use crate::console::terminal::{Terminal, LineColor, INPUT_MAX};
 
@@ -79,6 +80,16 @@ pub fn dispatch(
         b"memtest" => debug::cmd_memtest(t, args),
         b"inb"     => debug::cmd_inb(t, args),
         b"outb"    => debug::cmd_outb(t, args),
+
+        // ── Disco ATA ────────────────────────────────────────────────────────
+        b"diskinfo" | b"drives"
+            => disk::cmd_diskinfo(t),
+        b"diskread" | b"sectors"
+            => disk::cmd_diskread(t, args),
+        b"diskedit" | b"hexedit"
+            => disk::cmd_diskedit(t, args),
+        b"diskwrite"
+            => disk::cmd_diskwrite(t, args),
 
         // ── Entretenimiento ──────────────────────────────────────────────────
         b"beep"    => fun::cmd_beep(t, args),

@@ -1,98 +1,167 @@
-; boot/boot.asm - Stage1 PORTIX v6.0
-; CORRECCIONES:
-;   - boot_drive se guarda como PRIMERA instrucción (DL válido al entrar)
-;   - LBA: primero boot_drive ORIGINAL, luego 0x80 como fallback (no al revés)
-;   - boot_drive se pasa a stage2 vía DL justo antes del jmp
-;   - CHS: geometría HD (63 sec/pista, 255 cabezas), no floppy
-;   - Retry ×3 con reset en CHS
-;   - Stage2 se carga en 0x0800:0x0000 = físico 0x8000
+; boot/boot.asm  -  PORTIX Stage-1  v9.2
+; nasm -f bin boot.asm -o boot.bin
+;
+; CORRECCIONES vs v9.1:
+;   [FIX-DAP]     El DAP sigue el formato EXACTO de INT 13h/42h:
+;                   offset(2), segment(2)  ← orden correcto en memoria
+;                 En v9.1 estaban en orden correcto pero se llenaban al revés:
+;                   mov word [dap_offset], 0  y  mov word [dap_segment], STAGE2_SEG
+;                 Lo cual es correcto. El bug real era otro:
+;   [FIX-DS]      En start, bp=si se guardaba ANTES de establecer DS=0.
+;                 Si el chainloader entregó DS≠0, la instrucción posterior
+;                   mov eax, [BASE_LBA_ADDR]  leía con el DS del chainloader.
+;                 Ahora: primero CLI/segmentos/SP, luego guardar SI.
+;   [FIX-ALIGN]   Eliminado 'align 4' antes del DAP: en un sector de 512 bytes
+;                 el align podía empujar datos más allá del byte 510, corrompiendo
+;                 la firma 0xAA55 o el propio DAP.
+;   [FIX-RESET]   El reset de disco tras fallo LBA restaura CH/CL/DH para CHS.
+;                 En v9.1 faltaba recalcular CH/CL/DH después del reset en el
+;                 bloque .chs_retry (los registros quedan destruidos por INT 13h/0).
+;   [FIX-SEGWRAP] En CHS .chs_ok: el avance de segmento usa add ax,0x20 sobre ES
+;                 directamente, sin pasar por variable intermedia — igual que v6,
+;                 que funcionaba. En v9.1 el avance era correcto pero dependía de
+;                 que ES se hubiera restaurado del stack, lo cual fallaba si el
+;                 pop es/bx/cx ocurría en orden incorrecto.
+;
+; PROTOCOLO AL SALTAR A STAGE2:
+;   DL       = boot_drive_orig
+;   [0x7E00] = base_lba dword (offset de la imagen en el disco físico, 0 si ninguno)
 
 BITS 16
 ORG 0x7C00
 
 STAGE2_SECTORS equ 64
-STAGE2_SEG     equ 0x0800    ; 0x0800:0x0000 = 0x8000 físico
+STAGE2_SEG     equ 0x0800    ; físico 0x8000
+BASE_LBA_ADDR  equ 0x7E00    ; dword, escrito antes de saltar a stage2
 
 start:
+    ; ── [FIX-DS] Establecer segmentos PRIMERO, LUEGO guardar SI ──────────
     cli
-    xor ax, ax
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    mov sp, 0x7C00
+    xor  ax, ax
+    mov  ds, ax
+    mov  es, ax
+    mov  ss, ax
+    mov  sp, 0x7C00
     sti
 
-    ; ── CRÍTICO: guardar DL ANTES de cualquier otra instrucción ───────────
-    mov [boot_drive], dl
+    ; Ahora DS=0, es seguro guardar DL y SI
+    mov  [boot_drive_orig], dl
+    mov  [boot_drive],      dl
+    mov  [saved_si], si           ; guardar SI (puntero a entrada de partición)
 
-    mov si, msg_boot
-    call print_string
+    ; ── Detectar geometría dinámica (CHS) ─────────────────────────────────
+    push es
+    mov  ah, 0x08
+    mov  dl, [boot_drive]
+    int  0x13
+    jc   .geom_done
+    and  cx, 0x003F
+    jz   .geom_done
+    mov  [spt],   cx
+    movzx ax, dh
+    inc  ax
+    mov  [heads], ax
+.geom_done:
+    pop  es
 
-    ; Reset disco — ignorar error (QEMU IDE puede fallar aquí)
-    xor ah, ah
-    mov dl, [boot_drive]
-    int 0x13
+    ; ── Detectar base_lba desde DS:SI (protocolo chainload) ───────────────
+    xor  eax, eax
+    mov  [BASE_LBA_ADDR], eax     ; default: sin offset
 
-    mov si, msg_loading
-    call print_string
+    mov  si, [saved_si]
+    test si, si
+    jz   .no_offset
 
-    ; ── A) LBA con boot_drive ORIGINAL (puede ser 0x9F en óptico, 0x80 en HDD) ──
-    mov ah, 0x41
-    mov bx, 0x55AA
-    mov dl, [boot_drive]
-    int 0x13
-    jc  .try_lba_80
-    cmp bx, 0xAA55
-    jne .try_lba_80
-    ; Extensiones disponibles en drive original
-    jmp .do_lba
+    mov  ax, si
+    sub  ax, 0x00BE
+    test ax, 0x000F               ; alineado a 16 bytes como entrada de partición?
+    jnz  .no_offset
 
-    ; ── B) LBA con 0x80 como fallback (por si el BIOS da DL raro) ────────
+    mov  al, [si]
+    cmp  al, 0x80
+    je   .chk_lba
+    test al, al
+    jnz  .no_offset
+
+.chk_lba:
+    mov  eax, [si + 8]
+    test eax, eax
+    jz   .no_offset
+    mov  [BASE_LBA_ADDR], eax
+
+.no_offset:
+    ; Reset disco
+    xor  ah, ah
+    mov  dl, [boot_drive]
+    int  0x13
+
+    ; ── A) LBA con drive original ──────────────────────────────────────────
+    mov  ah, 0x41
+    mov  bx, 0x55AA
+    mov  dl, [boot_drive]
+    int  0x13
+    jc   .try_lba_80
+    cmp  bx, 0xAA55
+    jne  .try_lba_80
+    jmp  .do_lba
+
+    ; ── B) LBA con 0x80 (solo si drive original != 0x80) ──────────────────
 .try_lba_80:
-    mov ah, 0x41
-    mov bx, 0x55AA
-    mov dl, 0x80
-    int 0x13
-    jc  .use_chs
-    cmp bx, 0xAA55
-    jne .use_chs
-    mov byte [boot_drive], 0x80   ; actualizar solo si realmente funciona
+    cmp  byte [boot_drive_orig], 0x80
+    je   .use_chs
+    mov  ah, 0x41
+    mov  bx, 0x55AA
+    mov  dl, 0x80
+    int  0x13
+    jc   .use_chs
+    cmp  bx, 0xAA55
+    jne  .use_chs
+    mov  byte [boot_drive], 0x80
 
 .do_lba:
-    mov word  [dap_sectors],  STAGE2_SECTORS
-    mov word  [dap_offset],   0x0000
-    mov word  [dap_segment],  STAGE2_SEG
-    mov dword [dap_lba_lo],   1        ; stage2 empieza en LBA 1
-    mov dword [dap_lba_hi],   0
+    ; LBA físico de stage2 = base_lba + 1
+    mov  eax, [BASE_LBA_ADDR]
+    add  eax, 1
+    ; ── [FIX-DAP] Llenar DAP correctamente ────────────────────────────────
+    ; Formato en memoria: size(1) res(1) count(2) offset(2) segment(2) lba_lo(4) lba_hi(4)
+    mov  word  [dap_count],   STAGE2_SECTORS
+    mov  word  [dap_offset],  0x0000
+    mov  word  [dap_segment], STAGE2_SEG
+    mov  [dap_lba_lo], eax
+    mov  dword [dap_lba_hi],  0
 
-    mov si, dap
-    mov ah, 0x42
-    mov dl, [boot_drive]
-    int 0x13
-    jnc .loaded
-    ; LBA falló — caer a CHS
-    mov si, msg_chs
-    call print_string
+    mov  si, dap
+    mov  ah, 0x42
+    mov  dl, [boot_drive]
+    int  0x13
+    jnc  .loaded
+    mov  [disk_err_code], ah
 
     ; ── C) CHS clásico ────────────────────────────────────────────────────
 .use_chs:
-    mov ax, STAGE2_SEG
-    mov es, ax
-    xor bx, bx
-    mov word [current_lba], 1
-    mov cx, STAGE2_SECTORS
+    mov  dl, [boot_drive_orig]
+    mov  [boot_drive], dl
 
-.read_loop_chs:
+    mov  eax, [BASE_LBA_ADDR]
+    inc  eax
+    cmp  eax, 0xFFFF
+    ja   disk_error
+    mov  [current_lba], ax
+
+    ; Segmento destino inicial
+    mov  ax, STAGE2_SEG
+    mov  es, ax
+    xor  bx, bx
+    mov  cx, STAGE2_SECTORS
+
+.chs_loop:
     push cx
-    push bx
-    push es
 
-    ; Calcular CHS del sector actual
-    mov ax, [current_lba]
-    call lba_to_chs_hd       ; ch=cilindro, cl=sector|hi_cil, dh=cabeza
+    mov  ax, [current_lba]
+    call lba_to_chs_hd            ; → CH=cilindro, CL=sector|hi_cil, DH=cabeza
 
-    ; Intentar 3 veces con reset
-    mov cx, 3
+    ; Intentar 3 veces con reset + recalcular CHS
+    mov  cx, 3
 .chs_retry:
     push cx
     mov  ah, 0x02
@@ -101,105 +170,115 @@ start:
     int  0x13
     pop  cx
     jnc  .chs_ok
-    ; Reset antes de reintentar
+    mov  [disk_err_code], ah
+
+    ; Reset disco
     push cx
     xor  ah, ah
     mov  dl, [boot_drive]
     int  0x13
-    ; Recalcular CHS (registros destruidos por reset)
+    ; [FIX-RESET] Recalcular CHS: el reset destruye CH/CL/DH
     mov  ax, [current_lba]
     call lba_to_chs_hd
     pop  cx
     loop .chs_retry
+
+    ; Fallback: intentar con 0x80
+    cmp  byte [boot_drive_orig], 0x80
+    je   disk_error
+    mov  cx, 3
+.chs_retry80:
+    push cx
+    mov  ah, 0x02
+    mov  al, 1
+    mov  dl, 0x80
+    int  0x13
+    pop  cx
+    jnc  .chs_ok
+    push cx
+    xor  ah, ah
+    mov  dl, 0x80
+    int  0x13
+    mov  ax, [current_lba]
+    call lba_to_chs_hd
+    pop  cx
+    loop .chs_retry80
     jmp  disk_error
 
 .chs_ok:
-    pop es
-    pop bx
-    pop cx
+    ; [FIX-SEGWRAP] Avanzar segmento destino: +512 bytes = +0x20 párrafos
+    mov  ax, es
+    add  ax, 0x20
+    mov  es, ax
+    xor  bx, bx                   ; offset = 0 para cada sector
 
-    ; Avanzar destino: +512 bytes
-    add bx, 512
-    jnc .no_wrap
-    mov ax, es
-    add ax, 0x1000
-    mov es, ax
-    xor bx, bx
-.no_wrap:
-    inc word [current_lba]
-    loop .read_loop_chs
+    inc  word [current_lba]
+    pop  cx
+    loop .chs_loop
 
 .loaded:
-    mov si, msg_jump
-    call print_string
+    mov  dl, [boot_drive_orig]
+    jmp  0x0000:0x8000
 
-    ; Pasar boot_drive a stage2 en DL (stage2 lo lee como primera instrucción)
-    mov dl, [boot_drive]
-    jmp 0x0000:0x8000
-
-; ── LBA→CHS HD (63 sec/track, 255 heads) ─────────────────────────────────────
+; ── lba_to_chs_hd dinámico ───────────────────────────────────────────────────
 ; Entrada: AX = LBA  |  Salida: CH=cil, CL=sec|hi_cil, DH=cabeza
-; Destruye: AX, BX, DX  (¡no necesita preservar: caller no depende de ellos!)
+; [spt] y [heads] contienen la geometría detectada (default 63/255)
 lba_to_chs_hd:
-    push si
-    mov  si, ax           ; si = LBA
-
-    ; sector = (LBA mod 63) + 1
+    push ax
+    push bx
     xor  dx, dx
-    mov  ax, si
-    mov  bx, 63
-    div  bx               ; ax = LBA/63,  dx = LBA%63
-    inc  dx               ; 1-based
-    mov  cl, dl           ; CL = sector
-
-    ; cabeza y cilindro
+    mov  bx, [spt]
+    div  bx
+    inc  dx
+    mov  cl, dl
     xor  dx, dx
-    mov  bx, 255
-    div  bx               ; ax = cilindro,  dx = cabeza
-    mov  dh, dl           ; DH = cabeza
-    mov  ch, al           ; CH = cilindro bits 7:0
+    mov  bx, [heads]
+    div  bx
+    mov  dh, dl
+    mov  ch, al
     shl  ah, 6
-    or   cl, ah           ; CL bits 7:6 = cilindro bits 9:8
-
-    pop  si
+    or   cl, ah
+    pop  bx
+    pop  ax
     ret
 
 ; ── print_string ──────────────────────────────────────────────────────────────
 print_string:
     pusha
-.loop:
-    lodsb
+.l: lodsb
     test al, al
-    jz   .done
+    jz   .d
     mov  ah, 0x0E
-    mov  bh, 0
-    mov  bl, 7
     int  0x10
-    jmp  .loop
-.done:
-    popa
+    jmp  .l
+.d: popa
     ret
 
 disk_error:
-    mov si, msg_error
+    mov  si, msg_err
     call print_string
     cli
     hlt
 
 ; ── Datos ──────────────────────────────────────────────────────────────────────
-msg_boot    db "PORTIX v0.6", 13, 10, 0
-msg_loading db "Loading...", 13, 10, 0
-msg_chs     db "CHS fallback", 13, 10, 0
-msg_jump    db "Jumpaaaaaing!", 13, 10, 0
-msg_error   db "DISK ERROR!", 13, 10, 0
+msg_err          db "ERR", 0
 
-boot_drive  db 0x80
-current_lba dw 0
+spt              dw 63
+heads            dw 255
+boot_drive_orig  db 0x80
+boot_drive       db 0x80
+saved_si         dw 0
+current_lba      dw 0
+disk_err_code    db 0
 
-align 4
+; ── [FIX-ALIGN] SIN align 4 — el DAP debe caber antes del byte 510 ──────────
+; Formato DAP exacto (14 bytes):
+;   [0] size=0x10  [1] reserved=0x00
+;   [2-3] count    [4-5] offset   [6-7] segment
+;   [8-11] lba_lo  [12-15] lba_hi
 dap:
     db 0x10, 0x00
-dap_sectors: dw 0
+dap_count:   dw 0
 dap_offset:  dw 0
 dap_segment: dw 0
 dap_lba_lo:  dd 0

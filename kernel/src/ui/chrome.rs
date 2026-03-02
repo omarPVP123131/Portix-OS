@@ -1,4 +1,5 @@
-// ui/chrome.rs — Chrome de la UI: cabecera, barra de tabs y status bar
+// ui/chrome.rs — PORTIX Kernel v0.7.4
+// Chrome de la UI: cabecera, barra de tabs y status bar
 
 use crate::graphics::driver::framebuffer::{Color, Console, Layout};
 use crate::arch::hardware::HardwareInfo;
@@ -13,7 +14,6 @@ pub fn section_label(c: &mut Console, x: usize, y: usize, title: &str, w: usize)
 }
 
 /// Dibuja la cabecera, las pestañas y la barra de estado inferior.
-/// `mx`/`my` son las coordenadas del cursor del ratón (para hover en tabs).
 pub fn draw_chrome(
     c: &mut Console,
     lay: &Layout,
@@ -22,10 +22,9 @@ pub fn draw_chrome(
     mx: i32,
     my: i32,
 ) {
-    let fw = lay.fw;
-
+let fw = lay.fw;
     // ── Cabecera ──────────────────────────────────────────────────────────
-    c.fill_rect(0, 0, fw, lay.header_h, Color::HEADER_BG);
+c.fill_rect(0, 0, fw, lay.header_h, Color::HEADER_BG);
     c.fill_rect(0, 0, 6, lay.header_h, Color::PORTIX_GOLD);
     c.fill_rect(6, 0, 2, lay.header_h, Color::new(180, 120, 0));
     c.write_at_tall("PORTIX", 16, lay.header_h / 2 - 8, Color::PORTIX_GOLD);
@@ -40,7 +39,7 @@ pub fn draw_chrome(
     let by = (lay.header_h - 22) / 2;
     c.fill_rounded(bx, by, 92, 22, 4, Color::new(0, 40, 10));
     c.draw_rect(bx, by, 92, 22, 1, Color::new(0, 100, 30));
-    c.write_at("● BOOT OK", bx + 8, by + 7, Color::GREEN);
+    c.write_at("BOOT OK", bx + 8, by + 7, Color::GREEN);
 
     // ── Línea dorada divisoria ────────────────────────────────────────────
     c.fill_rect(0, lay.header_h, fw, lay.gold_h, Color::PORTIX_GOLD);
@@ -49,43 +48,46 @@ pub fn draw_chrome(
     let ty = lay.tab_y;
     c.fill_rect(0, ty, fw, lay.tab_h + 2, Color::TAB_INACTIVE);
 
-    let tw = lay.tab_w;
-    let tab_data: &[(&str, Tab)] = &[
-        (" F1  SISTEMA  ",       Tab::System),
-        (" F2  TERMINAL ",       Tab::Terminal),
-        (" F3  DISPOSITIVOS",   Tab::Devices),
+    // Datos de tabs: (label, fkey_label, variante Tab)
+    let tab_data: &[(&str, &str, Tab)] = &[
+        ("SISTEMA",      "F1", Tab::System),
+        ("TERMINAL",     "F2", Tab::Terminal),
+        ("DISPOSITIVOS", "F3", Tab::Devices),
+        ("IDE",          "F4", Tab::Ide),
+        ("ARCHIVOS",     "F5", Tab::Explorer),
     ];
 
-    for (i, &(label, tab)) in tab_data.iter().enumerate() {
-        let tx       = i * tw;
+    let tw: usize = (fw.min(1000)) / tab_data.len();
+
+    for (i, &(label, fkey, tab)) in tab_data.iter().enumerate() {
+        let tx        = i * tw;
         let is_active = tab == active;
-        let hovered  = !is_active
+        let hovered   = !is_active
             && (mx as usize) >= tx && (mx as usize) < tx + tw
             && (my as usize) >= ty && (my as usize) < ty + lay.tab_h + 2;
 
         if is_active {
-            c.fill_rect(tx, ty,     tw - 1, 2,          Color::PORTIX_GOLD);
-            c.fill_rect(tx, ty + 2, tw - 1, lay.tab_h,  Color::TAB_ACTIVE);
+            c.fill_rect(tx, ty,     tw - 1, 2,         Color::PORTIX_GOLD);
+            c.fill_rect(tx, ty + 2, tw - 1, lay.tab_h, Color::TAB_ACTIVE);
         } else {
-            c.fill_rect(tx, ty, tw - 1, lay.tab_h + 2, Color::TAB_INACTIVE);
+            let bg = if hovered { Color::new(0x0C, 0x18, 0x30) } else { Color::TAB_INACTIVE };
+            c.fill_rect(tx, ty, tw - 1, lay.tab_h + 2, bg);
         }
         c.fill_rect(tx + tw - 1, ty, 1, lay.tab_h + 2, Color::SEPARATOR);
 
         let fy = ty + 2 + lay.tab_h / 2 - 4;
+
+        // F-key en tono apagado a la izquierda
+        let fkey_fg = if is_active { Color::PORTIX_AMBER } else { Color::new(0x30, 0x40, 0x55) };
+        c.write_at(fkey, tx + 4, fy, fkey_fg);
+
+        // Label centrado
         let fg = if is_active    { Color::PORTIX_GOLD }
                  else if hovered { Color::LIGHT_GRAY  }
                  else            { Color::GRAY        };
-        c.write_at(label, tx + 4, fy, fg);
-    }
-
-    let hx = tab_data.len() * tw + 14;
-    let hy = ty + lay.tab_h / 2 - 4 + 2;
-    if hx + 320 < fw {
-        c.write_at(
-            "CLIC=cambiar tab  ESC=limpiar  Rueda/RePag=scroll",
-            hx, hy,
-            Color::new(28, 40, 56),
-        );
+        let label_px = label.len() * 9;
+        let lx = if tw > label_px + 28 { tx + (tw + 28 - label_px) / 2 } else { tx + 28 };
+        c.write_at(label, lx, fy, fg);
     }
 
     // ── Barra de estado inferior ──────────────────────────────────────────
@@ -100,7 +102,6 @@ pub fn draw_chrome(
     c.write_at("|",       102, sy, Color::SEP_BRIGHT);
     c.write_at("x86_64",  112, sy, Color::GRAY);
     c.write_at("|",       160, sy, Color::SEP_BRIGHT);
-    c.write_at("●",       170, sy, Color::NEON_GREEN);
     c.write_at("Listo",   183, sy, Color::TEAL);
     c.write_at("|",       228, sy, Color::SEP_BRIGHT);
 

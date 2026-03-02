@@ -4,6 +4,7 @@ use crate::graphics::driver::framebuffer::{Color, Console, Layout};
 use crate::arch::hardware::HardwareInfo;
 use crate::util::fmt::{fmt_u32, fmt_mhz, fmt_mib, fmt_hex};
 use crate::ui::chrome::section_label;
+use core::sync::atomic::Ordering;
 
 pub fn draw_system_tab(
     c: &mut Console,
@@ -141,7 +142,52 @@ pub fn draw_system_tab(
         c.write_at("bpp", rx + 140,            ry, Color::GRAY);
         let _ = ry;
     }
+// Heap / Buddy Allocator
+    if ry + 46 < lay.bottom_y {
+        ry += 6;
+        section_label(c, rx, ry, " HEAP (BUDDY)", rw);
+        ry += 20;
 
+        let allocs = crate::mem::allocator::ALLOC_STATS.total_allocs.load(Ordering::Relaxed);
+        let frees  = crate::mem::allocator::ALLOC_STATS.total_frees.load(Ordering::Relaxed);
+        let failed = crate::mem::allocator::ALLOC_STATS.failed_allocs.load(Ordering::Relaxed);
+
+        let mut ba = [0u8; 16];
+        let mut bfr = [0u8; 16];
+        let mut be = [0u8; 16];
+
+        let sa = fmt_u32(allocs as u32, &mut ba);
+        let sf = fmt_u32(frees  as u32, &mut bfr);
+        let se = fmt_u32(failed as u32, &mut be);
+
+        c.write_at(sa,      rx + 6,                        ry, Color::NEON_GREEN);
+        c.write_at("alloc", rx + 6 + sa.len() * 9 + 4,    ry, Color::GRAY);
+        c.write_at(sf,      rx + 90,                       ry, Color::TEAL);
+        c.write_at("free",  rx + 90 + sf.len() * 9 + 4,   ry, Color::GRAY);
+
+        if failed > 0 {
+            c.fill_rounded(
+                rx + rw - se.len() * 9 - 46, ry - 2,
+                se.len() * 9 + 42, 14, 3,
+                Color::new(40, 0, 0),
+            );
+            c.write_at("OOM:", rx + rw - se.len() * 9 - 42, ry, Color::new(200, 60, 60));
+            c.write_at(se,     rx + rw - se.len() * 9 - 14, ry, Color::new(255, 80, 80));
+        }
+        ry += lay.line_h + 2;
+
+        // Barra: porcentaje de allocs activos sobre el total histórico
+        let active    = allocs.saturating_sub(frees);
+        let used_pct  = if allocs > 0 { ((active * 100) / allocs).min(100) } else { 0 };
+        c.gradient_bar(
+            rx + 6, ry, rw - 16, 8,
+            used_pct as u32,
+            Color::PORTIX_AMBER,
+            Color::new(3, 12, 24),
+        );
+
+        let _ = ry;
+    }
     // Suprimir warning si fmt_hex no es usada en esta pestaña
     let _ = fmt_hex;
 }

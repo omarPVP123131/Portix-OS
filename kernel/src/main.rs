@@ -11,6 +11,10 @@
 #![no_main]
 #![allow(dead_code)]
 #![allow(static_mut_refs)] // kernel bare-metal single-thread — safe
+#![feature(alloc_error_handler)]
+#![feature(allocator_api)]
+
+extern crate alloc;
 
 pub mod arch;
 pub mod console;
@@ -19,7 +23,9 @@ pub mod graphics;
 pub mod time;
 pub mod ui;
 pub mod util;
+pub mod mem;
 
+use mem::allocator::BuddyAllocator;
 use console::terminal::editor::draw_editor_tab;
 use console::terminal::LineColor;
 use core::arch::global_asm;
@@ -32,6 +38,11 @@ use ui::{
     draw_chrome, draw_devices_tab, draw_explorer_tab, draw_ide_tab, draw_system_tab,
     draw_terminal_tab, terminal_hist_geometry, Tab, SCROLLBAR_W,
 };
+
+#[alloc_error_handler]
+fn alloc_error(layout: core::alloc::Layout) -> ! {
+    panic!("OOM: size={} align={}", layout.size(), layout.align());
+}
 
 extern "C" {
     static __bss_start: u8;
@@ -65,6 +76,9 @@ global_asm!(
     BSS_END   = sym __bss_end,
     RUST_MAIN = sym rust_main,
 );
+
+#[global_allocator]
+static ALLOCATOR: BuddyAllocator = BuddyAllocator::new();
 
 // ── Constantes ────────────────────────────────────────────────────────────────
 
@@ -171,7 +185,8 @@ let dd_y = content_y + IDE_MENU_H;
 
 #[no_mangle]
 extern "C" fn rust_main() -> ! {
-    // CRÍTICO: PAGE_POOL debe inicializarse ANTES de IdeState::new()
+    unsafe { ALLOCATOR.init(); }
+
     init_page_pool();
 
     unsafe {

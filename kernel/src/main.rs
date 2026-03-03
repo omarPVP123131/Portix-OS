@@ -29,7 +29,7 @@ use console::terminal::editor::draw_editor_tab;
 use console::terminal::LineColor;
 use core::arch::global_asm;
 use drivers::input::keyboard::Key;
-use drivers::storage::{mkfs, fat32, ata};
+use drivers::storage::{ata, fat32, mkfs};
 use graphics::driver::framebuffer::{Color, Console, Layout};
 use mem::allocator::BuddyAllocator;
 use ui::tabs::explorer::ExplorerState;
@@ -217,10 +217,6 @@ extern "C" fn rust_main() -> ! {
         drivers::serial::write_str(s);
         drivers::serial::write_str(" dispositivos\n");
     }
-    {
-        let ata = ata::AtaBus::scan();
-        ata::log_drives(&ata);
-    }
 
     let mut kbd = drivers::input::keyboard::KeyboardState::new();
     let mut ms = drivers::input::mouse::MouseState::new();
@@ -240,64 +236,50 @@ extern "C" fn rust_main() -> ! {
             .write(core::mem::MaybeUninit::new(ExplorerState::new(2)));
     }
 
-{
-    let ata = ata::AtaBus::scan();
-    
-    let vol_result = if let Some(drive) = ata.drive(ata::DriveId::Primary0) {
-        // Clonamos la info para poder re-crear el drive si el primer mount falla
-        let drive_info = *drive.info();
-        
-        // Primer intento de montaje
-        match fat32::Fat32Volume::mount(drive) {
-            Ok(vol) => Some(vol),
-            Err(_) => {
-                // Si falló, 'drive' se perdió (moved), así que creamos uno nuevo con la info guardada
-                let drive_recovery = ata::AtaDrive::from_info(drive_info);
-                
-                // Formateamos (aquí pasamos drive_recovery, que mkfs consumirá)
-                if mkfs::auto_format(drive_recovery).is_some() {
-                    // Si el formato tuvo éxito, creamos OTRO drive para el montaje final
-                    let drive_final = ata::AtaDrive::from_info(drive_info);
-                    fat32::Fat32Volume::mount(drive_final).ok()
-                } else {
-                    None
+  {
+        let ata = ata::AtaBus::scan();
+        ata::log_drives(&ata);
+
+        // v0.8.0: guardar DriveInfo ANTES de lanzar el loop principal.
+        // Desde este momento, todos los comandos del terminal pueden usar
+        // get_cached_drive_info() sin re-escanear el bus.
+        if let Some(info) = ata.info(ata::DriveId::Primary0) {
+            ata::store_primary_drive_info(*info);
+        }
+
+        // Montar FAT32 o formatear si no existe
+        let vol_result = if let Some(drive_info) = ata::get_cached_drive_info() {
+            let drive = ata::AtaDrive::from_info(drive_info);
+            match fat32::Fat32Volume::mount(drive) {
+                Ok(vol) => Some(vol),
+                Err(_) => {
+                    // Disco sin FAT32 — formatear
+                    let drive_recovery = ata::AtaDrive::from_info(drive_info);
+                    if mkfs::auto_format(drive_recovery).is_some() {
+                        // Re-montar tras el formato
+                        let drive_final = ata::AtaDrive::from_info(drive_info);
+                        fat32::Fat32Volume::mount(drive_final).ok()
+                    } else {
+                        None
+                    }
                 }
             }
+        } else {
+            None
+        };
+
+        // Inicializar ExplorerState con el cluster raíz real del volumen
+        if let Some(vol) = vol_result {
+            let root = vol.root_cluster();
+            unsafe {
+                core::ptr::addr_of_mut!(EXPLORER_STORAGE)
+                    .write(core::mem::MaybeUninit::new(ExplorerState::new(root)));
+            }
         }
-    } else {
-        None
-    };
-
-  if let Some(vol) = vol_result {
-    let root = vol.root_cluster();
-    serial_log!(Ok, "FAT32", "Volumen montado");
-
-    // --- Smoke Test: Navegación y Lectura ---
-    // Buscamos /home/user/README.TXT paso a paso
-    let test_read = vol.find_entry(root, "home")
-        .and_then(|e| vol.find_entry(e.cluster, "user"))
-        .and_then(|e| vol.find_entry(e.cluster, "README.TXT"));
-
-if let Ok(readme_entry) = test_read {
-    let mut buf = [0u8; 64];
-    // Cambiado: quitamos el 0 para que coincida con la firma (entry, buf)
-    if let Ok(bytes) = vol.read_file(&readme_entry, &mut buf) {
-        serial_log!(Info, "FAT32", "Lectura de prueba (/home/user/README.TXT):");
-        drivers::serial::write_str("      >> \"");
-        drivers::serial::write_bytes_raw(&buf[..bytes]);
-        drivers::serial::write_str("\"\n");
+        // Si vol_result == None, EXPLORER_STORAGE ya fue inicializado con
+        // ExplorerState::new(2) arriba — usa cluster 2 como fallback.
     }
-}else {
-        serial_log!(Warn, "FAT32", "No se encontró el archivo de bienvenida");
-    }
-    // ----------------------------------------
 
-    unsafe {
-        core::ptr::addr_of_mut!(EXPLORER_STORAGE)
-            .write(core::mem::MaybeUninit::new(ExplorerState::new(root)));
-    }
-}
-}
     // Referencias limpias para el loop principal
     let ide: &mut IdeState = unsafe { (*core::ptr::addr_of_mut!(IDE_STORAGE)).assume_init_mut() };
     let explorer: &mut ExplorerState =

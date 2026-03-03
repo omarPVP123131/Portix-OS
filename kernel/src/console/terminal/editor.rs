@@ -157,10 +157,10 @@ impl EditorState {
         let pl = path.len().min(256);
         ed.file_path[..pl].copy_from_slice(&path[..pl]);
         ed.file_path_len = pl;
-        ed.set_msg(
-            b"^S Guardar  ^X Salir  Flechas Mover  Enter Nueva linea",
-            MsgKind::Normal,
-        );
+      ed.set_msg(
+    b"  Ctrl+S = Guardar   |   Ctrl+X o Esc = Salir   |   Flechas = Mover cursor",
+    MsgKind::Normal,
+);
         ed
     }
 
@@ -208,12 +208,12 @@ impl EditorState {
     // ── Procesado de teclas ───────────────────────────────────────────────────
 
     /// Retorna `true` si la pantalla necesita redibujar.
-    pub fn handle_key(&mut self, key: Key) -> bool {
-        match self.mode {
-            EditorMode::Hex  => self.handle_key_hex(key),
-            EditorMode::Text => self.handle_key_text(key),
-        }
+pub fn handle_key(&mut self, key: Key, ctrl: bool) -> bool {
+    match self.mode {
+        EditorMode::Hex  => self.handle_key_hex(key),
+        EditorMode::Text => self.handle_key_text(key, ctrl),
     }
+}
 
     // ─────────────────────────────────────────────────────────────────────────
     // Teclas en modo HEX
@@ -320,10 +320,10 @@ impl EditorState {
     // Teclas en modo TEXTO
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn handle_key_text(&mut self, key: Key) -> bool {
+fn handle_key_text(&mut self, key: Key, ctrl: bool) -> bool {
         match key {
             // Salir (Ctrl+X = Esc en nuestro keyboard driver)
-            Key::Escape => {
+        Key::Escape | Key::Char(b'x') | Key::Char(b'X') if ctrl || key == Key::Escape => {
                 if self.dirty && !self.confirm_exit {
                     self.confirm_exit = true;
                     self.set_msg(
@@ -334,11 +334,11 @@ impl EditorState {
                     self.exit = true;
                 }
             }
-            // Guardar (Ctrl+S → en keyboard driver mapea a Key::Char(0x13) o Key::Save)
-            Key::Char(b's') | Key::Char(b'S') => {
-                self.confirm_exit = false;
-                self.save_text();
-            }
+        // Guardar: Ctrl+S
+        Key::Char(b's') | Key::Char(b'S') if ctrl => {
+            self.confirm_exit = false;
+            self.save_text();
+        }
             // Navegación
             Key::Up    => { self.text_move_up(); }
             Key::Down  => { self.text_move_down(); }
@@ -379,7 +379,7 @@ impl EditorState {
                 self.confirm_exit = false;
                 self.set_msg(b"Modificado. ^S para guardar.", MsgKind::Warn);
             }
-            Key::Char(c) => {
+        Key::Char(c) if !ctrl => {
                 if c >= 0x20 && c < 0x7F {
                     self.text_insert(c);
                     self.dirty        = true;
@@ -735,6 +735,8 @@ fn draw_text(c: &mut Console, lay: &Layout, ed: &EditorState) {
     let row_h = ch + 2;
 
     // ── Barra de título (estilo nano) ─────────────────────────────────────────
+        c.fill_rect(0, lay.content_y, lay.fw, lay.fh - lay.content_y, EdPalette::TEXT_BG);
+
     c.fill_rect(x0, y0, fw, ch + 4, EdPalette::STATUS_BAR);
     {
         let mut title = [0u8; 120]; let mut tp = 0;

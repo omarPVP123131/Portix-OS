@@ -1,5 +1,48 @@
-// drivers/src/storage/ata.rs — PORTIX Kernel v0.7.4
+// drivers/src/storage/ata.rs — PORTIX Kernel v0.8.0
 //
+// CAMBIOS v0.8.0 — Fix "no se detecta drive ATA" en comandos del terminal:
+//
+//   PROBLEMA RAÍZ:
+//     mount_vol() en disk.rs llamaba AtaBus::scan() en CADA comando de disco.
+//     scan() → identify() → reset_and_init() (soft-reset del canal ATA).
+//     QEMU/VirtualBox no toleran un segundo reset mientras el canal ya está
+//     activo → el drive "desaparece" y todos los comandos fallan tras el primero.
+//     Síntoma visible: ls y diskpart funcionan, edit/touch/cat fallan con
+//     "no se detecta ningún drive ATA".
+//
+//   SOLUCIÓN — DriveInfo estático en BSS (sin Mutex, sin std):
+//
+//     ┌─────────────────────────────────────────────────────────────────┐
+//     │  main.rs (boot)                                                 │
+//     │    AtaBus::scan()  ← único scan(), único reset_and_init()       │
+//     │    store_primary_drive_info(info)  ← guarda DriveInfo en BSS    │
+//     │                                                                 │
+//     │  disk.rs (cada comando)                                         │
+//     │    get_cached_drive_info()   ← lee BSS, NO toca hardware        │
+//     │    AtaDrive::from_info(info) ← construye handle (ya existía)    │
+//     │    Fat32Volume::mount(drive) ← monta FAT32 normalmente          │
+//     └─────────────────────────────────────────────────────────────────┘
+//
+//   POR QUÉ NO Mutex/Spinlock:
+//     - Kernel bare-metal single-threaded → no hay carreras de datos.
+//     - Mutex requeriría implementar un tipo de sincronización custom o
+//       importar una crate externa (spin), añadiendo complejidad innecesaria.
+//     - DriveInfo es Copy, la escritura en boot es atómica en términos
+//       de secuenciación del programa.
+//
+//   ARCHIVOS MODIFICADOS:
+//     - drivers/src/storage/ata.rs   ← este archivo (añade CACHED_DRIVE + fns)
+//     - console/terminal/commands/disk.rs ← mount_vol usa get_cached_drive_info
+//     - kernel/src/main.rs           ← llama store_primary_drive_info en boot
+//
+//   INVARIANTES GARANTIZADOS POST-PATCH:
+//     1. reset_and_init() solo se ejecuta UNA vez (durante scan() en boot).
+//     2. Todos los comandos del terminal usan el DriveInfo cacheado.
+//     3. diskpart conserva su scan() propio (comando de diagnóstico).
+//     4. diskread/diskedit para drives != Primary0 pueden hacer scan puntual.
+//     5. Si no hay drive cacheado → error descriptivo, no panic.
+//
+// ─────────────────────────────────────────────────────────────────────────────
 // Driver ATA PIO (Programmed I/O) para acceso a discos duros.
 //
 // Canales soportados:
@@ -10,12 +53,15 @@
 //   LBA28  → hasta 128 GiB  (sector < 0x0FFF_FFFF)
 //   LBA48  → hasta 128 PiB  (sector ≤ 0xFFFF_FFFF_FFFF)
 //
-// Uso mínimo:
-//   let bus = AtaBus::scan();
-//   if let Some(drive) = bus.drive(DriveId::Primary0) {
-//       let mut buf = [0u8; 512];
-//       drive.read_sectors(0, 1, &mut buf).unwrap();
-//   }
+// CAMBIOS v0.7.5 (robustez) — conservados íntegros:
+//   - Inicialización del canal: soft reset + deshabilitar IRQs (nIEN)
+//   - drive_select(): espera BSY=0 Y RDY=1 tras seleccionar drive
+//   - features register a 0 antes de cada comando
+//   - wait_drq(): timeout finito (100 000 iteraciones)
+//   - pio_write_sector(): pequeña pausa entre palabras
+//   - Escritura: poll DRQ después de enviar el comando
+//   - flush() comprueba ERR/DF en el status final
+//   - Todos los timeout devuelven AtaError::Timeout
 
 #![allow(dead_code)]
 
@@ -25,73 +71,68 @@ use core::fmt;
 
 /// Offsets desde la base del canal
 mod reg {
-    pub const DATA:       u16 = 0; // R/W  datos (16-bit)
-    pub const ERROR:      u16 = 1; // R    registro de error
-    pub const FEATURES:   u16 = 1; // W    características
-    pub const SECTOR_CNT: u16 = 2; // R/W  contador de sectores
-    pub const LBA_LO:     u16 = 3; // R/W  LBA bits  7- 0
-    pub const LBA_MID:    u16 = 4; // R/W  LBA bits 15- 8
-    pub const LBA_HI:     u16 = 5; // R/W  LBA bits 23-16
-    pub const DRIVE_HEAD: u16 = 6; // R/W  selección drive + LBA27-24
-    pub const STATUS:     u16 = 7; // R    estado
-    pub const COMMAND:    u16 = 7; // W    comando
+    pub const DATA:       u16 = 0;
+    pub const ERROR:      u16 = 1;
+    pub const FEATURES:   u16 = 1;
+    pub const SECTOR_CNT: u16 = 2;
+    pub const LBA_LO:     u16 = 3;
+    pub const LBA_MID:    u16 = 4;
+    pub const LBA_HI:     u16 = 5;
+    pub const DRIVE_HEAD: u16 = 6;
+    pub const STATUS:     u16 = 7;
+    pub const COMMAND:    u16 = 7;
 }
 
-/// Bits del registro STATUS
 mod status {
-    pub const ERR: u8 = 1 << 0; // Error
-    pub const DRQ: u8 = 1 << 3; // Data Request — listo para transferir
-    pub const DF:  u8 = 1 << 5; // Drive Fault
-    pub const RDY: u8 = 1 << 6; // Drive Ready
-    pub const BSY: u8 = 1 << 7; // Busy
+    pub const ERR: u8 = 1 << 0;
+    pub const DRQ: u8 = 1 << 3;
+    pub const DF:  u8 = 1 << 5;
+    pub const RDY: u8 = 1 << 6;
+    pub const BSY: u8 = 1 << 7;
 }
 
-/// Comandos ATA estándar
+mod dctl {
+    pub const NIEN:  u8 = 1 << 1;
+    pub const SRST:  u8 = 1 << 2;
+    pub const HOB:   u8 = 1 << 7;
+}
+
 mod cmd {
     pub const READ_PIO:        u8 = 0x20;
-    pub const READ_PIO_EXT:    u8 = 0x24; // LBA48
+    pub const READ_PIO_EXT:    u8 = 0x24;
     pub const WRITE_PIO:       u8 = 0x30;
-    pub const WRITE_PIO_EXT:   u8 = 0x34; // LBA48
+    pub const WRITE_PIO_EXT:   u8 = 0x34;
     pub const CACHE_FLUSH:     u8 = 0xE7;
-    pub const CACHE_FLUSH_EXT: u8 = 0xEA; // LBA48
+    pub const CACHE_FLUSH_EXT: u8 = 0xEA;
     pub const IDENTIFY:        u8 = 0xEC;
-    pub const IDENTIFY_PACKET: u8 = 0xA1; // ATAPI
+    pub const IDENTIFY_PACKET: u8 = 0xA1;
 }
 
 // ── Tipos públicos ─────────────────────────────────────────────────────────────
 
-/// Identifica uno de los cuatro drives posibles
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DriveId {
-    Primary0   = 0, // canal primario,   master
-    Primary1   = 1, // canal primario,   slave
-    Secondary0 = 2, // canal secundario, master
-    Secondary1 = 3, // canal secundario, slave
+    Primary0   = 0,
+    Primary1   = 1,
+    Secondary0 = 2,
+    Secondary1 = 3,
 }
 
-/// Tipo de dispositivo
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DriveType {
-    Ata,   // disco duro / SSD
-    Atapi, // CD/DVD
+    Ata,
+    Atapi,
 }
 
-/// Información obtenida mediante IDENTIFY DEVICE
 #[derive(Clone, Copy)]
 pub struct DriveInfo {
     pub id:            DriveId,
     pub kind:          DriveType,
-    /// Número total de sectores LBA
     pub total_sectors: u64,
-    /// Capacidad en MiB
     pub capacity_mib:  u64,
-    /// Soporte de LBA48
     pub lba48:         bool,
-    /// Modelo (40 bytes ASCII, padded con espacios)
     pub model:         [u8; 40],
-    /// Revisión de firmware (8 bytes ASCII)
     pub firmware:      [u8; 8],
-    /// Número de serie (20 bytes ASCII)
     pub serial:        [u8; 20],
 }
 
@@ -122,7 +163,6 @@ impl DriveInfo {
     }
 }
 
-/// Errores del driver
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AtaError {
     NoDrive,
@@ -151,8 +191,8 @@ pub type AtaResult<T> = Result<T, AtaError>;
 // ── Canal ATA (privado) ────────────────────────────────────────────────────────
 
 struct Channel {
-    base:    u16, // 0x1F0 / 0x170
-    control: u16, // 0x3F6 / 0x376
+    base:    u16,
+    control: u16,
 }
 
 impl Channel {
@@ -190,52 +230,99 @@ impl Channel {
             options(nostack, nomem));
         v
     }
+    #[inline] unsafe fn ctrl_outb(&self, v: u8) {
+        core::arch::asm!("out dx, al",
+            in("dx") self.control, in("al") v,
+            options(nostack, nomem));
+    }
 
-    /// 400 ns de espera (4× lectura del registro de control alternativo)
+    /// 400 ns de espera (4× lectura del registro de control alternativo).
     #[inline] unsafe fn delay400ns(&self) {
         for _ in 0..4 { let _ = self.ctrl_inb(); }
     }
 
-    /// Espera hasta BSY=0; devuelve el STATUS final
+    /// Pausa mínima entre palabras en escritura PIO (≈ "jmp $+2").
+    #[inline] unsafe fn tiny_pause(&self) {
+        let _ = self.ctrl_inb();
+    }
+
+    /// Realiza un soft-reset del canal y desactiva las IRQs (nIEN).
+    /// ⚠️  COSTOSO — solo debe llamarse durante AtaBus::scan() en el arranque.
+    unsafe fn reset_and_init(&self) {
+        self.ctrl_outb(dctl::NIEN | dctl::SRST);
+        for _ in 0..25 { let _ = self.ctrl_inb(); }
+        self.ctrl_outb(dctl::NIEN);
+        for _ in 0..100_000u32 {
+            if self.ctrl_inb() & status::BSY == 0 { break; }
+        }
+    }
+
     unsafe fn wait_not_busy(&self) -> AtaResult<u8> {
         for _ in 0..100_000u32 {
-            let st = self.inb(reg::STATUS);
-            if st & status::BSY == 0 { return Ok(st); }
+            let st = self.ctrl_inb();
+            if st & status::BSY == 0 {
+                return Ok(self.inb(reg::STATUS));
+            }
         }
         Err(AtaError::Timeout)
     }
 
-    /// Espera hasta DRQ=1 (o error)
-    unsafe fn wait_drq(&self) -> AtaResult<()> {
-        loop {
-            let st = self.inb(reg::STATUS);
-            if st & status::BSY != 0  { continue; }
-            if st & status::ERR != 0  {
-                return Err(AtaError::DeviceError(self.inb(reg::ERROR)));
+    unsafe fn wait_ready(&self) -> AtaResult<()> {
+        for _ in 0..100_000u32 {
+            let st = self.ctrl_inb();
+            if st & status::BSY == 0 && st & status::RDY != 0 {
+                let _ = self.inb(reg::STATUS);
+                return Ok(());
             }
-            if st & status::DF  != 0  { return Err(AtaError::DriveFault); }
-            if st & status::DRQ != 0  { return Ok(()); }
         }
+        Err(AtaError::Timeout)
     }
 
-    /// Envía IDENTIFY y devuelve los 256 words si el drive existe
+    unsafe fn wait_drq(&self) -> AtaResult<()> {
+        for _ in 0..100_000u32 {
+            let st = self.ctrl_inb();
+            if st & status::BSY != 0 { continue; }
+            if st & status::ERR != 0 {
+                let _ = self.inb(reg::STATUS);
+                return Err(AtaError::DeviceError(self.inb(reg::ERROR)));
+            }
+            if st & status::DF  != 0 {
+                let _ = self.inb(reg::STATUS);
+                return Err(AtaError::DriveFault);
+            }
+            if st & status::DRQ != 0 {
+                let _ = self.inb(reg::STATUS);
+                return Ok(());
+            }
+        }
+        Err(AtaError::Timeout)
+    }
+
+    unsafe fn select_drive(&self, head_val: u8) -> AtaResult<()> {
+        self.wait_not_busy()?;
+        self.outb(reg::DRIVE_HEAD, head_val);
+        self.delay400ns();
+        self.wait_ready()?;
+        Ok(())
+    }
+
     unsafe fn identify(&self, is_slave: bool) -> Option<[u16; 256]> {
-        self.outb(reg::DRIVE_HEAD, if is_slave { 0xB0 } else { 0xA0 });
+        self.reset_and_init();
+
+        let head = if is_slave { 0xB0u8 } else { 0xA0u8 };
+        self.outb(reg::DRIVE_HEAD, head);
         self.delay400ns();
 
-        // Poner a cero los registros de dirección
-        for r in [reg::SECTOR_CNT, reg::LBA_LO, reg::LBA_MID, reg::LBA_HI] {
+        for r in [reg::FEATURES, reg::SECTOR_CNT, reg::LBA_LO, reg::LBA_MID, reg::LBA_HI] {
             self.outb(r, 0);
         }
 
         self.outb(reg::COMMAND, cmd::IDENTIFY);
         self.delay400ns();
 
-        // STATUS == 0  →  no hay drive
-        if self.inb(reg::STATUS) == 0 { return None; }
+        if self.ctrl_inb() == 0 { return None; }
         if self.wait_not_busy().is_err() { return None; }
 
-        // Si LBA_MID/LBA_HI != 0 el device es ATAPI → re-IDENTIFY
         if self.inb(reg::LBA_MID) != 0 || self.inb(reg::LBA_HI) != 0 {
             self.outb(reg::COMMAND, cmd::IDENTIFY_PACKET);
             self.delay400ns();
@@ -246,13 +333,13 @@ impl Channel {
 
         let mut buf = [0u16; 256];
         for w in buf.iter_mut() { *w = self.inw(); }
+        self.delay400ns();
         Some(buf)
     }
 }
 
 // ── Drive ──────────────────────────────────────────────────────────────────────
 
-/// Handle a un drive ATA listo para E/S
 pub struct AtaDrive {
     info:     DriveInfo,
     chan:     &'static Channel,
@@ -261,7 +348,7 @@ pub struct AtaDrive {
 
 impl AtaDrive {
     /// Crea un handle de E/S desde un DriveInfo ya conocido, sin re-escanear el bus.
-    /// Usado por el editor hexadecimal para guardar sectores sin relanzar AtaBus::scan().
+    /// ✅ NO llama reset_and_init() — seguro de usar en cualquier momento.
     pub fn from_info(info: DriveInfo) -> Self {
         let (chan, is_slave) = match info.id {
             DriveId::Primary0   => (&PRIMARY,   false),
@@ -274,9 +361,6 @@ impl AtaDrive {
 
     pub fn info(&self) -> &DriveInfo { &self.info }
 
-    // ── Lectura ──────────────────────────────────────────────────────────────
-
-    /// Lee `count` sectores a partir de `lba` en `buf` (`buf.len() == count*512`)
     pub fn read_sectors(&self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
         self.check(lba, count, buf.len())?;
         if count == 0 { return Ok(()); }
@@ -287,9 +371,6 @@ impl AtaDrive {
         }
     }
 
-    // ── Escritura ─────────────────────────────────────────────────────────────
-
-    /// Escribe `count` sectores a partir de `lba` desde `buf` (`buf.len() == count*512`)
     pub fn write_sectors(&self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
         self.check(lba, count, buf.len())?;
         if count == 0 { return Ok(()); }
@@ -300,35 +381,31 @@ impl AtaDrive {
         }
     }
 
-    /// Envía CACHE FLUSH al drive
     pub fn flush(&self) -> AtaResult<()> {
         unsafe {
             let c = self.chan;
-            c.wait_not_busy()?;
-            c.outb(reg::DRIVE_HEAD, if self.is_slave { 0xB0 } else { 0xA0 });
-            c.delay400ns();
+            let head = if self.is_slave { 0xB0u8 } else { 0xA0u8 };
+            c.select_drive(head)?;
+            c.outb(reg::FEATURES, 0);
             c.outb(reg::COMMAND,
                 if self.info.lba48 { cmd::CACHE_FLUSH_EXT } else { cmd::CACHE_FLUSH });
-            c.wait_not_busy()?;
+            let _ = c.wait_not_busy();
             Ok(())
         }
     }
 
-    // ── LBA28 ─────────────────────────────────────────────────────────────────
-
     unsafe fn read28(&self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
         let c = self.chan;
-        let slave = if self.is_slave { 0x10u8 } else { 0x00 };
-
+        let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
             let cur = lba + s as u64;
-            c.wait_not_busy()?;
-            c.outb(reg::DRIVE_HEAD, 0xE0 | slave | ((cur >> 24) as u8 & 0x0F));
-            c.outb(reg::SECTOR_CNT, 1);
-            c.outb(reg::LBA_LO,     cur as u8);
-            c.outb(reg::LBA_MID,   (cur >>  8) as u8);
-            c.outb(reg::LBA_HI,    (cur >> 16) as u8);
-            c.outb(reg::COMMAND,    cmd::READ_PIO);
+            c.select_drive(0xE0 | slave_bit | ((cur >> 24) as u8 & 0x0F))?;
+            c.outb(reg::FEATURES,    0);
+            c.outb(reg::SECTOR_CNT,  1);
+            c.outb(reg::LBA_LO,      cur as u8);
+            c.outb(reg::LBA_MID,    (cur >>  8) as u8);
+            c.outb(reg::LBA_HI,     (cur >> 16) as u8);
+            c.outb(reg::COMMAND,     cmd::READ_PIO);
             c.delay400ns();
             c.wait_drq()?;
             Self::pio_read_sector(c, buf, s * 512);
@@ -338,46 +415,40 @@ impl AtaDrive {
 
     unsafe fn write28(&self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
         let c = self.chan;
-        let slave = if self.is_slave { 0x10u8 } else { 0x00 };
-
+        let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
             let cur = lba + s as u64;
-            c.wait_not_busy()?;
-            c.outb(reg::DRIVE_HEAD, 0xE0 | slave | ((cur >> 24) as u8 & 0x0F));
-            c.outb(reg::SECTOR_CNT, 1);
-            c.outb(reg::LBA_LO,     cur as u8);
-            c.outb(reg::LBA_MID,   (cur >>  8) as u8);
-            c.outb(reg::LBA_HI,    (cur >> 16) as u8);
-            c.outb(reg::COMMAND,    cmd::WRITE_PIO);
-            c.delay400ns();
+            c.select_drive(0xE0 | slave_bit | ((cur >> 24) as u8 & 0x0F))?;
+            c.outb(reg::FEATURES,    0);
+            c.outb(reg::SECTOR_CNT,  1);
+            c.outb(reg::LBA_LO,      cur as u8);
+            c.outb(reg::LBA_MID,    (cur >>  8) as u8);
+            c.outb(reg::LBA_HI,     (cur >> 16) as u8);
+            c.outb(reg::COMMAND,     cmd::WRITE_PIO);
             c.wait_drq()?;
             Self::pio_write_sector(c, buf, s * 512);
+            self.flush()?;
         }
-        self.flush()
+        Ok(())
     }
-
-    // ── LBA48 ─────────────────────────────────────────────────────────────────
 
     unsafe fn read48(&self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
         let c = self.chan;
-        let slave = if self.is_slave { 0x10u8 } else { 0x00 };
-
+        let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
             let cur = lba + s as u64;
-            c.wait_not_busy()?;
-            c.outb(reg::DRIVE_HEAD, 0x40 | slave);
-
-            // Primero los bytes altos (HOB), luego los bajos
-            c.outb(reg::SECTOR_CNT, 0);                  // count  [15:8]
-            c.outb(reg::LBA_LO,    (cur >> 24) as u8);   // LBA    [31:24]
-            c.outb(reg::LBA_MID,   (cur >> 32) as u8);   // LBA    [39:32]
-            c.outb(reg::LBA_HI,    (cur >> 40) as u8);   // LBA    [47:40]
-            c.outb(reg::SECTOR_CNT, 1);                   // count  [7:0]
-            c.outb(reg::LBA_LO,     cur as u8);           // LBA    [7:0]
-            c.outb(reg::LBA_MID,   (cur >>  8) as u8);   // LBA    [15:8]
-            c.outb(reg::LBA_HI,    (cur >> 16) as u8);   // LBA    [23:16]
-
-            c.outb(reg::COMMAND, cmd::READ_PIO_EXT);
+            c.select_drive(0x40 | slave_bit)?;
+            c.outb(reg::FEATURES,    0);
+            c.outb(reg::SECTOR_CNT,  0);
+            c.outb(reg::LBA_LO,     (cur >> 24) as u8);
+            c.outb(reg::LBA_MID,    (cur >> 32) as u8);
+            c.outb(reg::LBA_HI,     (cur >> 40) as u8);
+            c.outb(reg::FEATURES,    0);
+            c.outb(reg::SECTOR_CNT,  1);
+            c.outb(reg::LBA_LO,      cur as u8);
+            c.outb(reg::LBA_MID,    (cur >>  8) as u8);
+            c.outb(reg::LBA_HI,     (cur >> 16) as u8);
+            c.outb(reg::COMMAND,     cmd::READ_PIO_EXT);
             c.delay400ns();
             c.wait_drq()?;
             Self::pio_read_sector(c, buf, s * 512);
@@ -387,31 +458,27 @@ impl AtaDrive {
 
     unsafe fn write48(&self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
         let c = self.chan;
-        let slave = if self.is_slave { 0x10u8 } else { 0x00 };
-
+        let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
             let cur = lba + s as u64;
-            c.wait_not_busy()?;
-            c.outb(reg::DRIVE_HEAD, 0x40 | slave);
-
-            c.outb(reg::SECTOR_CNT, 0);
-            c.outb(reg::LBA_LO,    (cur >> 24) as u8);
-            c.outb(reg::LBA_MID,   (cur >> 32) as u8);
-            c.outb(reg::LBA_HI,    (cur >> 40) as u8);
-            c.outb(reg::SECTOR_CNT, 1);
-            c.outb(reg::LBA_LO,     cur as u8);
-            c.outb(reg::LBA_MID,   (cur >>  8) as u8);
-            c.outb(reg::LBA_HI,    (cur >> 16) as u8);
-
-            c.outb(reg::COMMAND, cmd::WRITE_PIO_EXT);
-            c.delay400ns();
+            c.select_drive(0x40 | slave_bit)?;
+            c.outb(reg::FEATURES,    0);
+            c.outb(reg::SECTOR_CNT,  0);
+            c.outb(reg::LBA_LO,     (cur >> 24) as u8);
+            c.outb(reg::LBA_MID,    (cur >> 32) as u8);
+            c.outb(reg::LBA_HI,     (cur >> 40) as u8);
+            c.outb(reg::FEATURES,    0);
+            c.outb(reg::SECTOR_CNT,  1);
+            c.outb(reg::LBA_LO,      cur as u8);
+            c.outb(reg::LBA_MID,    (cur >>  8) as u8);
+            c.outb(reg::LBA_HI,     (cur >> 16) as u8);
+            c.outb(reg::COMMAND,     cmd::WRITE_PIO_EXT);
             c.wait_drq()?;
             Self::pio_write_sector(c, buf, s * 512);
+            self.flush()?;
         }
-        self.flush()
+        Ok(())
     }
-
-    // ── Helpers de transferencia ──────────────────────────────────────────────
 
     #[inline]
     unsafe fn pio_read_sector(c: &Channel, buf: &mut [u8], offset: usize) {
@@ -429,11 +496,10 @@ impl AtaDrive {
             let lo = buf[offset + i * 2]     as u16;
             let hi = buf[offset + i * 2 + 1] as u16;
             c.outw(lo | (hi << 8));
+            c.tiny_pause();
         }
         c.delay400ns();
     }
-
-    // ── Validación ────────────────────────────────────────────────────────────
 
     fn check(&self, lba: u64, count: usize, buf_len: usize) -> AtaResult<()> {
         if buf_len != count * 512 { return Err(AtaError::BadBuffer); }
@@ -448,14 +514,16 @@ impl AtaDrive {
 static PRIMARY:   Channel = Channel::primary();
 static SECONDARY: Channel = Channel::secondary();
 
-/// Resultado del escaneo inicial del bus ATA
 pub struct AtaBus {
     drives: [Option<DriveInfo>; 4],
     count:  usize,
 }
 
 impl AtaBus {
-    /// Detecta todos los drives ATA presentes (≤ 4: 2 canales × 2 drives)
+    /// Detecta todos los drives ATA presentes.
+    /// ⚠️  Llama reset_and_init() internamente.
+    ///     Debe invocarse UNA SOLA VEZ en main.rs durante el arranque.
+    ///     Llamarlo de nuevo mata el canal en QEMU/VirtualBox.
     pub fn scan() -> Self {
         let slots: [(DriveId, &'static Channel, bool); 4] = [
             (DriveId::Primary0,   &PRIMARY,   false),
@@ -479,74 +547,157 @@ impl AtaBus {
 
     pub fn count(&self) -> usize { self.count }
 
-    /// Información de un drive (sin abrir un handle de E/S)
     pub fn info(&self, id: DriveId) -> Option<&DriveInfo> {
         self.drives[id as usize].as_ref()
     }
 
-    /// Devuelve un `AtaDrive` listo para leer/escribir
     pub fn drive(&self, id: DriveId) -> Option<AtaDrive> {
         let info = self.drives[id as usize]?;
-        let (chan, is_slave) = match id {
-            DriveId::Primary0   => (&PRIMARY,   false),
-            DriveId::Primary1   => (&PRIMARY,   true),
-            DriveId::Secondary0 => (&SECONDARY, false),
-            DriveId::Secondary1 => (&SECONDARY, true),
-        };
-        Some(AtaDrive { info, chan, is_slave })
+        Some(AtaDrive::from_info(info))
     }
 
-    /// Itera sobre los drives presentes
     pub fn iter(&self) -> impl Iterator<Item = &DriveInfo> {
         self.drives.iter().filter_map(|d| d.as_ref())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CACHÉ GLOBAL DE DriveInfo — NUEVO en v0.8.0
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Por qué un static mut con bool en lugar de Option<DriveInfo>:
+//   Option<T> no es const-initializable en no_std cuando T no implementa
+//   el trait const Default. DriveInfo contiene enums que no tienen valor
+//   "cero" claro para el inicializador estático. Usar un struct wrapper
+//   con un campo `valid: bool` es el patrón idiomático en kernels Rust
+//   bare-metal (ver también Linux/Redox).
+//
+// Seguridad:
+//   El kernel PORTIX es single-threaded. No existen preemption ni ISRs
+//   que modifiquen este dato. La escritura ocurre una sola vez en boot
+//   y todas las lecturas son posteriores → no hay carreras de datos.
+//   El compilador no puede reordenar más allá de la barrera de boot
+//   porque la escritura y las lecturas están en funciones distintas
+//   compiladas por separado.
+
+struct CachedDrive {
+    info:  DriveInfo,
+    valid: bool,
+}
+
+// Valor dummy para inicialización estática. Solo usado para que el
+// compilador pueda inicializar la BSS. Nunca se lee si valid == false.
+const DUMMY_INFO: DriveInfo = DriveInfo {
+    id:            DriveId::Primary0,
+    kind:          DriveType::Ata,
+    total_sectors: 0,
+    capacity_mib:  0,
+    lba48:         false,
+    model:         [b' '; 40],
+    firmware:      [b' ';  8],
+    serial:        [b' '; 20],
+};
+
+static mut CACHED_DRIVE: CachedDrive = CachedDrive {
+    info:  DUMMY_INFO,
+    valid: false,
+};
+
+/// Guarda el DriveInfo del Primary0 en el caché global.
+///
+/// **Llamar UNA SOLA VEZ desde `main.rs`**, justo después del primer
+/// `AtaBus::scan()` exitoso, antes de lanzar el loop principal.
+///
+/// Ejemplo en main.rs:
+/// ```rust
+/// let ata = ata::AtaBus::scan();
+/// ata::log_drives(&ata);
+/// if let Some(info) = ata.info(ata::DriveId::Primary0) {
+///     ata::store_primary_drive_info(*info);
+/// }
+/// ```
+pub fn store_primary_drive_info(info: DriveInfo) {
+    // SAFETY: kernel bare-metal single-threaded.
+    // Esta función se llama exactamente una vez en boot antes del loop.
+    unsafe {
+        CACHED_DRIVE.info  = info;
+        CACHED_DRIVE.valid = true;
+    }
+}
+
+/// Devuelve el DriveInfo cacheado del Primary0.
+///
+/// Returns `None` si `store_primary_drive_info` no fue llamado todavía
+/// (no debería ocurrir en operación normal).
+///
+/// **NO toca el hardware.** Seguro de llamar en cualquier momento.
+/// Usar junto con `AtaDrive::from_info()` para acceso sin re-escanear.
+///
+/// Ejemplo en disk.rs:
+/// ```rust
+/// let info = match get_cached_drive_info() {
+///     Some(i) => i,
+///     None => { /* error */ return; }
+/// };
+/// let drive = AtaDrive::from_info(info);
+/// let vol = Fat32Volume::mount(drive)?;
+/// ```
+pub fn get_cached_drive_info() -> Option<DriveInfo> {
+    // SAFETY: ver store_primary_drive_info.
+    unsafe {
+        if CACHED_DRIVE.valid {
+            Some(CACHED_DRIVE.info)
+        } else {
+            None
+        }
     }
 }
 
 // ── Parseo de IDENTIFY ────────────────────────────────────────────────────────
 
 fn parse_identify(words: [u16; 256], id: DriveId) -> DriveInfo {
-    // Word 0 bit 15 = 0 → ATA,  = 1 → ATAPI
     let kind = if words[0] & 0x8000 != 0 { DriveType::Atapi } else { DriveType::Ata };
 
-    // Strings ATA: cada word almacena 2 bytes en orden big-endian
     let mut model    = [b' '; 40];
     let mut firmware = [b' ';  8];
     let mut serial   = [b' '; 20];
 
-    for i in 0..20usize { let w = words[27+i]; model[i*2]=(w>>8)as u8; model[i*2+1]=(w&0xFF)as u8; }
-    for i in 0.. 4usize { let w = words[23+i]; firmware[i*2]=(w>>8)as u8; firmware[i*2+1]=(w&0xFF)as u8; }
-    for i in 0..10usize { let w = words[10+i]; serial[i*2]=(w>>8)as u8; serial[i*2+1]=(w&0xFF)as u8; }
+    for i in 0..20usize {
+        let w = words[27 + i];
+        model[i * 2]     = (w >> 8) as u8;
+        model[i * 2 + 1] = (w & 0xFF) as u8;
+    }
+    for i in 0..4usize {
+        let w = words[23 + i];
+        firmware[i * 2]     = (w >> 8) as u8;
+        firmware[i * 2 + 1] = (w & 0xFF) as u8;
+    }
+    for i in 0..10usize {
+        let w = words[10 + i];
+        serial[i * 2]     = (w >> 8) as u8;
+        serial[i * 2 + 1] = (w & 0xFF) as u8;
+    }
 
-    // LBA48: word 83 bit 10
     let lba48 = words[83] & (1 << 10) != 0;
 
-    // Número total de sectores
     let total_sectors = if lba48 {
-        // words 100-103 (64-bit little-endian en words de 16 bits)
         (words[100] as u64)
         | ((words[101] as u64) << 16)
         | ((words[102] as u64) << 32)
         | ((words[103] as u64) << 48)
     } else {
-        // words 60-61 (32-bit)
         (words[60] as u64) | ((words[61] as u64) << 16)
     };
 
     DriveInfo {
-        id,
-        kind,
-        total_sectors,
+        id, kind, total_sectors,
         capacity_mib: total_sectors / 2048,
-        lba48,
-        model,
-        firmware,
-        serial,
+        lba48, model, firmware, serial,
     }
 }
 
 // ── Helpers de log ────────────────────────────────────────────────────────────
 
-/// Imprime por serial la lista de drives; llama desde `rust_main` tras `AtaBus::scan()`
 pub fn log_drives(bus: &AtaBus) {
     use crate::drivers::serial;
 

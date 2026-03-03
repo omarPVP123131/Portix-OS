@@ -1,5 +1,10 @@
-// drivers/storage/fat32.rs — PORTIX Kernel v0.7.4
+// drivers/storage/fat32.rs — PORTIX Kernel v0.7.5
 // Driver FAT32 sobre ATA PIO.
+//
+// CAMBIOS v0.7.5:
+//   - accumulate_lfn(): eliminado el bloque de código duplicado que
+//     añadía los caracteres LFN dos veces (una vía macro push! y otra
+//     vía los bucles manuales posteriores), corrompiendo los nombres.
 
 #![allow(dead_code)]
 
@@ -91,7 +96,6 @@ struct DirEntry83 {
 }
 
 impl DirEntry83 {
-    /// FIXED: acceso seguro a campos packed — usar read_unaligned vía copy
     fn cluster(&self) -> u32 {
         let hi: u16 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(self.clus_hi)) };
         let lo: u16 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(self.clus_lo)) };
@@ -166,7 +170,6 @@ impl Fat32Volume {
 
         if vbr[510] != 0x55 || vbr[511] != 0xAA { return Err(FatError::NotFat32); }
 
-        // Leer campos del BPB manualmente (evitar referencias a packed fields)
         let bytes_per_sec = u16::from_le_bytes([vbr[11], vbr[12]]);
         let sec_per_clus  = vbr[13] as u32;
         let reserved_secs = u16::from_le_bytes([vbr[14], vbr[15]]) as u32;
@@ -450,10 +453,6 @@ impl Fat32Volume {
         let mut sec = [0u8; 512];
         self.drive.read_sectors(entry.dir_sector, 1, &mut sec)?;
         let off = entry.dir_offset;
-        // clus_hi at +20, clus_lo at +26
-        sec[off + 20] = cluster as u8;        // lo byte of hi word
-        sec[off + 21] = (cluster >> 8) as u8; // hi byte of hi word  -- wait, hi word is bits [31:16]
-        // Correct layout: clus_hi = cluster[31:16], clus_lo = cluster[15:0]
         let hi = (cluster >> 16) as u16;
         let lo = cluster as u16;
         sec[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
@@ -474,50 +473,47 @@ impl Fat32Volume {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Acumula los caracteres de una entrada LFN en el buffer compartido.
+///
+/// BUG CORREGIDO: la versión anterior tenía el cuerpo duplicado — primero
+/// un bloque `macro_rules! push!` que insertaba los caracteres, y luego
+/// los mismos tres bucles manuales que los volvían a insertar, doblando
+/// la longitud del nombre y corrompiendo todos los LFN.
+/// Ahora solo existe una ruta de código (los tres bucles seguros con
+/// `read_unaligned`), que es la correcta para structs `packed`.
 fn accumulate_lfn(lfn: &LfnEntry, buf: &mut [u16; 256], len: &mut usize) {
     let order = (lfn.order & 0x1F) as usize;
     if order == 0 || order > 20 { return; }
     let base = (order - 1) * 13;
     let mut pos = base;
-    // Read LFN name fields safely (packed struct)
-macro_rules! push {
-    ($offset:expr, $count:expr) => {
-        for k in 0..$count {
-            let w: u16 = unsafe {
-                core::ptr::read_unaligned(
-                    (lfn as *const LfnEntry as *const u8).add($offset + k * 2) as *const u16
-                )
-            };
-            if pos < 256 {
-                buf[pos] = w;
-                pos += 1;
-            }
-        }
-    };
-}
 
-push!(1, 5);
-push!(14, 6);
-push!(28, 2);
-    // name1: 5 u16, name2: 6 u16, name3: 2 u16
+    // Leer los 13 caracteres UTF-16 de la entrada LFN de forma segura
+    // (los campos son unaligned en el struct packed, por lo que se debe
+    // usar read_unaligned en lugar de acceso directo).
+    let base_ptr = lfn as *const LfnEntry as *const u8;
+
+    // name1: 5 u16 desde offset 1
     for k in 0..5usize {
-        let w: u16 = unsafe { core::ptr::read_unaligned(
-            (lfn as *const LfnEntry as *const u8).add(1 + k * 2) as *const u16
-        )};
+        let w: u16 = unsafe {
+            core::ptr::read_unaligned(base_ptr.add(1 + k * 2) as *const u16)
+        };
         if pos < 256 { buf[pos] = w; pos += 1; }
     }
+    // name2: 6 u16 desde offset 14
     for k in 0..6usize {
-        let w: u16 = unsafe { core::ptr::read_unaligned(
-            (lfn as *const LfnEntry as *const u8).add(14 + k * 2) as *const u16
-        )};
+        let w: u16 = unsafe {
+            core::ptr::read_unaligned(base_ptr.add(14 + k * 2) as *const u16)
+        };
         if pos < 256 { buf[pos] = w; pos += 1; }
     }
+    // name3: 2 u16 desde offset 28
     for k in 0..2usize {
-        let w: u16 = unsafe { core::ptr::read_unaligned(
-            (lfn as *const LfnEntry as *const u8).add(28 + k * 2) as *const u16
-        )};
+        let w: u16 = unsafe {
+            core::ptr::read_unaligned(base_ptr.add(28 + k * 2) as *const u16)
+        };
         if pos < 256 { buf[pos] = w; pos += 1; }
     }
+
     if pos > *len { *len = pos; }
 }
 
@@ -561,7 +557,7 @@ fn make_83(name: &str) -> ([u8; 8], [u8; 3]) {
     let dot = name.rfind('.');
     let (base, ext) = if let Some(d) = dot { (&name[..d], &name[d+1..]) } else { (name, "") };
     for (i, b) in base.bytes().take(8).enumerate() { n8[i] = b.to_ascii_uppercase(); }
-    for (i, b) in ext.bytes().take(3).enumerate() { e3[i] = b.to_ascii_uppercase(); }
+    for (i, b) in ext.bytes().take(3).enumerate()  { e3[i] = b.to_ascii_uppercase(); }
     (n8, e3)
 }
 

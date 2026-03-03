@@ -20,17 +20,18 @@ pub mod arch;
 pub mod console;
 pub mod drivers;
 pub mod graphics;
+pub mod mem;
 pub mod time;
 pub mod ui;
 pub mod util;
-pub mod mem;
 
-use mem::allocator::BuddyAllocator;
 use console::terminal::editor::draw_editor_tab;
 use console::terminal::LineColor;
 use core::arch::global_asm;
 use drivers::input::keyboard::Key;
+use drivers::storage::{mkfs, fat32, ata};
 use graphics::driver::framebuffer::{Color, Console, Layout};
+use mem::allocator::BuddyAllocator;
 use ui::tabs::explorer::ExplorerState;
 use ui::tabs::ide::{init_page_pool, IdeState, MenuState, MENUS};
 use ui::tabs::ide::{MENU_H as IDE_MENU_H, STATUS_H as IDE_STATUS_H, TABS_H as IDE_TABS_H};
@@ -106,12 +107,16 @@ static mut EXPLORER_STORAGE: core::mem::MaybeUninit<ExplorerState> =
 // Tiene que coincidir con los anchos que calcula draw_ide_tab en ide.rs.
 fn ide_menubar_hit(mx: i32, my: i32, content_y: usize, font_w: usize) -> i32 {
     let y = my as usize;
-    if y < content_y || y >= content_y + IDE_MENU_H { return -1; }
-    let mut x_pos = 8usize;  // cambió de 6 a 8
+    if y < content_y || y >= content_y + IDE_MENU_H {
+        return -1;
+    }
+    let mut x_pos = 8usize; // cambió de 6 a 8
     for (i, menu) in MENUS.iter().enumerate() {
         let label_w = menu.title.len() * font_w + 14; // cambió de 16 a 14
         let x = mx as usize;
-        if x >= x_pos && x < x_pos + label_w { return i as i32; }
+        if x >= x_pos && x < x_pos + label_w {
+            return i as i32;
+        }
         x_pos += label_w + 2;
     }
     -1
@@ -163,7 +168,7 @@ fn ide_dropdown_hit(mx: i32, my: i32, menu_idx: usize, content_y: usize, font_w:
         .unwrap_or(0);
     let dd_w = (max_label + max_short + 6) * font_w + 16;
     let dd_x = x_pos;
-let dd_y = content_y + IDE_MENU_H;
+    let dd_y = content_y + IDE_MENU_H;
 
     let x = mx as usize;
     let y = my as usize;
@@ -185,7 +190,9 @@ let dd_y = content_y + IDE_MENU_H;
 
 #[no_mangle]
 extern "C" fn rust_main() -> ! {
-    unsafe { ALLOCATOR.init(); }
+    unsafe {
+        ALLOCATOR.init();
+    }
 
     init_page_pool();
 
@@ -211,8 +218,8 @@ extern "C" fn rust_main() -> ! {
         drivers::serial::write_str(" dispositivos\n");
     }
     {
-        let ata = drivers::storage::ata::AtaBus::scan();
-        drivers::storage::ata::log_drives(&ata);
+        let ata = ata::AtaBus::scan();
+        ata::log_drives(&ata);
     }
 
     let mut kbd = drivers::input::keyboard::KeyboardState::new();
@@ -233,37 +240,64 @@ extern "C" fn rust_main() -> ! {
             .write(core::mem::MaybeUninit::new(ExplorerState::new(2)));
     }
 
-    // Intentar FAT32 — si falla Explorer queda con cluster=2
-    {
-        let ata = drivers::storage::ata::AtaBus::scan();
-
-        // Intentar disco primario primero, luego secundario como fallback
-        let vol_result = ata
-            .drive(drivers::storage::ata::DriveId::Primary0)
-            .and_then(|d| drivers::storage::fat32::Fat32Volume::mount(d).ok())
-            .or_else(|| {
-                drivers::serial::log("FAT32", "Primary0 fallido, intentando Primary1");
-                ata.drive(drivers::storage::ata::DriveId::Primary1)
-                    .and_then(|d| drivers::storage::fat32::Fat32Volume::mount(d).ok())
-            })
-            .or_else(|| {
-                drivers::serial::log("FAT32", "Primary1 fallido, intentando Secondary0");
-                ata.drive(drivers::storage::ata::DriveId::Secondary0)
-                    .and_then(|d| drivers::storage::fat32::Fat32Volume::mount(d).ok())
-            });
-
-        if let Some(vol) = vol_result {
-            let root = vol.root_cluster();
-            drivers::serial::log("FAT32", "Volumen montado OK");
-            unsafe {
-                core::ptr::addr_of_mut!(EXPLORER_STORAGE)
-                    .write(core::mem::MaybeUninit::new(ExplorerState::new(root)));
+{
+    let ata = ata::AtaBus::scan();
+    
+    let vol_result = if let Some(drive) = ata.drive(ata::DriveId::Primary0) {
+        // Clonamos la info para poder re-crear el drive si el primer mount falla
+        let drive_info = *drive.info();
+        
+        // Primer intento de montaje
+        match fat32::Fat32Volume::mount(drive) {
+            Ok(vol) => Some(vol),
+            Err(_) => {
+                // Si falló, 'drive' se perdió (moved), así que creamos uno nuevo con la info guardada
+                let drive_recovery = ata::AtaDrive::from_info(drive_info);
+                
+                // Formateamos (aquí pasamos drive_recovery, que mkfs consumirá)
+                if mkfs::auto_format(drive_recovery).is_some() {
+                    // Si el formato tuvo éxito, creamos OTRO drive para el montaje final
+                    let drive_final = ata::AtaDrive::from_info(drive_info);
+                    fat32::Fat32Volume::mount(drive_final).ok()
+                } else {
+                    None
+                }
             }
-        } else {
-            drivers::serial::log("FAT32", "Sin disco disponible — modo memoria");
         }
-    }
+    } else {
+        None
+    };
 
+  if let Some(vol) = vol_result {
+    let root = vol.root_cluster();
+    serial_log!(Ok, "FAT32", "Volumen montado");
+
+    // --- Smoke Test: Navegación y Lectura ---
+    // Buscamos /home/user/README.TXT paso a paso
+    let test_read = vol.find_entry(root, "home")
+        .and_then(|e| vol.find_entry(e.cluster, "user"))
+        .and_then(|e| vol.find_entry(e.cluster, "README.TXT"));
+
+if let Ok(readme_entry) = test_read {
+    let mut buf = [0u8; 64];
+    // Cambiado: quitamos el 0 para que coincida con la firma (entry, buf)
+    if let Ok(bytes) = vol.read_file(&readme_entry, &mut buf) {
+        serial_log!(Info, "FAT32", "Lectura de prueba (/home/user/README.TXT):");
+        drivers::serial::write_str("      >> \"");
+        drivers::serial::write_bytes_raw(&buf[..bytes]);
+        drivers::serial::write_str("\"\n");
+    }
+}else {
+        serial_log!(Warn, "FAT32", "No se encontró el archivo de bienvenida");
+    }
+    // ----------------------------------------
+
+    unsafe {
+        core::ptr::addr_of_mut!(EXPLORER_STORAGE)
+            .write(core::mem::MaybeUninit::new(ExplorerState::new(root)));
+    }
+}
+}
     // Referencias limpias para el loop principal
     let ide: &mut IdeState = unsafe { (*core::ptr::addr_of_mut!(IDE_STORAGE)).assume_init_mut() };
     let explorer: &mut ExplorerState =
@@ -412,10 +446,10 @@ extern "C" fn rust_main() -> ! {
 
                     // ── IDE — Ctrl+S/N/W y teclas de edición ──────────────
                     _ if tab == Tab::Ide => {
-let edit_start = lay.content_y + IDE_MENU_H + IDE_TABS_H;
-let edit_h     = lay.fh.saturating_sub(edit_start + IDE_STATUS_H);
-let lh         = lay.font_h + 3;
-let vis_r      = (edit_h / lh).max(1);
+                        let edit_start = lay.content_y + IDE_MENU_H + IDE_TABS_H;
+                        let edit_h = lay.fh.saturating_sub(edit_start + IDE_STATUS_H);
+                        let lh = lay.font_h + 3;
+                        let vis_r = (edit_h / lh).max(1);
 
                         // Ctrl+S/N/W/Tab manejados dentro de ide.handle_key
                         ide.handle_key(key, ctrl, vis_r);
@@ -541,30 +575,30 @@ let vis_r      = (edit_h / lh).max(1);
 
                 // ── Click dentro del área de contenido del IDE ────────────
                 } else if tab == Tab::Ide {
-                    
                     if ide_help_btn_hit(ms.x, ms.y, lay.content_y, lay.fw, lay.font_w) {
-    ide.show_help = !ide.show_help;
-    needs_draw = true;
-}
-if explorer.context.visible {
-    // ¿Hit en algún item del menú?
-    let cx = explorer.context.x;
-    let cy = explorer.context.y;
-    let mw = explorer.context.width(lay.font_w);
-    let x  = ms.x as usize; let y = ms.y as usize;
-    if x >= cx && x < cx + mw && y >= cy {
-        let item_idx = (y.saturating_sub(cy + 2)) / 18;
-        explorer.execute_context(item_idx);
-    } else {
-        explorer.context.close();
-    }
-    needs_draw = true;
-}
-// Botón [?] de help en toolbar del explorer
-else if exp_help_btn_hit(ms.x, ms.y, lay.content_y, lay.fw, lay.font_w) {
-    explorer.show_help = !explorer.show_help;
-    needs_draw = true;
-}
+                        ide.show_help = !ide.show_help;
+                        needs_draw = true;
+                    }
+                    if explorer.context.visible {
+                        // ¿Hit en algún item del menú?
+                        let cx = explorer.context.x;
+                        let cy = explorer.context.y;
+                        let mw = explorer.context.width(lay.font_w);
+                        let x = ms.x as usize;
+                        let y = ms.y as usize;
+                        if x >= cx && x < cx + mw && y >= cy {
+                            let item_idx = (y.saturating_sub(cy + 2)) / 18;
+                            explorer.execute_context(item_idx);
+                        } else {
+                            explorer.context.close();
+                        }
+                        needs_draw = true;
+                    }
+                    // Botón [?] de help en toolbar del explorer
+                    else if exp_help_btn_hit(ms.x, ms.y, lay.content_y, lay.fw, lay.font_w) {
+                        explorer.show_help = !explorer.show_help;
+                        needs_draw = true;
+                    }
                     let hit_menu = ide_menubar_hit(ms.x, ms.y, lay.content_y, lay.font_w);
                     if hit_menu >= 0 {
                         // Abrir/cerrar menú

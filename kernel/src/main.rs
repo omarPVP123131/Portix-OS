@@ -346,12 +346,13 @@ extern "C" fn rust_main() -> ! {
                 needs_draw = true;
 
                 // Editor de texto del terminal (modo especial)
-                if term.editor.is_some() {
-                    let should_exit = {
-                        let ed = term.editor.as_mut().unwrap();
-                        ed.handle_key(key);
-                        ed.exit
-                    };
+               if term.editor.is_some() {
+    let should_exit = {
+        let ed = term.editor.as_mut().unwrap();
+        let ctrl = kbd.ctrl();
+        ed.handle_key(key, ctrl);  // ← ctrl ahora se pasa
+        ed.exit
+    };
                     if should_exit {
                         term.editor = None;
                         term.write_line("  Editor cerrado.", LineColor::Info);

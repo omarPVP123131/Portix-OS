@@ -1,13 +1,9 @@
-// console/terminal/mod.rs
-// Struct Terminal, constantes públicas y toda la lógica "core":
-//   - Ring buffer / scroll
-//   - Input (type_char, backspace, clear, enter)
-//   - Escritura (write_line, write_bytes, write_empty)
-//   - separador() — helper de presentación usado por los comandos
-//
-// Los comandos viven en el submódulo `commands/`.
-// Los helpers de formato viven en `fmt`.
-// El editor hexadecimal vive en `editor`.
+// console/terminal/mod.rs — PORTIX Kernel v0.7.5
+// Struct Terminal + toda la lógica core.
+// CAMBIOS v0.7.5:
+//   - Añadido campo `cwd` / `cwd_len` para directorio de trabajo actual.
+//   - El CWD persiste entre comandos dentro de la sesión.
+//   - El CWD inicial es "/home/user" (coincide con mkfs).
 
 #![allow(dead_code)]
 
@@ -22,6 +18,7 @@ pub const TERM_ROWS:   usize = 128;
 pub const INPUT_MAX:   usize = 80;
 pub const PROMPT:      &[u8] = b"PORTIX> ";
 pub const SCROLL_STEP: usize = 3;
+pub const CWD_MAX:     usize = 256;
 
 // ── Tipos públicos ────────────────────────────────────────────────────────────
 
@@ -56,12 +53,20 @@ pub struct Terminal {
     pub(crate) hist_cmds:  [[u8; INPUT_MAX]; 16],
     pub(crate) hist_lens:  [usize; 16],
     pub(crate) hist_count: usize,
-    // Editor hexadecimal de disco (Some = editor activo, None = terminal normal)
+    // Editor (hex o texto) — Some = editor activo, None = terminal normal
     pub editor: Option<editor::EditorState>,
+    // Directorio de trabajo actual (CWD), persiste entre comandos
+    pub cwd:     [u8; CWD_MAX],
+    pub cwd_len: usize,
 }
 
 impl Terminal {
     pub const fn new() -> Self {
+        // CWD inicial: "/home/user"
+        let mut cwd = [0u8; CWD_MAX];
+        cwd[0]  = b'/'; cwd[1]  = b'h'; cwd[2]  = b'o';
+        cwd[3]  = b'm'; cwd[4]  = b'e'; cwd[5]  = b'/';
+        cwd[6]  = b'u'; cwd[7]  = b's'; cwd[8]  = b'e'; cwd[9] = b'r';
         Terminal {
             lines:         [TermLine::empty(); TERM_ROWS],
             line_count:    0,
@@ -73,6 +78,8 @@ impl Terminal {
             hist_lens:     [0usize; 16],
             hist_count:    0,
             editor:        None,
+            cwd,
+            cwd_len:       10, // len("/home/user")
         }
     }
 
@@ -102,8 +109,6 @@ impl Terminal {
 
     pub fn write_empty(&mut self) { self.write_bytes(b"", LineColor::Normal); }
 
-    /// Cabecera de sección tipo `+-- TITULO ------+`.
-    /// Usada por los módulos de comandos para separar bloques de información.
     pub fn separador(&mut self, titulo: &str) {
         let tb = titulo.as_bytes();
         let tl = tb.len();
@@ -121,9 +126,15 @@ impl Terminal {
         self.write_bytes(&buf[..pos], LineColor::Header);
     }
 
+    // ══ CWD ══════════════════════════════════════════════════════════════════
+
+    /// Retorna el CWD como &str (best-effort, '/' si UTF-8 falla).
+    pub fn cwd_str(&self) -> &str {
+        core::str::from_utf8(&self.cwd[..self.cwd_len]).unwrap_or("/")
+    }
+
     // ══ Ring buffer ═══════════════════════════════════════════════════════════
 
-    /// Línea por índice lógico (0 = la más antigua disponible).
     #[inline]
     pub fn line_at(&self, li: usize) -> &TermLine {
         &self.lines[li % TERM_ROWS]
@@ -134,7 +145,6 @@ impl Terminal {
         if self.line_count <= TERM_ROWS { 0 } else { self.line_count - TERM_ROWS }
     }
 
-    /// Máximo `scroll_offset` posible para la ventana visible dada.
     pub fn max_scroll(&self, max_visible: usize) -> usize {
         let available = self.line_count.saturating_sub(self.oldest_logical());
         available.saturating_sub(max_visible)
@@ -152,7 +162,6 @@ impl Terminal {
     pub fn scroll_to_bottom(&mut self) { self.scroll_offset = 0; }
     pub fn at_bottom(&self)  -> bool   { self.scroll_offset == 0 }
 
-    /// Retorna `(inicio_lógico, cantidad)` para el render.
     pub fn visible_range(&self, max_visible: usize) -> (usize, usize) {
         if self.line_count == 0 { return (0, 0); }
         let oldest          = self.oldest_logical();
@@ -185,21 +194,26 @@ impl Terminal {
         self.scroll_offset = 0;
     }
 
-    // ══ Enter: echo + historial + dispatch ════════════════════════════════════
+    // ══ Enter ════════════════════════════════════════════════════════════════
 
     pub fn enter(
         &mut self,
         hw:  &crate::arch::hardware::HardwareInfo,
         pci: &crate::drivers::bus::pci::PciBus,
     ) {
-        // Echo de la línea de prompt
-        let mut echo = [0u8; INPUT_MAX + 10];
-        let plen = PROMPT.len();
-        echo[..plen].copy_from_slice(PROMPT);
-        echo[plen..plen + self.input_len].copy_from_slice(&self.input[..self.input_len]);
-        self.write_bytes(&echo[..plen + self.input_len], LineColor::Prompt);
+        // Echo con CWD en el prompt: "user@portix:/home/user> comando"
+        let mut echo = [0u8; INPUT_MAX + 60];
+        let mut ep = 0;
+        // Prompt estilo Linux: "root@portix:<cwd>$ "
+        for b in b"root@portix:" { echo[ep] = *b; ep += 1; }
+        let cl = self.cwd_len.min(40);
+        echo[ep..ep + cl].copy_from_slice(&self.cwd[..cl]); ep += cl;
+        for b in b"$ " { echo[ep] = *b; ep += 1; }
+        let il = self.input_len.min(INPUT_MAX);
+        echo[ep..ep + il].copy_from_slice(&self.input[..il]); ep += il;
+        self.write_bytes(&echo[..ep], LineColor::Prompt);
 
-        // Guardar en historial
+        // Historial
         if self.input_len > 0 {
             let slot = self.hist_count % 16;
             self.hist_cmds[slot][..self.input_len].copy_from_slice(&self.input[..self.input_len]);
@@ -231,7 +245,6 @@ impl Terminal {
 
         if cmd_len == 0 { self.clear_input(); return; }
 
-        // Delegar al dispatcher
         commands::dispatch(self, &cmd_buf[..cmd_len], &args_buf[..args_len], hw, pci);
         self.clear_input();
     }

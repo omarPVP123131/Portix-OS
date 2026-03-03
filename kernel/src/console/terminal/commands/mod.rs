@@ -1,5 +1,5 @@
-// console/terminal/commands/mod.rs
-// Tabla de dispatch central. Añadir un comando nuevo = 1 línea aquí + función en el módulo correcto.
+// console/terminal/commands/mod.rs — PORTIX Kernel v0.7.5
+// Tabla de dispatch central.
 
 pub mod system;
 pub mod debug;
@@ -9,7 +9,7 @@ pub mod disk;
 
 use crate::console::terminal::{Terminal, LineColor, INPUT_MAX};
 
-/// Enruta `cmd` al handler correspondiente. Llamado desde `Terminal::enter()`.
+/// Enruta `cmd` al handler correspondiente.
 pub fn dispatch(
     t:   &mut Terminal,
     cmd: &[u8],
@@ -81,9 +81,38 @@ pub fn dispatch(
         b"inb"     => debug::cmd_inb(t, args),
         b"outb"    => debug::cmd_outb(t, args),
 
-        // ── Disco ATA ────────────────────────────────────────────────────────
-        b"diskinfo" | b"drives"
-            => disk::cmd_diskinfo(t),
+        // ── Navegación del sistema de archivos (estilo Unix) ─────────────────
+        b"ls" | b"dir" | b"listar"
+            => disk::cmd_ls(t, args),
+        b"cd" | b"chdir"
+            => disk::cmd_cd(t, args),
+        b"pwd" | b"ruta"
+            => disk::cmd_pwd(t),
+        b"tree" | b"arbol"
+            => disk::cmd_tree(t, args),
+
+        // ── Archivos ─────────────────────────────────────────────────────────
+
+b"cat" | b"type"
+    => disk::cmd_cat(t, args),
+        b"touch" | b"nuevo"
+            => disk::cmd_touch(t, args),
+        b"write" | b"escribir"
+            => disk::cmd_write(t, args),
+        b"mkdir" | b"md"
+            => disk::cmd_mkdir(t, args),
+        b"rm" | b"del" | b"eliminar"
+            => disk::cmd_rm(t, args),
+        b"mv" | b"ren" | b"renombrar"
+            => disk::cmd_mv(t, args),
+        b"stat" | b"info_archivo"
+            => disk::cmd_stat(t, args),
+        b"edit" | b"nano" | b"editor"
+            => disk::cmd_edit(t, args),
+
+        // ── Disco ATA / DiskPart ─────────────────────────────────────────────
+        b"diskpart" | b"diskinfo" | b"drives"
+            => disk::cmd_diskpart(t),
         b"diskread" | b"sectors"
             => disk::cmd_diskread(t, args),
         b"diskedit" | b"hexedit"
@@ -116,10 +145,11 @@ pub fn dispatch(
         // ── Comando desconocido ──────────────────────────────────────────────
         _ => {
             let mut buf = [0u8; INPUT_MAX]; let mut pos = 0;
-            for b in b"  Error: comando no encontrado: " { buf[pos] = *b; pos += 1; }
+            for b in b"  Comando no encontrado: " { buf[pos] = *b; pos += 1; }
             let l = cmd.len().min(40);
-            buf[pos..pos + l].copy_from_slice(&cmd[..l]);
-            t.write_bytes(&buf[..pos + l], LineColor::Error);
+            buf[pos..pos + l].copy_from_slice(&cmd[..l]); pos += l;
+            t.write_bytes(&buf[..pos + l - l], LineColor::Error);
+            t.write_bytes(&buf[..pos], LineColor::Error);
             t.write_line("  Escribe 'help' para ver los comandos disponibles.", LineColor::Normal);
         }
     }

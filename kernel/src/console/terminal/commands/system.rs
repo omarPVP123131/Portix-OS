@@ -221,18 +221,45 @@ pub fn cmd_cpu(t: &mut Terminal, hw: &crate::arch::hardware::HardwareInfo) {
 }
 
 pub fn cmd_mem(t: &mut Terminal, hw: &crate::arch::hardware::HardwareInfo) {
-    t.separador("MEMORIA RAM (E820)");
+    t.separador("MEMORIA RAM (BOOTINFO)");
     {
         let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Utilizable : ");
         append_mib(&mut buf, &mut pos, hw.ram.usable_or_default());
-        append_str(&mut buf, &mut pos, b"   Entradas E820: ");
+        append_str(&mut buf, &mut pos, b"   Entradas: ");
         append_u32(&mut buf, &mut pos, hw.ram.entry_count as u32);
         t.write_bytes(&buf[..pos], LineColor::Normal);
     }
     t.write_empty();
     t.write_line("  #  Base                   Longitud      Tipo", LineColor::Info);
     t.write_line("  -  --------------------   -----------   ----------", LineColor::Normal);
+    if let Some(boot) = crate::bootinfo::get() {
+        let regions = crate::bootinfo::memory_regions(boot);
+        for (i, r) in regions.iter().take(16).enumerate() {
+            let ts: &[u8] = match r.kind {
+                crate::bootinfo::MEM_USABLE_MAPPED => b"UsableMap",
+                crate::bootinfo::MEM_USABLE_UNMAPPED => b"UsableUnmap",
+                crate::bootinfo::MEM_ACPI_RECLAIM => b"ACPI Reclam",
+                crate::bootinfo::MEM_ACPI_NVS => b"ACPI NVS",
+                crate::bootinfo::MEM_FRAMEBUFFER => b"Framebuffer",
+                crate::bootinfo::MEM_KERNEL => b"Kernel",
+                crate::bootinfo::MEM_PAGE_TABLES => b"PageTables",
+                crate::bootinfo::MEM_BAD_MEMORY => b"BadMemory",
+                _ => b"Reservada",
+            };
+            let mut eb = [0u8; TERM_COLS]; let mut ep = 0;
+            append_str(&mut eb, &mut ep, b"  ");
+            append_u32(&mut eb, &mut ep, i as u32);
+            append_str(&mut eb, &mut ep, b"  0x");
+            append_hex64_full(&mut eb, &mut ep, r.base);
+            append_str(&mut eb, &mut ep, b"  ");
+            append_mib(&mut eb, &mut ep, r.length / (1024 * 1024));
+            append_str(&mut eb, &mut ep, b"   ");
+            eb[ep..ep + ts.len()].copy_from_slice(ts); ep += ts.len();
+            t.write_bytes(&eb[..ep], if r.kind == crate::bootinfo::MEM_USABLE_MAPPED || r.kind == crate::bootinfo::MEM_USABLE_UNMAPPED { LineColor::Success } else { LineColor::Normal });
+        }
+        return;
+    }
     unsafe {
         for i in 0..(hw.ram.entry_count.min(16) as usize) {
             let p    = (0x9102usize + i * 20) as *const u8;

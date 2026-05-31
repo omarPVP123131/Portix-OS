@@ -113,6 +113,64 @@ pub unsafe fn pci_read8(bus: u8, dev: u8, func: u8, reg: u8) -> u8 {
     (v >> ((reg & 3) * 8)) as u8
 }
 
+/// Lee la dirección base de un BAR PCI (offset 0x10..0x24).
+/// Maneja BARs 32-bit y 64-bit (pair). Devuelve 0 si no es MMIO.
+unsafe fn pci_read_bar_base(bus: u8, dev: u8, func: u8, reg: u8) -> u64 {
+    let bar = pci_read32(bus, dev, func, reg);
+    if bar & 1 != 0 { return 0; }          // I/O BAR, skip
+    if (bar >> 1) & 0x3 == 0x2 {           // 64-bit
+        let hi = pci_read32(bus, dev, func, reg + 4);
+        ((hi as u64) << 32) | (bar as u64 & !0xF)
+    } else {                                 // 32-bit
+        (bar as u64) & !0xF
+    }
+}
+
+/// Escanea PCI buscando un controlador VGA (class=0x03, subclass=0x00)
+/// y devuelve la dirección física del framebuffer.
+/// Soporta: Bochs VGA (BAR0), virtio-vga (BAR1), QXL, VMware SVGA.
+/// Usado como fallback cuando GOP/UEFI no provee framebuffer.
+pub fn pci_find_vga_framebuffer() -> u64 {
+    unsafe {
+        for b in 0u8..=255u8 {
+            for d in 0u8..32u8 {
+                let id = pci_read32(b, d, 0, 0);
+                let vendor = (id & 0xFFFF) as u16;
+                if vendor == 0xFFFF { continue; }
+                let header = pci_read8(b, d, 0, 0x0E);
+                let max_func: u8 = if header & 0x80 != 0 { 8 } else { 1 };
+                for f in 0u8..max_func {
+                    let fid = pci_read32(b, d, f, 0);
+                    if (fid & 0xFFFF) as u16 == 0xFFFF { continue; }
+                    let cls = pci_read32(b, d, f, 0x08);
+                    if (cls >> 24) as u8 != 0x03 || ((cls >> 16) & 0xFF) as u8 != 0x00 {
+                        continue;
+                    }
+                    // VGA controller found — select framebuffer BAR por vendor
+                    let fb_addr = match vendor {
+                        0x1AF4 => {
+                            // virtio-vga / QXL: BAR1 = framebuffer, BAR0 = legacy I/O
+                            let a = pci_read_bar_base(b, d, f, 0x14);
+                            if a != 0 { a } else { pci_read_bar_base(b, d, f, 0x10) }
+                        }
+                        0x15AD | 0x80EE => {
+                            // VMware SVGA, VirtualBox: BAR0 = framebuffer
+                            pci_read_bar_base(b, d, f, 0x10)
+                        }
+                        _ => {
+                            // Bochs VGA / default: BAR0, fallback BAR1
+                            let a = pci_read_bar_base(b, d, f, 0x10);
+                            if a != 0 { a } else { pci_read_bar_base(b, d, f, 0x14) }
+                        }
+                    };
+                    if fb_addr != 0 { return fb_addr; }
+                }
+            }
+        }
+    }
+    0
+}
+
 pub struct PciBus {
     pub devices: [PciDevice; MAX_PCI_DEVICES],
     pub count:   usize,

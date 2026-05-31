@@ -64,6 +64,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.pyo
+scripts/Diagnostico.py
+scripts/kernel.py
 
 # virtualenvs
 .venv/
@@ -78,6 +80,13 @@ env/
 logs/
 debug/
 serial.log
+
+#######################################################
+# 🐙 GITHUB / CI / AI ASSISTANTS (no versionar)
+#######################################################
+
+.github/
+.opencode/
 
 #######################################################
 # 🧰 IDEs / EDITORS

@@ -1,0 +1,19 @@
+# Portix OS - Code Ownership
+
+# El núcleo es territorio sagrado
+/boot/                    @omarPVP123131
+/kernel/src/arch/         @omarPVP123131
+/kernel/src/drivers/      @omarPVP123131
+/kernel/src/mem/          @omarPVP123131
+/kernel/src/time/         @omarPVP123131
+/kernel/src/main.rs       @omarPVP123131
+/scripts/                 @omarPVP123131
+# Evitar que toquen la configuración de compilación
+/kernel/Cargo.toml          @omarPVP123131
+/kernel/Cargo.lock          @omarPVP123131
+/kernel/*.json              @omarPVP123131
+# Evitar que toquen el linker (Si mueven esto, el kernel no bootea)
+/kernel/linker.ld           @omarPVP123131
+
+/kernel/src/console/commands/fun.rs  @omarPVP123131 @hsalinasgarcia8-lgtm
+/kernel/src/console/commands/mod.rs  @omarPVP123131 @hsalinasgarcia8-lgtm

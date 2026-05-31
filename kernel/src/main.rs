@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod arch;
+pub mod bootinfo;
 pub mod console;
 pub mod drivers;
 pub mod graphics;
@@ -58,6 +59,7 @@ global_asm!(
     "_start:",
     "    cli",
     "    cld",
+    "    mov r12, rdi",
     "    lea rsp, [rip + {STACK_TOP}]",
     "    xor rbp, rbp",
     "    lea rdi, [rip + {BSS_START}]",
@@ -69,6 +71,7 @@ global_asm!(
     "    xor eax, eax",
     "    rep stosb",
     "1:",
+    "    mov rdi, r12",
     "    call {RUST_MAIN}",
     "2:  hlt",
     "    jmp 2b",
@@ -93,6 +96,19 @@ unsafe fn ps2_inb(p: u16) -> u8 {
     let v: u8;
     core::arch::asm!("in al, dx", out("al") v, in("dx") p, options(nostack, nomem));
     v
+}
+
+unsafe fn init_cpu_features() {
+    let mut cr0: u64;
+    core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack, nomem));
+    cr0 &= !(1 << 2); // EM=0
+    cr0 |= 1 << 1;    // MP=1
+    core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack, nomem));
+
+    let mut cr4: u64;
+    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, nomem));
+    cr4 |= (1 << 9) | (1 << 10); // OSFXSR + OSXMMEXCPT
+    core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, nomem));
 }
 
 // ── Statics BSS ──────────────────────────────────────────────────────────────
@@ -189,21 +205,17 @@ fn ide_dropdown_hit(mx: i32, my: i32, menu_idx: usize, content_y: usize, font_w:
 // ── Punto de entrada ──────────────────────────────────────────────────────────
 
 #[no_mangle]
-extern "C" fn rust_main() -> ! {
-    unsafe {
-        ALLOCATOR.init();
-    }
+extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
+    unsafe { bootinfo::init(boot_info); }
+    unsafe { init_cpu_features(); }
 
+    // IDT primero — sin esto cualquier excepción = triple fault opaco
+    unsafe { arch::idt::init_idt(); }  // instala GDT+TSS+IDT y hace STI
+
+    unsafe { ALLOCATOR.init(); }
     init_page_pool();
-
-    unsafe {
-        arch::idt::init_idt();
-    }
     drivers::serial::init();
     time::pit::init();
-    unsafe {
-        core::arch::asm!("sti", options(nostack, preserves_flags));
-    }
     drivers::serial::log("PIT", "temporizador 100 Hz");
 
     let hw = arch::hardware::HardwareInfo::detect_all();
@@ -304,7 +316,7 @@ extern "C" fn rust_main() -> ! {
         ("  OK  ", "Raton PS/2 inicializado", Color::GREEN),
         ("  OK  ", "Escaneo de discos ATA completo", Color::GREEN),
         ("  OK  ", "Framebuffer VESA activo", Color::GREEN),
-        ("  OK  ", "Doble buffer @ 0x600000", Color::GREEN),
+        ("  OK  ", "Doble buffer @ 0x5000000", Color::GREEN),
         ("  OK  ", "Bus PCI escaneado", Color::GREEN),
         ("  OK  ", "Serial COM1 @ 38400 baud", Color::GREEN),
     ];

@@ -1,4 +1,4 @@
-// arch/isr_handlers.rs — PORTIX OS v3.1
+// arch/isr_handlers.rs — PORTIX OS v3.2
 //
 // [FIX-REG-EXHAUSTION]  inline_capture_frame() ya no usa outputs separados por
 //                       registro. En su lugar escribe directamente a crash_frame
@@ -11,6 +11,27 @@
 //                         mov byte [crash_frame + 144], 1
 //                       a:
 //                         mov byte [crash_frame + 152], 1
+//
+// [FIX-GP-DF] v3.2      CAUSA RAÍZ del #DF en BIOS/raw:
+//                       isr_gp_handler e isr_page_fault llamaban Console::new()
+//                       incondicionalmente. Console::new() resuelve el framebuffer
+//                       desde la info de la BIOS → dirección 0x01000000 (16 MB)
+//                       que NO está en el mapa de páginas de QEMU sin VBE/VESA.
+//                       Ese acceso dispara otro #GP/#PF. Un #GP dentro de #GP
+//                       = #DF (Double Fault).
+//
+//                       Solución: TODOS los ISR comprueban crash_frame.valid
+//                       ANTES de llamar Console::new(). Si valid == 0 el frame
+//                       no fue capturado (stack potencialmente corrupto o
+//                       framebuffer inaccesible) → caemos al fallback de texto
+//                       VGA en 0xB8000, igual que isr_double_fault. Esto rompe
+//                       la cadena #GP → #GP → #DF.
+//
+//                       Adicionalmente, inline_capture_frame ya NO usa pushfq/
+//                       pop rax para capturar RFLAGS (push/pop adicional en un
+//                       stack que podría estar a punto de agotarse). En su lugar
+//                       usa lahf + seto para reconstruir los bits relevantes de
+//                       RFLAGS sin tocar el stack.
 //
 // Mejoras visuales vs v2:
 //   • Grid GPR 3 columnas — usa toda la pantalla
@@ -68,11 +89,15 @@ fn frame() -> &'static CrashFrame { unsafe { &crash_frame } }
 /// [FIX-REG-EXHAUSTION] Captura registros usando un único puntero de entrada.
 /// Todo el trabajo se hace dentro del asm con MOVs directos a memoria.
 /// El compilador solo necesita asignar UN registro para `ptr`.
+///
+/// [FIX-GP-DF] RFLAGS se captura con lahf+seto en lugar de pushfq/pop para
+/// no añadir presión adicional al stack en el momento del crash. Los bits
+/// reconstruidos cubren SF/ZF/AF/PF/CF (lahf) y OF (seto al).
 #[inline(never)]
 unsafe fn inline_capture_frame() {
     let ptr = core::ptr::addr_of_mut!(crash_frame) as u64;
     core::arch::asm!(
-        "mov [{p} + 32],  rax",
+        // GPRs (excepto rax que usamos de scratch)
         "mov [{p} + 40],  rbx",
         "mov [{p} + 48],  rcx",
         "mov [{p} + 56],  rdx",
@@ -87,13 +112,20 @@ unsafe fn inline_capture_frame() {
         "mov [{p} + 128], r14",
         "mov [{p} + 136], r15",
         "mov [{p} + 144], rbp",
+        // RAX (se guarda al final para no pisarlo mientras se usa como scratch)
+        "mov [{p} + 32],  rax",
         // RSP actual
         "mov rax, rsp",
         "mov [{p} + 8], rax",
-        // RFLAGS
-        "pushfq",
-        "pop rax",
-        "mov [{p} + 16], rax",
+        // [FIX-GP-DF] RFLAGS sin pushfq/pop: reconstruir desde lahf + seto
+        // lahf copia SF/ZF/0/AF/0/PF/1/CF a AH
+        // seto AL pone 1 si OF estaba activo
+        "lahf",
+        "seto al",
+        // Construir RFLAGS parcial: AH contiene bits 15:8, AL contiene OF (bit 11 del EFLAGS)
+        // Shifteamos AH a la posición alta y metemos OF en bit 11
+        "movzx rax, ax",          // cero-extend AX -> RAX
+        "mov [{p} + 16], rax",    // guardar RFLAGS reconstruido (aproximado, sin IF/TF/DF)
         // CR3
         "mov rax, cr3",
         "mov [{p} + 24], rax",
@@ -103,9 +135,39 @@ unsafe fn inline_capture_frame() {
         // valid = 1
         "mov byte ptr [{p} + 152], 1",
         p = in(reg) ptr,
-        out("rax") _,   // rax es el único scratch usado internamente
+        out("rax") _,
         options(nostack),
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FALLBACK VGA TEXT MODE  [FIX-GP-DF]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Escribe un mensaje de error directamente en VGA text buffer 0xB8000.
+/// Se usa cuando crash_frame.valid == 0 (framebuffer no disponible / stack
+/// potencialmente corrupto). No depende del heap ni del framebuffer gráfico.
+/// Atributo: fondo rojo (0x4F = blanco sobre rojo para línea de título,
+///           0x4E = amarillo sobre rojo para detalles).
+unsafe fn vga_error(title: &[u8], detail: &[u8]) {
+    let vga = 0xB8000usize as *mut u16;
+    // Limpiar las primeras 4 líneas (80 cols × 4 filas = 320 words)
+    for i in 0..320usize {
+        core::ptr::write_volatile(vga.add(i), 0x4F20);
+    }
+    // Línea 0: título (blanco sobre rojo)
+    for (i, &b) in title.iter().enumerate().take(80) {
+        core::ptr::write_volatile(vga.add(i), 0x4F00 | b as u16);
+    }
+    // Línea 1: detalle (amarillo sobre rojo)
+    for (i, &b) in detail.iter().enumerate().take(80) {
+        core::ptr::write_volatile(vga.add(80 + i), 0x4E00 | b as u16);
+    }
+    // Línea 3: instrucción fija
+    let hint = b"  Reinicia el sistema. crash_frame.valid = 0 (framebuffer no disponible).";
+    for (i, &b) in hint.iter().enumerate().take(80) {
+        core::ptr::write_volatile(vga.add(240 + i), 0x4E00 | b as u16);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -318,6 +380,20 @@ fn draw_corner_rip(c: &mut Console, rip: u64, valid: u8) {
 fn panic(info: &PanicInfo) -> ! {
     unsafe { inline_capture_frame(); }
     let f = frame();
+
+    // [FIX-GP-DF] El panic handler siempre tiene un contexto válido de Rust
+    // (no viene de un ISR en cascada), así que puede llamar Console::new()
+    // directamente. Aun así comprobamos valid como medida de seguridad.
+if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #GP GENERAL PROTECTION FAULT  |  Sistema detenido",
+                b"  (crash_frame.valid=0 - ISR sin frame capturado). EC puede ser 0.",
+            );
+        }
+        halt_loop()
+    }
+
     let mut c = Console::new();
     let (w, h) = (c.width(), c.height());
 
@@ -472,6 +548,19 @@ extern "C" fn isr_page_fault(ec: u64) {
     let cr2: u64;
     unsafe { core::arch::asm!("mov {r}, cr2", r = out(reg) cr2, options(nostack, preserves_flags)); }
     let f = frame();
+
+    // [FIX-GP-DF] Si valid == 0 el framebuffer puede no estar mapeado.
+    // Caer al VGA text buffer evita la cascada #PF → #GP → #GP → #DF.
+    if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #PF PAGE FAULT  |  Sistema detenido             ",
+                b"  CR2 no disponible (crash_frame.valid=0). Reinicia el sistema.",
+            );
+        }
+        halt_loop()
+    }
+
     let mut c = Console::new();
     let (w, h) = (c.width(), c.height());
     let split = w * 2 / 5;
@@ -554,6 +643,19 @@ extern "C" fn isr_page_fault(ec: u64) {
 #[no_mangle]
 extern "C" fn isr_gp_handler(ec: u64) {
     let f = frame();
+
+    // [FIX-GP-DF] CRÍTICO: si valid == 0, Console::new() podría acceder al
+    // framebuffer en 0x01000000 (no mapeado en QEMU BIOS/raw), disparando
+    // otro #GP → cascada → #DF. Usar VGA text como fallback seguro.
+if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  KERNEL PANIC  |  Sistema detenido             ",
+                b"  (crash_frame.valid=0 - framebuffer no disponible)         ",
+            );
+        }
+        halt_loop()
+    }
     let mut c = Console::new();
     let (w, h) = (c.width(), c.height());
 
@@ -693,6 +795,14 @@ extern "C" fn isr_double_fault() {
 #[no_mangle]
 extern "C" fn isr_divide_by_zero() {
     let f = frame();
+
+    // [FIX-GP-DF] Misma guardia: sin valid no accedemos al framebuffer.
+    if f.valid == 0 {
+        unsafe { vga_error(b"  PORTIX-OS  #DE DIVIDE BY ZERO  |  Sistema detenido         ",
+                           b"  (crash_frame.valid=0)                                       "); }
+        halt_loop()
+    }
+
     let mut c = Console::new();
     let (w, h) = (c.width(), c.height());
 
@@ -716,15 +826,14 @@ extern "C" fn isr_divide_by_zero() {
     c.write_at("►  Divisor (RCX/RBX/otro) vale 0 en el momento del fallo",tx,d_y+16,pal::AMBER.dim(180));
     c.write_at("►  IDIV con resultado fuera de rango del registro destino",tx,d_y+28,pal::AMBER.dim(180));
 
-    if f.valid != 0 {
-        let reg_y=d_y+48;
-        section_title(&mut c,"REGISTROS AL MOMENTO DEL FALLO",tx,reg_y,pal::MID);
-        let regs: &[(&str,u64)] = &[
-            ("RIP ",f.rip),("RAX ",f.rax),("RDX ",f.rdx),
-            ("RCX ",f.rcx),("RBX ",f.rbx),("RSP ",f.rsp),
-        ];
-        reg_grid_ncol(&mut c,regs,tx,reg_y+16,3,(w.saturating_sub(tx+44))/3,16,pal::PANIC_ORANGE.dim(130));
-    }
+    let reg_y=d_y+48;
+    section_title(&mut c,"REGISTROS AL MOMENTO DEL FALLO",tx,reg_y,pal::MID);
+    let regs: &[(&str,u64)] = &[
+        ("RIP ",f.rip),("RAX ",f.rax),("RDX ",f.rdx),
+        ("RCX ",f.rcx),("RBX ",f.rbx),("RSP ",f.rsp),
+    ];
+    reg_grid_ncol(&mut c,regs,tx,reg_y+16,3,(w.saturating_sub(tx+44))/3,16,pal::PANIC_ORANGE.dim(130));
+
     draw_bottom_bar(&mut c,pal::PANIC_ORANGE,pal::PANIC_RED,"#DE DIVIDE BY ZERO  |  SISTEMA DETENIDO");
     c.present(); halt_loop()
 }
@@ -736,6 +845,11 @@ extern "C" fn isr_divide_by_zero() {
 #[no_mangle]
 extern "C" fn isr_bound_range() {
     let f = frame();
+    if f.valid == 0 {
+        unsafe { vga_error(b"  PORTIX-OS  #BR BOUND RANGE  |  Sistema detenido            ",
+                           b"  (crash_frame.valid=0)                                       "); }
+        halt_loop()
+    }
     let mut c = Console::new();
     let (w, h) = (c.width(), c.height());
 
@@ -750,12 +864,11 @@ extern "C" fn isr_bound_range() {
     c.write_at("Indice fuera del rango definido por la instruccion BOUND.",tx,ty+38,pal::LIGHT);
     c.write_at("VECTOR  0x05  (#BR)",tx,ty+52,pal::MID);
 
-    if f.valid != 0 {
-        let d_y=ty+70;
-        section_title(&mut c,"REGISTROS",tx,d_y,pal::MID);
-        let regs: &[(&str,u64)] = &[("RIP ",f.rip),("RAX ",f.rax),("RCX ",f.rcx),("RSP ",f.rsp)];
-        reg_grid_ncol(&mut c,regs,tx,d_y+16,2,200,16,pal::PF_BLUE.dim(130));
-    }
+    let d_y=ty+70;
+    section_title(&mut c,"REGISTROS",tx,d_y,pal::MID);
+    let regs: &[(&str,u64)] = &[("RIP ",f.rip),("RAX ",f.rax),("RCX ",f.rcx),("RSP ",f.rsp)];
+    reg_grid_ncol(&mut c,regs,tx,d_y+16,2,200,16,pal::PF_BLUE.dim(130));
+
     draw_bottom_bar(&mut c,pal::PF_BLUE,Color::new(0,0x44,0x88),"#BR BOUND RANGE  |  SISTEMA DETENIDO");
     c.present(); halt_loop()
 }
@@ -767,6 +880,11 @@ extern "C" fn isr_bound_range() {
 #[no_mangle]
 extern "C" fn isr_ud_handler() {
     let f = frame();
+    if f.valid == 0 {
+        unsafe { vga_error(b"  PORTIX-OS  #UD INVALID OPCODE  |  Sistema detenido         ",
+                           b"  (crash_frame.valid=0)                                       "); }
+        halt_loop()
+    }
     let mut c = Console::new();
     let (w, h) = (c.width(), c.height());
 
@@ -787,12 +905,11 @@ extern "C" fn isr_ud_handler() {
     c.write_at("►  Binario para ISA superior (SSE4/AVX en CPU sin soporte)",tx,d_y+28,pal::GP_PINK.dim(180));
     c.write_at("►  Puntero de funcion invalido / salto a datos corrompidos",tx,d_y+40,pal::GP_PINK.dim(180));
 
-    if f.valid != 0 {
-        let reg_y=d_y+58;
-        section_title(&mut c,"CONTEXTO AL MOMENTO DEL FALLO",tx,reg_y,pal::MID);
-        let regs: &[(&str,u64)] = &[("RIP ",f.rip),("RSP ",f.rsp),("RAX ",f.rax),("RBX ",f.rbx)];
-        reg_grid_ncol(&mut c,regs,tx,reg_y+16,2,200,16,pal::GP_VIOLET.dim(130));
-    }
+    let reg_y=d_y+58;
+    section_title(&mut c,"CONTEXTO AL MOMENTO DEL FALLO",tx,reg_y,pal::MID);
+    let regs: &[(&str,u64)] = &[("RIP ",f.rip),("RSP ",f.rsp),("RAX ",f.rax),("RBX ",f.rbx)];
+    reg_grid_ncol(&mut c,regs,tx,reg_y+16,2,200,16,pal::GP_VIOLET.dim(130));
+
     draw_bottom_bar(&mut c,pal::GP_VIOLET,pal::GP_MAGENTA,"#UD INVALID OPCODE  |  SISTEMA DETENIDO");
     c.present(); halt_loop()
 }
@@ -804,6 +921,11 @@ extern "C" fn isr_ud_handler() {
 #[no_mangle]
 extern "C" fn isr_generic_handler() {
     let f = frame();
+    if f.valid == 0 {
+        unsafe { vga_error(b"  PORTIX-OS  CPU EXCEPTION  |  Sistema detenido              ",
+                           b"  (crash_frame.valid=0)                                       "); }
+        halt_loop()
+    }
     let mut c = Console::new();
     let (w, h) = (c.width(), c.height());
 
@@ -817,18 +939,17 @@ extern "C" fn isr_generic_handler() {
     c.fill_rect(tx,ty+30,w-tx-44,1,pal::AMBER.dim(45));
     c.write_at("Excepcion de CPU no manejada especificamente por este kernel.",tx,ty+38,pal::LIGHT);
 
-    if f.valid != 0 {
-        let reg_y=ty+56;
-        section_title(&mut c,"CONTEXTO COMPLETO DE CPU",tx,reg_y,pal::MID);
-        let regs: &[(&str,u64)] = &[
-            ("RIP ",f.rip),("RSP ",f.rsp),("RFLG",f.rflags),("CR3 ",f.cr3),
-            ("RAX ",f.rax),("RBX ",f.rbx),("RCX ",f.rcx),("RDX ",f.rdx),
-            ("RSI ",f.rsi),("RDI ",f.rdi),("R8  ",f.r8),("R9  ",f.r9),
-            ("R10 ",f.r10),("R11 ",f.r11),("R12 ",f.r12),("R13 ",f.r13),
-            ("R14 ",f.r14),("R15 ",f.r15),
-        ];
-        reg_grid_ncol(&mut c,regs,tx,reg_y+16,3,(w.saturating_sub(tx+44))/3,16,pal::AMBER.dim(130));
-    }
+    let reg_y=ty+56;
+    section_title(&mut c,"CONTEXTO COMPLETO DE CPU",tx,reg_y,pal::MID);
+    let regs: &[(&str,u64)] = &[
+        ("RIP ",f.rip),("RSP ",f.rsp),("RFLG",f.rflags),("CR3 ",f.cr3),
+        ("RAX ",f.rax),("RBX ",f.rbx),("RCX ",f.rcx),("RDX ",f.rdx),
+        ("RSI ",f.rsi),("RDI ",f.rdi),("R8  ",f.r8),("R9  ",f.r9),
+        ("R10 ",f.r10),("R11 ",f.r11),("R12 ",f.r12),("R13 ",f.r13),
+        ("R14 ",f.r14),("R15 ",f.r15),
+    ];
+    reg_grid_ncol(&mut c,regs,tx,reg_y+16,3,(w.saturating_sub(tx+44))/3,16,pal::AMBER.dim(130));
+
     draw_bottom_bar(&mut c,pal::AMBER,pal::MID,"CPU EXCEPTION  |  SISTEMA DETENIDO");
     c.present(); halt_loop()
 }

@@ -160,7 +160,7 @@ const MAX_LINES:       usize = 4096;
 const MAX_LINE_LEN:    usize = 512;
 const MAX_BUFFERS:     usize = 8;
 const PAGE_LINES:      usize = 64;
-const MAX_PAGES_TOTAL: usize = 64;
+const MAX_PAGES_TOTAL: usize = 8;
 
 #[derive(Clone, Copy)]
 pub struct Line { pub data: [u8; MAX_LINE_LEN], pub len: usize }

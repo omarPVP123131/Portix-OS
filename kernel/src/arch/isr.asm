@@ -20,6 +20,7 @@
 ;   [RSP+40] = SS
 
 BITS 64
+[default abs]
 
 extern pit_tick
 extern isr_divide_by_zero

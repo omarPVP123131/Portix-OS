@@ -404,4 +404,6 @@ unsafe fn buddy_free(inner: &mut BuddyInner, ptr: *mut u8, order: usize) {
         serial::write_u32(ord as u32);
         serial::write_byte(b'\n');
     }
+    #[cfg(not(debug_assertions))]
+    let _ = merges;
 }

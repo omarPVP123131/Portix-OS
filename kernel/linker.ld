@@ -5,7 +5,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x10000;
+    . = 0x200000;
 
     .text : ALIGN(16) {
         KEEP(*(.text._start))

@@ -159,8 +159,26 @@ pub unsafe fn init_idt() {
     asm!("lidt [{p}]", p = in(reg) core::ptr::addr_of!(IDT_PTR),
          options(nostack, preserves_flags, readonly));
 
-    // 10. Unmask IRQ0 (PIT) only; leave all others masked
-    // Master PIC mask: bit0=0 (IRQ0 unmasked), rest masked
+    // 10. Remap PIC + unmask IRQ0 only
+    // ICW1: ICW4 needed, cascade, edge
+    core::arch::asm!("out 0x20, al", in("al") 0x11u8, options(nostack, nomem));
+    core::arch::asm!("out 0xA0, al", in("al") 0x11u8, options(nostack, nomem));
+    core::arch::asm!("out 0x80, al", in("al") 0x00u8, options(nostack, nomem));
+    // ICW2: master base 0x20, slave base 0x28
+    core::arch::asm!("out 0x21, al", in("al") 0x20u8, options(nostack, nomem));
+    core::arch::asm!("out 0x80, al", in("al") 0x00u8, options(nostack, nomem));
+    core::arch::asm!("out 0xA1, al", in("al") 0x28u8, options(nostack, nomem));
+    core::arch::asm!("out 0x80, al", in("al") 0x00u8, options(nostack, nomem));
+    // ICW3: master slave on IRQ2, slave cascade identity
+    core::arch::asm!("out 0x21, al", in("al") 0x04u8, options(nostack, nomem));
+    core::arch::asm!("out 0x80, al", in("al") 0x00u8, options(nostack, nomem));
+    core::arch::asm!("out 0xA1, al", in("al") 0x02u8, options(nostack, nomem));
+    core::arch::asm!("out 0x80, al", in("al") 0x00u8, options(nostack, nomem));
+    // ICW4: 8086 mode, normal EOI
+    core::arch::asm!("out 0x21, al", in("al") 0x01u8, options(nostack, nomem));
+    core::arch::asm!("out 0xA1, al", in("al") 0x01u8, options(nostack, nomem));
+    core::arch::asm!("out 0x80, al", in("al") 0x00u8, options(nostack, nomem));
+    // IMR: unmask IRQ0 only (bit0=0), all others masked
     core::arch::asm!("out 0x21, al", in("al") 0xFEu8, options(nostack, nomem));
     core::arch::asm!("out 0xA1, al", in("al") 0xFFu8, options(nostack, nomem));
 

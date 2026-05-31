@@ -2,6 +2,8 @@
 // Detección universal: CPU (CPUID), Discos (ATA IDENTIFY), RAM (E820), Display
 #![allow(dead_code)]
 
+use crate::bootinfo;
+
 // ── Port I/O helpers ──────────────────────────────────────────────────────────
 #[inline(always)]
 unsafe fn inb(port: u16) -> u8 {
@@ -476,6 +478,24 @@ pub struct RamInfo {
 impl RamInfo {
     pub fn detect() -> Self {
         let mut info = RamInfo { usable_mb: 0, total_mb: 0, entry_count: 0 };
+        if let Some(boot) = bootinfo::get() {
+            let regions = bootinfo::memory_regions(boot);
+            info.entry_count = regions.len().min(u16::MAX as usize) as u16;
+            for r in regions {
+                let mb = r.length / (1024 * 1024);
+                match r.kind {
+                    bootinfo::MEM_USABLE_MAPPED | bootinfo::MEM_USABLE_UNMAPPED => {
+                        info.usable_mb += mb;
+                        info.total_mb += mb;
+                    }
+                    bootinfo::MEM_ACPI_RECLAIM => {
+                        info.total_mb += mb;
+                    }
+                    _ => {}
+                }
+            }
+            return info;
+        }
         unsafe {
             let count = core::ptr::read_volatile(0x9100 as *const u16);
             info.entry_count = count;
@@ -512,6 +532,16 @@ pub struct DisplayInfo {
 
 impl DisplayInfo {
     pub fn detect() -> Self {
+        if let Some(boot) = bootinfo::get() {
+            let fb = &boot.framebuffer;
+            return DisplayInfo {
+                lfb_addr: fb.base,
+                width: fb.width as u16,
+                height: fb.height as u16,
+                pitch: fb.pitch_bytes as u16,
+                bpp: fb.bpp as u8,
+            };
+        }
         unsafe {
             DisplayInfo {
                 lfb_addr: core::ptr::read_volatile(0x9004 as *const u32) as u64,

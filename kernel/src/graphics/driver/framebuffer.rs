@@ -15,13 +15,17 @@
 #![allow(dead_code)]
 #![allow(clippy::missing_safety_doc)]
 
-const LFB_PTR_ADDR: *const u32 = 0x9004 as *const u32;
-const WIDTH_ADDR:   *const u16 = 0x9008 as *const u16;
-const HEIGHT_ADDR:  *const u16 = 0x900A as *const u16;
-const PITCH_ADDR:   *const u16 = 0x900C as *const u16;
-const BPP_ADDR:     *const u8  = 0x900E as *const u8;
+use crate::bootinfo;
+use crate::drivers::bus::pci;
+use crate::drivers::serial;
 
-const BACKBUF_ADDR: u64 = 0x0060_0000;
+const LEGACY_LFB_PTR_ADDR: *const u32 = 0x9004 as *const u32;
+const LEGACY_WIDTH_ADDR:   *const u16 = 0x9008 as *const u16;
+const LEGACY_HEIGHT_ADDR:  *const u16 = 0x900A as *const u16;
+const LEGACY_PITCH_ADDR:   *const u16 = 0x900C as *const u16;
+const LEGACY_BPP_ADDR:     *const u8  = 0x900E as *const u8;
+
+const BACKBUF_ADDR: u64 = 0x0500_0000;
 
 // Matriz Bayer 4×4 para dithering ordenado (mejora #4)
 const BAYER_4X4: [[u8; 4]; 4] = [
@@ -33,6 +37,67 @@ const BAYER_4X4: [[u8; 4]; 4] = [
 
 // ── Alpha LUT (mejora #6) ─────────────────────────────────────────────────────
 static mut ALPHA_LUT: [[u8; 256]; 256] = [[0u8; 256]; 256];
+
+// ── Bochs VBE I/O ports ────────────────────────────────────────────────
+const VBE_DISPI_PORT_INDEX: u16 = 0x1CE;
+const VBE_DISPI_PORT_DATA:  u16 = 0x1CF;
+
+#[inline(always)]
+unsafe fn vbe_inw(reg: u16) -> u16 {
+    let v: u16;
+    core::arch::asm!(
+        "mov dx, {idx}",
+        "out dx, ax",
+        "mov dx, {data}",
+        "in ax, dx",
+        idx = const VBE_DISPI_PORT_INDEX,
+        data = const VBE_DISPI_PORT_DATA,
+        inout("ax") reg => v,
+        out("dx") _,
+        options(nostack, nomem)
+    );
+    v
+}
+
+/// Escribe un registro Bochs VBE.
+#[inline(always)]
+unsafe fn vbe_outw(reg: u16, val: u16) {
+    core::arch::asm!("out dx, ax", in("dx") VBE_DISPI_PORT_INDEX, in("ax") reg, options(nostack, nomem));
+    core::arch::asm!("out dx, ax", in("dx") VBE_DISPI_PORT_DATA,  in("ax") val, options(nostack, nomem));
+}
+
+/// Intenta inicializar/leer el modo Bochs VBE.
+/// Si VBE no está activo, lo inicializa a 1024x768x32.
+/// Devuelve (width, height, bpp) o (0,0,0) si falla.
+fn bochs_vbe_setup() -> (u32, u32, u32) {
+    unsafe {
+        let id = vbe_inw(0);
+        let active = id == 0xB0C0 || id == 0xB0C1 || id == 0xB0C2 || id == 0xB0C3 || id == 0xB0C4;
+
+        if active {
+            serial::log("VBE", "already active, reading current mode");
+        } else {
+            serial::log("VBE", "not active — initializing to 1024x768x32");
+            vbe_outw(0, 0xB0C4);        // set ID
+            vbe_outw(4, 0);             // disable
+            vbe_outw(1, 1024);          // X resolution
+            vbe_outw(2, 768);           // Y resolution
+            vbe_outw(3, 32);            // BPP
+            vbe_outw(6, 1024);          // virtual width
+            vbe_outw(4, 0x41);          // enable + LFB
+        }
+
+        let xres = vbe_inw(1) as u32;
+        let yres = vbe_inw(2) as u32;
+        let bpp  = vbe_inw(3) as u32;
+        if xres == 0 || yres == 0 || bpp < 15 {
+            serial::log("VBE", "invalid resolution after init");
+            return (0, 0, 0);
+        }
+        serial::log("VBE", if active { "resolution OK (active)" } else { "resolution OK (init)" });
+        (xres, yres, bpp)
+    }
+}
 
 pub fn init_alpha_lut() {
     unsafe {
@@ -226,18 +291,61 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
-    pub fn new() -> Self {
+pub fn new() -> Self {
         unsafe {
-            let bpp_raw = core::ptr::read_volatile(BPP_ADDR);
-            let w_raw   = core::ptr::read_volatile(WIDTH_ADDR)  as usize;
-            let h_raw   = core::ptr::read_volatile(HEIGHT_ADDR) as usize;
-            let p_raw   = core::ptr::read_volatile(PITCH_ADDR)  as usize;
-            let lfb     = core::ptr::read_volatile(LFB_PTR_ADDR) as u64;
+            let (mut lfb, mut w_raw, mut h_raw, p_raw, mut bpp_raw) =
+                if let Some(info) = bootinfo::get() {
+                    let fb = &info.framebuffer;
+                    (
+                        fb.base,
+                        fb.width as usize,
+                        fb.height as usize,
+                        fb.pitch_bytes as usize,
+                        fb.bpp as u8,
+                    )
+                } else {
+                    (
+                        core::ptr::read_volatile(LEGACY_LFB_PTR_ADDR) as u64,
+                        core::ptr::read_volatile(LEGACY_WIDTH_ADDR) as usize,
+                        core::ptr::read_volatile(LEGACY_HEIGHT_ADDR) as usize,
+                        core::ptr::read_volatile(LEGACY_PITCH_ADDR) as usize,
+                        core::ptr::read_volatile(LEGACY_BPP_ADDR),
+                    )
+                };
+
+            // Fallback: si no hay framebuffer via bootinfo, escanear PCI
+            if lfb == 0 {
+                let pci_fb = pci::pci_find_vga_framebuffer();
+                if pci_fb != 0 {
+                    serial::log("FB", "framebuffer via PCI BAR");
+                    lfb = pci_fb;
+                    // Inicializar VBE si es necesario y leer resolución
+                    let (vbe_w, vbe_h, vbe_bpp) = bochs_vbe_setup();
+                    serial::log("FB", "VBE resolution (w x h x bpp):");
+                    serial::write_usize(vbe_w as usize);
+                    serial::write_byte(b'x');
+                    serial::write_usize(vbe_h as usize);
+                    serial::write_byte(b'x');
+                    serial::write_usize(vbe_bpp as usize);
+                    serial::write_byte(b'\n');
+                    if vbe_w > 0 && vbe_h > 0 && vbe_bpp >= 15 {
+                        w_raw = vbe_w as usize;
+                        h_raw = vbe_h as usize;
+                        bpp_raw = vbe_bpp as u8;
+                    } else {
+                        w_raw = 1024;
+                        h_raw = 768;
+                        bpp_raw = 32;
+                    }
+                } else {
+                    serial::log("FB", "PCI BAR fallback: no VGA found");
+                }
+            }
 
             let (w, h, lfb_pitch, bpp) = if w_raw == 0 || h_raw == 0 {
-                (1024, 768, 3072, 24u8)
+                (1024, 768, 4096, 32u8)
             } else {
-                let bpp = if bpp_raw < 15 { 24 } else { bpp_raw };
+                let bpp = if bpp_raw < 15 { 32 } else { bpp_raw };
                 let bpp_b = (bpp as usize + 7) / 8;
                 let p = if p_raw == 0 { w_raw * bpp_b } else { p_raw };
                 (w_raw, h_raw, p, bpp)

@@ -41,9 +41,9 @@ use ui::{
     draw_terminal_tab, terminal_hist_geometry, Tab, SCROLLBAR_W,
 };
 
-#[alloc_error_handler]
-fn alloc_error(layout: core::alloc::Layout) -> ! {
-    panic!("OOM: size={} align={}", layout.size(), layout.align());
+#[no_mangle]
+extern "Rust" fn __rust_alloc_error_handler(size: usize, align: usize) -> ! {
+    panic!("OOM: size={} align={}", size, align);
 }
 
 extern "C" {

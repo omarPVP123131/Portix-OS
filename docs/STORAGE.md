@@ -1,139 +1,161 @@
-# Portix OS — Storage Subsystem
+# Portix OS — Subsistema de Almacenamiento
 
-## Architecture
+## Arquitectura
 
 ```
-User / Shell
+Shell / Comandos
     │
-    ├── fs::vfs — Virtual File System
-    │     └── Lookup, read, write, open, close
-    │
-    ├── fs::fat32 — FAT32 Implementation
-    │     └── Cluster chain walk, directory entry parsing
-    │
-    └── drivers::ata — ATA PIO Driver
-          └── Read/write sectors via PIO (LBA48)
+    └── drivers::storage::vfs (trait Virtual File System)
+          ├── open, read, write, list, mkdir, remove
+          │
+          └── drivers::storage::fat32 (implementación FAT32)
+                ├── mount, root_cluster
+                ├── read_file, write_file
+                ├── parseo de entradas de directorio (SFN + LFN)
+                └── recorrido de cadena de clústeres vía FAT
+                      │
+                      └── drivers::storage::ata (driver ATA PIO)
+                            ├── AtaBus::scan()     — detectar unidades
+                            ├── AtaDrive::read_sectors()
+                            ├── AtaDrive::write_sectors()
+                            ├── LBA48
+                            └── caché de sectores (reduce reinicios de bus)
 ```
 
-## ATA PIO Driver (`kernel/src/drivers/ata.rs`)
+> **Nota**: en Portix, el trait VFS y la implementación FAT32 viven ambos
+> en `drivers/storage/` (`vfs.rs` y `fat32.rs`). No existe un directorio
+> `fs/` separado en la versión actual.
 
-### Features
+---
 
-- Primary and secondary ATA buses
-- Master/slave drive detection
-- LBA48 (48-bit) sector addressing
-- PIO data transfers (no DMA)
-- Sector cache to reduce bus resets
-- Drive identification via IDENTIFY command
+## Driver ATA PIO (`drivers/storage/ata.rs`)
 
-### I/O Ports (Primary Bus)
+### Puertos E/S (primario: 0x1F0–0x1F7 + 0x3F6)
 
-| Port    | Register               | Direction |
-|---------|------------------------|-----------|
-| 0x1F0   | Data                   | R/W       |
-| 0x1F1   | Features/Error         | R/W       |
-| 0x1F2   | Sector count           | R/W       |
-| 0x1F3   | LBA low                | R/W       |
-| 0x1F4   | LBA mid                | R/W       |
-| 0x1F5   | LBA high               | R/W       |
-| 0x1F6   | Drive/Head             | R/W       |
-| 0x1F7   | Command/Status         | R/W       |
-| 0x3F6   | Control                | W         |
+| Puerto | Registro        | Dirección |
+|--------|-----------------|-----------|
+| 0x1F0  | Datos           | R/W       |
+| 0x1F1  | Características | R/W       |
+| 0x1F2  | Cuenta de sectores | R/W   |
+| 0x1F3  | LBA bajo        | R/W       |
+| 0x1F4  | LBA medio       | R/W       |
+| 0x1F5  | LBA alto        | R/W       |
+| 0x1F6  | Unidad/cabezal  | R/W       |
+| 0x1F7  | Comando/Estado  | R/W       |
+| 0x3F6  | Control         | W         |
 
-### Key Functions
-
-| Function            | Description                             |
-|---------------------|-----------------------------------------|
-| `ata_init()`        | Detect drives on both buses             |
-| `ata_read()`        | Read sectors with LBA48                |
-| `ata_write()`       | Write sectors with LBA48               |
-| `ata_identify()`    | Send IDENTIFY command, parse response  |
-
-### Protocol (PIO Read)
+### Protocolo de lectura ATA PIO
 
 ```
-1. Wait for BSY == 0
-2. Write LBA48 registers (sector count, LBA low/mid/high × 2)
-3. Write DRV bit + LBA bit to 0x1F6
-4. Write READ command (0x24) to 0x1F7
-5. Poll DRQ bit
-6. Read 256 words from 0x1F0
-7. Repeat for next sector
+1. Esperar BSY == 0
+2. Escribir cuenta de sectores
+3. Escribir LBA bajo/medio/alto (48 bits: dos bancos)
+4. Escribir DRV + bit LBA en 0x1F6
+5. Enviar comando READ (0x24 para LBA48)
+6. Sondear DRQ (status & 0x08)
+7. Leer 256 palabras del puerto de datos con INSW
+8. Repetir para los sectores restantes
 ```
 
-### Sector Cache
+### Detección de unidades
 
-A small internal cache stores recently accessed sectors to avoid unnecessary
-bus resets. The cache is a simple fixed-size array indexed by LBA.
+`AtaBus::scan()` itera primario/secundario y maestro/esclavo. Para cada
+combinación envía el comando IDENTIFY (0xEC) y lee 256 palabras. Parsea:
+- Modelo (palabras 27–46)
+- Número de serie (palabras 10–19)
+- Capacidad LBA48 (palabras 100–103)
+- Detección ATAPI vía firma en LBA mid/hi
 
-## FAT32 Filesystem (`kernel/src/fs/fat32.rs`)
+Los resultados se cachean con `store_primary_drive_info()` para que los
+comandos del terminal puedan consultar la información sin re-escanear el bus.
 
-### On-disk Structure
-
-```
-MBR → VBR (LBA 0)
- ├── Reserved sectors
- ├── FAT #1
- ├── FAT #2 (mirror)
- ├── Root directory (cluster chain)
- └── Data clusters
-```
-
-### BPB Fields (used by driver)
-
-| Field               | Offset | Description                |
-|---------------------|--------|----------------------------|
-| bytes_per_sector    | 0x0B   | Usually 512                |
-| sectors_per_cluster | 0x0D   | Usually 1-128              |
-| reserved_count      | 0x0E   | Reserved sector count      |
-| num_fats            | 0x10   | Usually 2                  |
-| sectors_per_fat     | 0x24   | FAT size in sectors        |
-| root_cluster        | 0x2C   | First cluster of root dir  |
-
-### Cluster Chain Walking
+### Tipos principales
 
 ```rust
-fn get_fat_entry(cluster: u32) -> u32  // Read FAT entry
-fn next_cluster(cluster: u32) -> u32   // Get next in chain (or EOC marker)
-```
+pub enum DriveId { Primary0, Primary1, Secondary0, Secondary1 }
 
-End-of-chain markers: `≥ 0x0FFFFFF8`.
+pub struct DriveInfo {
+    model:   [u8; 40],
+    serial:  [u8; 20],
+    size_mb: u64,
+    lba48:   bool,
+    // ...
+}
 
-### Directory Entry Format (32 bytes)
+pub struct AtaDrive { base, ctrl, id, info, ... }
 
-| Offset | Size | Field        |
-|--------|------|--------------|
-| 0      | 8    | Short name   |
-| 8      | 3    | Extension    |
-| 11     | 1    | Attributes   |
-| 13     | 1    | Reserved     |
-| 14-15  | 2    | Create time  |
-| 16-17  | 2    | Create date  |
-| 18-19  | 2    | Access date  |
-| 20-21  | 2    | Cluster high |
-| 22-23  | 2    | Modify time  |
-| 24-25  | 2    | Modify date  |
-| 26-27  | 2    | Cluster low  |
-| 28-31  | 4    | File size    |
-
-### Long File Names (LFN)
-
-LFN entries precede their short-name entry. Each LFN entry uses attribute
-`0x0F` and stores up to 13 UTF-16 characters in a non-standard layout.
-
-## VFS (Virtual File System)
-
-Provides a unified interface:
-
-```rust
-trait FileSystem {
-    fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize>;
-    fn write(&self, path: &str, offset: u64, buf: &[u8]) -> Result<usize>;
-    fn list(&self, path: &str) -> Result<Vec<DirEntry>>;
-    fn mkdir(&self, path: &str) -> Result<()>;
-    fn remove(&self, path: &str) -> Result<()>;
+impl AtaDrive {
+    pub fn read_sectors(&self, lba: u64, count: usize, buf: &mut [u8]) -> Result<()>;
+    pub fn write_sectors(&self, lba: u64, count: usize, buf: &[u8]) -> Result<()>;
+    pub fn from_info(info: DriveInfo) -> Self;
 }
 ```
 
-Currently only FAT32 is implemented. The VFS layer routes calls to the
-FAT32 driver based on mount point.
+---
+
+## Sistema de archivos FAT32 (`drivers/storage/fat32.rs`)
+
+### Disposición en disco
+
+```
+LBA 0          VBR + BPB (Volume Boot Record + BIOS Parameter Block)
+LBA 1..N       Sectores reservados
+               FAT #1
+               FAT #2 (espejo)
+               Directorio raíz (cadena de clústeres)
+               Clústeres de datos
+```
+
+### Campos del BPB usados
+
+| Campo                | Offset | Notas                       |
+|----------------------|--------|-----------------------------|
+| `bytes_per_sector`   | 0x0B   | 512 (estándar)              |
+| `sectors_per_cluster`| 0x0D   | Variable según formato      |
+| `reserved_count`     | 0x0E   | Sectores antes de la FAT   |
+| `num_fats`           | 0x10   | Normalmente 2               |
+| `sectors_per_fat_32` | 0x24   | Tamaño de cada FAT          |
+| `root_cluster`       | 0x2C   | Primer clúster del directorio raíz |
+
+### Recorrido de cadena de clústeres
+
+```rust
+let mut cluster = root_cluster;
+while cluster < 0x0FFF_FFF8 {
+    read_cluster(volume, cluster, &mut buf);
+    cluster = fat32_read_fat(volume, cluster);
+}
+```
+
+### Entrada de directorio (32 bytes)
+
+| Offset | Tamaño | Campo            |
+|--------|--------|------------------|
+| 0      | 8      | Nombre corto (SFN) |
+| 8      | 3      | Extensión        |
+| 11     | 1      | Atributos        |
+| 13     | 1      | Reservado        |
+| 20–21  | 2      | Clúster alto     |
+| 26–27  | 2      | Clúster bajo     |
+| 28–31  | 4      | Tamaño de archivo |
+
+Las entradas LFN (attr = 0x0F) preceden a su entrada de nombre corto y
+almacenan hasta 13 caracteres UTF-16 cada una.
+
+---
+
+## MKFS — Formato en primer arranque (`drivers/storage/mkfs.rs`)
+
+Si no se encuentra ningún sistema de archivos FAT32, `mkfs::auto_format()`
+escribe la siguiente estructura en disco:
+
+1. MBR con tabla de particiones
+2. VBR (FAT32 BPB)
+3. FAT inicializada (clúster 2 = fin de cadena)
+4. Directorio raíz vacío
+5. Directorios estándar: `/bin`, `/etc`, `/home`, `/tmp`, `/usr`, `/var`
+6. `README.TXT` en `/home/user`
+
+Tras el formato, el kernel intenta montar el volumen recién creado.
+Si el montaje falla de nuevo, `ExplorerState` se inicializa con clúster 2
+como fallback.

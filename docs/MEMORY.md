@@ -1,105 +1,124 @@
-# Portix OS — Memory Management
+# Portix OS — Gestión de Memoria
 
-## Physical Memory Map
+## Regiones de memoria física
 
-The physical memory map is provided at boot via `PortixBootInfo.memory_map`. Each entry is a `PortixMemoryRegion` (48 bytes):
+Obtenidas de `PortixBootInfo.memory_map`. Cada entrada ocupa 48 bytes:
 
 ```rust
 struct PortixMemoryRegion {
-    base: u64,              // Physical start address
-    length: u64,            // Length in bytes
-    kind: u32,              // MEM_USABLE, MEM_RESERVED, MEM_FRAMEBUFFER, etc.
-    owner: u32,             // OWNER_FIRMWARE, OWNER_LOADER, OWNER_KERNEL
-    reclaim_policy: u32,    // RECLAIM_NEVER, RECLAIM_AFTER_KERNEL_INIT
-    cache_attributes: u32,  // CACHE_UC, CACHE_WB
+    base:             u64,  // inicio físico
+    length:           u64,  // longitud en bytes
+    kind:             u32,  // tipo (ver tabla)
+    owner:            u32,  // firmware, cargador, kernel
+    reclaim_policy:   u32,  // cuándo puede reclamarse
+    cache_attributes: u32,  // UC, WB
 }
 ```
 
-### Region Types
+| Constante              | Valor | Descripción                      |
+|------------------------|-------|----------------------------------|
+| `MEM_USABLE_MAPPED`    | 1     | Usable, identity-mapped          |
+| `MEM_USABLE_UNMAPPED`  | 2     | Usable, aún no mapeada           |
+| `MEM_RESERVED`         | 3     | Reservada                        |
+| `MEM_ACPI_RECLAIM`     | 4     | Reclamable por ACPI              |
+| `MEM_ACPI_NVS`         | 5     | ACPI NVS (no volátil)            |
+| `MEM_MMIO`             | 6     | Memoria mapeada de E/S           |
+| `MEM_FRAMEBUFFER`      | 7     | Framebuffer de vídeo             |
+| `MEM_KERNEL`           | 8     | Imagen del kernel                |
+| `MEM_LOADER_DATA`      | 12    | Datos del cargador               |
+| `MEM_FIRMWARE_RUNTIME` | 15    | Servicios de firmware en runtime |
 
-| Constant              | Value | Description                    |
-|-----------------------|-------|--------------------------------|
-| MEM_USABLE_MAPPED     | 1     | Usable, already identity-mapped |
-| MEM_USABLE            | 2     | Usable memory                  |
-| MEM_RESERVED          | 3     | Reserved (do not touch)        |
-| MEM_ACPI_RECLAIM      | 4     | ACPI reclaimable               |
-| MEM_ACPI_NVS          | 5     | ACPI non-volatile              |
-| MEM_MMIO             | 6     | MMIO region                    |
-| MEM_FRAMEBUFFER       | 7     | Framebuffer memory             |
-| MEM_KERNEL            | 8     | Kernel image                   |
-| MEM_KERNEL_STACK      | 9     | Kernel stack                   |
-| MEM_PAGE_TABLES       | 10    | Page tables                    |
-| MEM_LOADER_CODE       | 11    | Loader code                    |
-| MEM_LOADER_DATA       | 12    | Loader data                    |
-| MEM_LOADER_STACK      | 13    | Loader stack                   |
-| MEM_LOADER_HEAP       | 14    | Loader heap                    |
-| MEM_FIRMWARE_RUNTIME  | 15    | Firmware runtime services      |
-| MEM_BAD_MEMORY        | 16    | Known bad memory               |
+---
 
-### Reserved Ranges
-
-In addition to the memory map, reserved ranges provide semantic annotations:
+## Rangos reservados (anotaciones semánticas)
 
 ```rust
 struct ReservedRange {
-    base: u64,
-    length: u64,
-    kind: u32,      // Same as region types
-    owner: u32,
-    reclaim_policy: u32,
+    base:             u64,
+    length:           u64,
+    kind:             u32,
+    owner:            u32,
+    reclaim_policy:   u32,
     cache_attributes: u32,
 }
 ```
 
-### Pre-allocated ranges (UEFI boot):
+Rangos pre-asignados en arranque:
 
-| Range        | Length    | Purpose           | Reclaim       |
-|--------------|-----------|-------------------|---------------|
-| 0x200000     | kernel_size | Kernel image    | Never         |
-| 0x600000     | 0x1A00    | PortixBootInfo    | Never         |
-| 0x100000     | 0x2000    | EFI loader code   | After kernel  |
-| 0x700000     | 0x100000  | EFI loader data   | After kernel  |
+| Base       | Tamaño    | Propósito                | Política de reclamación |
+|------------|-----------|--------------------------|-------------------------|
+| `0x200000` | variable  | Imagen del kernel        | Nunca                   |
+| `0x600000` | `0x1A00`  | PortixBootInfo           | Nunca                   |
+| `0x100000` | `0x2000`  | Código del cargador      | Tras init del kernel    |
+| `0x700000` | `0x100000`| Datos del cargador       | Tras init del kernel    |
+| `0x5000000`| ~4 MB     | Backbuffer gráfico       | Nunca                   |
 
-## Address Space Layout
+---
 
-| Range               | Purpose                           |
-|---------------------|-----------------------------------|
-| 0x000000–0x0FFFFF   | Low memory (IVT, BDA, EBDA, stage2, backbuffer) |
-| 0x100000–0x1FFFFF   | EFI runtime / loader data         |
-| **0x200000**        | **Kernel image**                  |
-| 0x500000–0x5FFFFF   | **Kernel heap (buddy allocator)** |
-| **0x600000**        | **PortixBootInfo**                |
-| 0x700000–0x7FFFFF   | EFI memory map (UEFI)             |
-| 0x1000000–0x1FFFFFF | **Framebuffer LFB** (linear frame buffer) |
+## Heap: Buddy Allocator
 
-## Heap Allocator: Buddy System
+**Archivo**: `kernel/src/mem/allocator.rs`
 
-The kernel heap at `0x500000` uses a buddy allocator with intrusive free lists.
+### Diseño
 
-### Design
+- Base: `~0x500000`, tamaño de pool fijo en compilación
+- Bloque mínimo: 64 bytes (`MIN_ORDER`)
+- Órdenes `0..~20` (bloque máximo: ~1 MB)
+- Listas libres intrusivas: los bloques libres almacenan `next`/`prev`
+  en su propia carga útil (sin overhead de metadatos externos)
+- Allocator global vía `#[global_allocator] static ALLOCATOR: BuddyAllocator`
+- `AllocStats`: contadores atómicos (`AtomicUsize`) visibles desde la UI
+  sin bloqueo — `total_allocs`, `total_frees`, `failed_allocs`, `free_blocks[orden]`
 
-- Minimum block size: 64 bytes
-- Maximum order: ~20 (up to 1 MB blocks)
-- Free list array: `free_lists[ORDER_COUNT]`, each entry is a linked list of free blocks
-- Intrusive: free blocks store `next`/`prev` pointers in their own payload area
-
-### Key operations
+### Operaciones públicas
 
 ```rust
-fn buddy_init(base: usize, size: usize)    // Initialize heap
-fn buddy_alloc(order: usize) -> usize      // Allocate 2^order * MIN_BLOCK
-fn buddy_free(ptr: usize, order: usize)    // Return block to pool
+pub unsafe fn init(&self)
+// GlobalAlloc:
+unsafe fn alloc(&self, layout: Layout) -> *mut u8
+unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout)
+unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8
+unsafe fn realloc(&self, old: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8
 ```
 
-### Allocation strategy
+### Estrategia
 
-1. Find smallest free list with available blocks at requested order
-2. If not found, split a larger block recursively
-3. On free, merge with buddy if both are free
-4. Reinsert merged block into appropriate free list
+1. Buscar la lista libre de menor orden con bloques disponibles ≥ orden requerido
+2. Dividir bloques más grandes de forma recursiva (buddy split)
+3. Al liberar: intentar fusión con el bloque buddy si ambos están libres;
+   reinsertar en el orden superior
+4. La fusión sube iterativamente hasta `MAX_ORDER` o hasta que el buddy no esté libre
 
-## Future Plans
+### Debug
 
-- Page table management for full virtual memory
-- Kernel SLAB allocator for small objects
-- User-space address space isolation
+Con `cfg(debug_assertions)`, cada `alloc`, `dealloc` y fusión emite una traza
+por COM1 con el orden y la dirección.
+
+---
+
+## Limitaciones del espacio de direcciones
+
+- Sin gestión propia de tablas de páginas. El kernel opera en el **identity
+  map** dejado por el cargador.
+- Todas las direcciones físicas = virtuales.
+- Trabajo futuro: walk de tablas de páginas, espacio de usuario aislado.
+
+---
+
+## Traducción del mapa de memoria UEFI → Portix
+
+El cargador UEFI (`boot/efi/src/main.rs`) traduce el mapa de memoria de UEFI
+al formato de Portix antes de construir `PortixBootInfo`:
+
+| Tipo UEFI                   | Tipo Portix        |
+|-----------------------------|--------------------|
+| 1 (Loader code)             | `MEM_USABLE`       |
+| 4 (Boot services code)      | `MEM_USABLE`       |
+| 7 (Conventional memory)     | `MEM_USABLE`       |
+| 10 (ACPI reclaim)           | `MEM_ACPI_RECLAIM` |
+| 11 (ACPI NVS)               | `MEM_ACPI_NVS`     |
+| 13 / 14 (RT code / data)    | `MEM_RESERVED`     |
+| 17 (MMIO)                   | `MEM_FRAMEBUFFER`  |
+| Resto                       | `MEM_RESERVED`     |
+
+El stage2 BIOS escribe las entradas E820 directamente en formato Portix.

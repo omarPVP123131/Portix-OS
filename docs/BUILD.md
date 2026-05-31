@@ -1,125 +1,126 @@
-# Portix OS — Build System
+# Portix OS — Sistema de Build
 
-## Prerequisites
-
-| Tool           | Required | Notes                          |
-|----------------|----------|--------------------------------|
-| Python 3       | Yes      | Build script (build.py v5.0)  |
-| Rust nightly   | Yes      | rustup + nightly toolchain    |
-| NASM           | Yes      | Assembler for boot + ISR      |
-| QEMU           | Yes      | Emulator for testing          |
-| objcopy        | Yes      | From binutils (ELF→binary)    |
-| xorriso        | Optional | ISO creation (genisoimage also works) |
-| qemu-img       | Optional | VDI/VMDK conversion           |
-
-## Usage
+## Uso
 
 ```sh
-python scripts/build.py [--mode=MODE] [--vga=TYPE] [--clean]
+python scripts/build.py --mode=MODO [--format=FMT] [--vga=TIPO] [--no-run] [--clean]
 ```
 
-### Modes
+### Modos
 
-| Mode          | Image                    | Boot Target        | Description                         |
-|---------------|--------------------------|--------------------|-------------------------------------|
-| `raw` (default) | portix.img             | BIOS (MBR)         | Legacy BIOS boot                    |
-| `iso`         | portix.iso               | BIOS (El Torito)   | ISO9660 with no-emul boot           |
-| `uefi`        | portix-uefi.img          | UEFI (GPT+ESP)     | OVMF UEFI boot                      |
-| `dual`        | portix-dual.img + uefi   | BIOS + UEFI        | Combined BIOS + separate UEFI image |
-| `ventoy-sim`  | portix-ventoy-sim.img    | Ventoy-simulated   | Tests Ventoy compatibility          |
+| Modo   | Imágenes generadas                                    | Método de arranque       | Caso de uso              |
+|--------|-------------------------------------------------------|--------------------------|--------------------------|
+| `bios` | `portix.iso`, `portix.img`                            | BIOS (El Torito + MBR)   | Pruebas BIOS, VBox       |
+| `uefi` | `portix-uefi.img`, `portix-uefi.iso`                  | UEFI (GPT + ESP)         | OVMF, hardware real      |
+| `dual` | `portix-dual.iso` (híbrida), `portix-dual.img` + UEFI | BIOS + UEFI              | Validación completa      |
+| `all`  | Todo lo anterior                                      | BIOS + UEFI + híbrida    | Build de release         |
 
-### VGA Adapter Selection
+**Por defecto**: `--mode=all` (construye todo)
+
+### Filtro de formato
+
+| Flag            | Efecto                                    |
+|-----------------|-------------------------------------------|
+| `--format=iso`  | Solo archivos ISO                         |
+| `--format=img`  | Solo imágenes de disco IMG                |
+| (omitido)       | Todos los formatos del modo indicado      |
+
+Ejemplos:
+```sh
+python scripts/build.py --mode=bios --format=iso   # solo portix.iso
+python scripts/build.py --mode=dual --format=img   # solo portix-dual.img
+```
+
+### Adaptador VGA
 
 ```sh
-python scripts/build.py --vga=std
-python scripts/build.py --vga=virtio
-python scripts/build.py --vga=qxl
-python scripts/build.py --vga=vmware  # EXPERIMENTAL
+python scripts/build.py --vga=std     # VGA estándar QEMU (Bochs VBE)
+python scripts/build.py --vga=virtio  # virtio-vga (requiere fallback PCI)
+python scripts/build.py --vga=qxl     # SPICE QXL
+python scripts/build.py --vga=vmware  # VMware SVGA II (experimental)
 ```
 
-QEMU will use the specified VGA adapter. Default is `std`.
+### Otros flags
 
-### Other Flags
+| Flag        | Efecto                                        |
+|-------------|-----------------------------------------------|
+| `--clean`   | Elimina todos los artefactos de compilación   |
+| `--no-run`  | Solo compilar, no lanzar QEMU                 |
 
-| Flag         | Effect                                  |
-|--------------|-----------------------------------------|
-| `--clean`    | Clean build artifacts before building   |
-| `--no-run`   | Build only, don't launch QEMU           |
-| `--no-iso`   | Skip ISO creation (raw mode only)       |
+---
 
-## Build Flow
-
-```
-build.py
- ├── Verify tools (nasm, cargo, qemu, objcopy, xorriso, qemu-img)
- ├── Assemble boot.asm → boot.bin (512 bytes)
- ├── Assemble isr.asm → isr.o (NASM elf64)
- ├── cargo +nightly build --release
- │     -Z build-std=core,alloc
- │     -Z json-target-spec
- │     --target kernel/x86_64-portix.json
- ├── objcopy → kernel.bin (ELF → binary, stripped)
- ├── Assemble stage2.asm → stage2.bin (with KERNEL_SECTORS)
- ├── Create portix.img (MBR + stage2 + kernel)
- ├── Create portix.iso (xorriso, no-emul+boot)
- ├── Create portix-uefi.img (GPT+ESP FAT32, Python-puro)
- └── Launch QEMU (mode-dependent)
-```
-
-## Kernel Target Specification
-
-File: `kernel/x86_64-portix.json`
-
-```json
-{
-  "llvm-target": "x86_64-unknown-none",
-  "arch": "x86_64",
-  "os": "none",
-  "linker-flavor": "ld.lld",
-  "linker": "rust-lld",
-  "panic-strategy": "abort",
-  "disable-redzone": true,
-  "relocation-model": "static",
-  "code-model": "small",
-  "pre-link-args": {
-    "ld.lld": ["-Tlinker.ld"]
-  }
-}
-```
-
-## Linker Script
-
-File: `kernel/linker.ld`
+## Flujo de build
 
 ```
-KERNEL_PHYS_ADDR = 0x200000;
+1.  check_tools()
+      Verifica: nasm, cargo, qemu, objcopy, xorriso, qemu-img
 
-.text  : AT(ADDR(.text))  { *(.text*)   } > ram
-.rodata: AT(ADDR(.rodata)){ *(.rodata*) } > ram
-.data  : AT(ADDR(.data))  { *(.data*)   } > ram
-.bss   : AT(ADDR(.bss))   { *(.bss*)    } > ram
+2.  assemble_boot()
+      nasm boot.asm    → boot.bin
+      nasm isr.asm     → isr.o
 
-/DISCARD/ : { *(.comment*) *(.note*) *(.eh_frame*) }
+3.  build_kernel()
+      cargo +nightly build --release
+        -Z build-std=core,alloc
+        -Z json-target-spec
+        --target x86_64-portix.json
+      objcopy → kernel.bin (ELF sin símbolos de debug)
+
+4.  assemble_stage2()
+      nasm stage2.asm  (con define KERNEL_SECTORS)
+
+5.  create_raw()
+      Ensambla imagen MBR  → portix.img
+
+6.  create_iso()
+      ISO9660 El Torito vía xorriso, genisoimage o pycdlib
+      Fallback a copia raw si no hay herramienta ISO disponible
+      ISO híbrida (modo dual): agrega -e esp.img para entrada El Torito UEFI
+
+7.  [modo uefi] build_efi_loader()
+      cargo +nightly para x86_64-unknown-uefi
+    create_uefi_image()
+      Constructor GPT en Python + pyfatfs para la ESP
+    create_uefi_iso()
+      xorriso con flag -e para arranque EFI
+
+8.  run_qemu()
+      Lanzamiento de VM según modo (img BIOS, UEFI con OVMF, o dual)
 ```
 
-## OVMF Setup
+---
 
-The build script searches for OVMF firmware in:
+## Prerrequisitos
 
-| Platform | Path                                         |
-|----------|----------------------------------------------|
-| Windows  | `C:\Program Files\qemu\share\edk2-x86_64-code.fd` |
-| Linux    | `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd`     |
-| Linux    | `/usr/share/OVMF/OVMF_CODE.fd`               |
+Ver `PREREQUISITES.md` en la raíz del proyecto para instrucciones completas
+de instalación en Windows y Linux.
 
-If not found, the script prints setup instructions.
+### Resumen rápido
 
-## Output Files
+| Herramienta          | Requerida    | Instalar (Windows)              | Instalar (Linux)           |
+|----------------------|--------------|---------------------------------|----------------------------|
+| Python 3             | Sí           | python.org                      | `apt install python3`      |
+| Rust nightly         | Sí           | rustup.rs                       | `rustup`                   |
+| NASM                 | Sí           | nasm.us                         | `apt install nasm`         |
+| QEMU                 | Sí           | qemu.org                        | `apt install qemu-system-x86` |
+| objcopy (binutils)   | Sí           | MSYS2 mingw64                   | `apt install binutils`     |
+| xorriso              | Recomendada  | MSYS2: `pacman -S libisoburn`   | `apt install xorriso`      |
+| pyfatfs              | Solo UEFI    | `pip install pyfatfs`           | `pip install pyfatfs`      |
+| OVMF                 | Solo UEFI    | Carpeta share de QEMU (OVMF.fd) | `apt install ovmf`         |
 
-| File                       | Size   | Format       | Boot           |
-|----------------------------|--------|--------------|----------------|
-| `build/dist/portix.img`    | 8 MB   | MBR raw      | BIOS           |
-| `build/dist/portix.iso`    | 8.4 MB | ISO9660      | BIOS El Torito |
-| `build/dist/portix-uefi.img` | 64 MB | GPT+ESP FAT32 | UEFI          |
-| `build/dist/portix.vdi`    | 1 MB   | VDI          | VirtualBox     |
-| `build/dist/portix.vmdk`   | 576 KB | VMDK         | VMware         |
+> **Nota**: para la ISO híbrida (modo `dual`) xorriso es obligatorio. Sin
+> xorriso, el modo `dual` recurre a una copia de la ISO solo-BIOS.
+
+---
+
+## Archivos de salida
+
+| Archivo                           | Tamaño aprox. | Formato                       | Arranque                   |
+|-----------------------------------|---------------|-------------------------------|----------------------------|
+| `build/dist/portix.iso`           | ~8 MB         | ISO9660 + El Torito           | BIOS                       |
+| `build/dist/portix.img`           | ~8 MB         | MBR raw                       | BIOS MBR                   |
+| `build/dist/portix-dual.iso`      | ~8 MB         | ISO9660 + El Torito dual      | BIOS + UEFI (híbrida)      |
+| `build/dist/portix-dual.img`      | ~8 MB         | MBR raw                       | BIOS MBR (copia dual)      |
+| `build/dist/portix-uefi.iso`      | ~64 MB        | ISO9660 + El Torito EFI       | UEFI                       |
+| `build/dist/portix-uefi.img`      | 64 MB         | GPT + ESP FAT32               | UEFI                       |
+| `build/portix.img`                | ~8 MB         | MBR raw                       | BIOS MBR (intermedio)      |

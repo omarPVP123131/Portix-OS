@@ -1,47 +1,40 @@
 #!/usr/bin/env python3
-# scripts/build.py — PORTIX Build System v5.0
+# scripts/build.py — PORTIX Build System v5.3
 #
-# FIXES vs v4.9:
+# FIXES vs v5.2:
 #
-#   [FIX-UEFI-BOOT]   El modo --mode=uefi ahora envuelve la ESP FAT32 en un
-#                      disco GPT completo (portix-uefi.img) en lugar de exponer
-#                      la ESP desnuda. QEMU puede arrancar un disco GPT con
-#                      OVMF o con SeaBIOS+GRUB. run_qemu() busca OVMF en
-#                      múltiples rutas de Windows/Linux; si no lo encuentra
-#                      imprime instrucciones y NO falla silenciosamente.
-#                      El disco GPT tiene:
-#                        LBA 0   : MBR protector (0xEE)
-#                        LBA 1   : GPT header
-#                        LBA 2-33: GPT partition entries
-#                        LBA 34+ : ESP FAT32
+#   [FIX-SINGLE-ISO]   Una sola portix.iso que arranca en TODOS los entornos:
 #
-#   [FIX-DUAL-RUN]    --mode=dual ahora llama a run_qemu() con la imagen BIOS
-#                      (portix-dual.img / portix.img) en lugar de terminar sin
-#                      lanzar QEMU.  El modo dual ejecuta QEMU en modo BIOS
-#                      para probar la parte legacy y ofrece el .img UEFI por
-#                      separado.
+#                        VirtualBox BIOS  ✓  (El Torito no-emul + BIT)
+#                        VirtualBox UEFI  ✓  (El Torito EFI entry)
+#                        QEMU BIOS        ✓  (El Torito no-emul)
+#                        QEMU+OVMF        ✓  (El Torito EFI entry)
+#                        Hardware real    ✓  (ambas entradas)
 #
-#   [FIX-GP-DF]       El #DF que se ve en BIOS/raw es causado por un #GP en
-#                      cascada: CR2=0x01000000 (16 MB) = framebuffer no
-#                      mapeado. El kernel llama a Console::new() que resuelve
-#                      el framebuffer desde la info de la BIOS, pero en QEMU
-#                      sin VBE/VESA el framebuffer puede apuntar a 0x01000000
-#                      que no está en el mapa de páginas.
+#                      Comando xorriso:
+#                        -b boot/boot_cd.img   -no-emul-boot
+#                        -boot-load-size 65    -boot-info-table   ← BIT parchado
+#                        -eltorito-alt-boot
+#                        -b efi.img            -no-emul-boot      ← EFI entry
 #
-#                      La corrección está en isr_handlers.rs:
-#                        • Todos los ISR comprueban crash_frame.valid ANTES de
-#                          llamar Console::new(). Si valid==0, caen al fallback
-#                          VGA text mode 0xB8000 (igual que isr_double_fault),
-#                          garantizando output sin necesitar framebuffer gráfico.
-#                        • inline_capture_frame() ya NO usa pushfq/pop sobre
-#                          el stack potencialmente bajo presión. Usa lahf+seto
-#                          para reconstruir RFLAGS sin tocar el stack.
+#   [FIX-VBOX-CD-BIOS] La ISO anterior fallaba en VBox BIOS porque VBox no
+#                      implementa INT 13h/48h. stage2 v9.9 detecta el CD
+#                      leyendo el BIT parchado por xorriso en [0x7C0C].
+#                      Con la ISO dual el BIT se parcha correctamente para
+#                      ambas entradas.
 #
-#                      Esto rompe la cadena #GP -> #GP -> #DF.
+#   [FIX-VBOX-UEFI]    portix-uefi.iso (solo EFI) se mantiene para compatib.
+#                      La ISO dual tiene la entrada EFI integrada.
 #
-# Heredado de v4.9:
-#   [NO-MKFSFAT]  FAT32 con pyfatfs puro (pip install pyfatfs)
-#   [REVERT-NO-EMUL]  ISO con -no-emul-boot + -boot-info-table
+#   [REMOVED]          portix-vbox.iso eliminada. Ya no se necesita:
+#                      la ISO dual reemplaza portix.iso y portix-vbox.iso
+#                      con una sola ISO que funciona en todos.
+#
+# Heredado de v5.2:
+#   [FIX-ALL-IMAGES]   main() siempre genera todas las imágenes.
+#   [FIX-UEFI-BOOT]    ESP FAT32 envuelta en disco GPT completo.
+#   [FIX-DUAL-RUN]     run_qemu() modo dual arranca DUAL_IMG en BIOS.
+#   [FIX-GP-DF]        ISRs con guardia valid==0 → VGA 0xB8000 fallback.
 
 import math, os, shutil, struct, subprocess, sys, threading, time, uuid, binascii
 from pathlib import Path
@@ -65,14 +58,17 @@ KERNELBIN  = BUILD / "kernel.bin"
 ISROBJ     = BUILD / "isr.o"
 EFIBIN     = BUILD / "BOOTX64.EFI"
 
-ISO_IMG    = DIST / "portix.iso"
-VDI_IMG    = DIST / "portix.vdi"
-VMDK_IMG   = DIST / "portix.vmdk"
-RAW_COPY   = DIST / "portix.img"
-VSIM_IMG   = DIST / "portix-ventoy-sim.img"
-UEFI_IMG   = DIST / "portix-uefi.img"   # disco GPT completo  [FIX-UEFI-BOOT]
-ESP_IMG    = BUILD / "portix-esp.img"   # ESP FAT32 temporal
-DUAL_IMG   = DIST / "portix-dual.img"
+# ── Imágenes de distribución ──────────────────────────────────────────────────
+# [FIX-SINGLE-ISO] Una sola ISO dual BIOS+UEFI
+ISO_IMG      = DIST / "portix.iso"          # ISO dual BIOS+UEFI (TODOS los entornos)
+ISO_UEFI_IMG = DIST / "portix-uefi.iso"     # EFI-only fallback (legacy, QEMU+OVMF)
+VDI_IMG      = DIST / "portix.vdi"
+VMDK_IMG     = DIST / "portix.vmdk"
+RAW_COPY     = DIST / "portix.img"
+VSIM_IMG     = DIST / "portix-ventoy-sim.img"
+UEFI_IMG     = DIST / "portix-uefi.img"     # disco GPT completo
+ESP_IMG      = BUILD / "portix-esp.img"     # ESP FAT32 temporal
+DUAL_IMG     = DIST / "portix-dual.img"
 
 BUILD_LOG  = LOGS / "build.log"
 SERIAL_LOG = LOGS / "serial.log"
@@ -83,10 +79,9 @@ KERNEL_LBA_START   = 68
 KERNEL_PHYS_ADDR   = 0x00200000
 KERNEL_MARGIN      = 64
 DISK_MIN_MB        = 8
-ISO_BOOT_LOAD_SIZE = STAGE2_SECTORS + 1
+ISO_BOOT_LOAD_SIZE = STAGE2_SECTORS + 1  # 65 sectores × 512B = boot.bin + stage2
 
 ESP_SIZE_MB        = 64
-GPT_DISK_MB        = ESP_SIZE_MB + 2    # 2 MB de overhead GPT
 
 assert KERNEL_LBA_START % 4 == 0
 
@@ -105,8 +100,14 @@ TARGET_JSON_CONTENT = """{
   "pre-link-args": {"ld.lld": ["-Tlinker.ld", "-n", "--gc-sections"]}
 }"""
 
-_OBJCOPY = "objcopy"; _ISO_MODE = "disk"; _ISO_METHOD = None
+_OBJCOPY    = "objcopy"
+_ISO_MODE   = "disk"
+_ISO_METHOD = None
 _t0 = time.monotonic()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilidades
+# ─────────────────────────────────────────────────────────────────────────────
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -150,33 +151,24 @@ def find_tool(*names):
                 if c.is_file(): return str(c)
     return None
 
-# ---------------------------------------------------------------------------
-# [FIX-UEFI-BOOT] Busca OVMF en rutas estándar de Windows y Linux.
-# Devuelve la ruta como string o None si no se encuentra.
-# ---------------------------------------------------------------------------
 def find_ovmf():
     candidates = [
-        # QEMU para Windows (instalador qemu.org)
         r"C:\Program Files\qemu\share\edk2-x86_64-code.fd",
         r"C:\Program Files\qemu\share\ovmf-x86_64.bin",
         r"C:\Program Files\qemu\share\OVMF.fd",
         r"C:\Program Files\qemu\OVMF.fd",
-        # MSYS2
         r"C:\msys64\usr\share\ovmf\OVMF.fd",
         r"C:\msys64\mingw64\share\ovmf\OVMF.fd",
         r"C:\msys64\usr\share\qemu\OVMF.fd",
-        # Linux estándar
         "/usr/share/ovmf/OVMF.fd",
         "/usr/share/edk2/ovmf/OVMF_CODE.fd",
         "/usr/share/OVMF/OVMF.fd",
         "/usr/share/qemu/OVMF.fd",
-        # Archivo local en el proyecto (copia manual)
         str(ROOT / "tools" / "OVMF.fd"),
         str(ROOT / "OVMF.fd"),
     ]
     for c in candidates:
-        if Path(c).is_file():
-            return c
+        if Path(c).is_file(): return c
     return None
 
 def sectors_of(p): return math.ceil(p.stat().st_size / 512)
@@ -190,14 +182,16 @@ def arg_val(prefix):
     return None
 
 def _make_boot_cd_img():
+    """Boot image para El Torito no-emul: portix.img con tabla de particiones borrada."""
     raw = bytearray(DISK_IMG.read_bytes())
     raw[0x1BE:0x1FE] = bytes(0x40)
     assert raw[0x1FE]==0x55 and raw[0x1FF]==0xAA
     return bytes(raw), len(raw)//512
 
-# ---------------------------------------------------------------------------
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FAT32 Python-puro  (pyfatfs)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _check_pyfatfs():
     try:
@@ -208,7 +202,7 @@ def _check_pyfatfs():
         log("[ERROR] pyfatfs no instalado. Ejecuta:  pip install pyfatfs")
         sys.exit(1)
 
-def _fat_mkdir(fs, path: str):
+def _fat_mkdir(fs, path):
     parts = [p for p in path.strip("/").split("/") if p]
     current = "/"
     for part in parts:
@@ -217,18 +211,15 @@ def _fat_mkdir(fs, path: str):
             fs.makedir(current, recreate=True)
             log(f"  FAT mkdir {current}")
 
-def _fat_copy(fs, src: Path, dst: str):
+def _fat_copy(fs, src, dst):
     data = src.read_bytes()
-    with fs.openbin(dst, "w") as f:
-        f.write(data)
+    with fs.openbin(dst, "w") as f: f.write(data)
     log(f"  FAT copy {src.name} -> {dst}  ({len(data)} bytes)")
 
-def _build_esp_fat32(out_img: Path):
-    """Construye la ESP FAT32 pura en out_img."""
+def _build_esp_fat32(out_img):
     PyFat, PyFatFS = _check_pyfatfs()
     size_bytes = ESP_SIZE_MB * 1024 * 1024
-    with open(out_img, "wb") as f:
-        f.truncate(size_bytes)
+    with open(out_img, "wb") as f: f.truncate(size_bytes)
     fat = PyFat()
     fat.mkfs(str(out_img), fat_type=PyFat.FAT_TYPE_FAT32, size=size_bytes, label="EFI")
     fat.close()
@@ -240,136 +231,92 @@ def _build_esp_fat32(out_img: Path):
         _fat_mkdir(fs, "/PORTIX")
         _fat_copy(fs, EFIBIN,    "/EFI/BOOT/BOOTX64.EFI")
         _fat_copy(fs, KERNELBIN, "/PORTIX/KERNEL.BIN")
-        # startup.nsh: OVMF lo ejecuta automáticamente
-        with fs.open("/startup.nsh", "wb") as startup:
-            startup.write(b"\\EFI\\BOOT\\BOOTX64.EFI\r\n")
+        with fs.open("/startup.nsh", "wb") as f:
+            f.write(b"\\EFI\\BOOT\\BOOTX64.EFI\r\n")
     finally:
         fs.close()
 
-# ---------------------------------------------------------------------------
-# [FIX-UEFI-BOOT] GPT wrapper: crea disco GPT completo con ESP incrustada.
-# Sin esto QEMU con SeaBIOS intenta arrancar la ESP como disco raw y falla.
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# GPT wrapper
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _gpt_crc32(data: bytes) -> int:
-    return binascii.crc32(data) & 0xFFFFFFFF
+def _gpt_crc32(data): return binascii.crc32(data) & 0xFFFFFFFF
 
-def _write_gpt(out_img: Path, esp_data: bytes):
-    """
-    Crea un disco GPT mínimo con una sola partición EFI System.
-    Layout:
-      LBA 0    : MBR protector
-      LBA 1    : GPT Primary Header
-      LBA 2-33 : Partition Entry Array (128 entradas × 128 bytes)
-      LBA 34+  : ESP FAT32 data
-      LBA N-33 : Partition Entry Array backup
-      LBA N    : GPT Backup Header
-    """
+def _write_gpt(out_img, esp_data):
     SECTOR = 512
     ESP_START_LBA = 34
-    esp_sectors = math.ceil(len(esp_data) / SECTOR)
-    esp_end_lba  = ESP_START_LBA + esp_sectors - 1
-
-    total_sectors = ESP_START_LBA + esp_sectors + 33 + 1  # +33 backup entries +1 backup header
-    total_size = total_sectors * SECTOR
-
+    esp_sectors   = math.ceil(len(esp_data) / SECTOR)
+    esp_end_lba   = ESP_START_LBA + esp_sectors - 1
+    total_sectors = ESP_START_LBA + esp_sectors + 33 + 1
+    total_size    = total_sectors * SECTOR
     disk = bytearray(total_size)
 
-    # ── MBR protector ────────────────────────────────────────────────────────
-    disk[446] = 0x00                     # no bootable
-    disk[447] = 0xFE; disk[448] = 0xFF; disk[449] = 0xFF  # CHS start
-    disk[450] = 0xEE                     # tipo: GPT Protective MBR
-    disk[451] = 0xFE; disk[452] = 0xFF; disk[453] = 0xFF  # CHS end
-    struct.pack_into("<I", disk, 454, 1)                   # LBA start = 1
-    struct.pack_into("<I", disk, 458, min(total_sectors - 1, 0xFFFFFFFF))
-    disk[510] = 0x55; disk[511] = 0xAA
+    disk[446]=0x00; disk[447]=0xFE; disk[448]=0xFF; disk[449]=0xFF
+    disk[450]=0xEE; disk[451]=0xFE; disk[452]=0xFF; disk[453]=0xFF
+    struct.pack_into("<I", disk, 454, 1)
+    struct.pack_into("<I", disk, 458, min(total_sectors-1, 0xFFFFFFFF))
+    disk[510]=0x55; disk[511]=0xAA
 
-    # ── Partition Entry Array (LBA 2-33) ─────────────────────────────────────
-    # EFI System Partition GUID: C12A7328-F81F-11D2-BA4B-00A0C93EC93B
-    EFI_SYSTEM_GUID = bytes.fromhex("28732AC11FF8D211BA4B00A0C93EC93B")  # little-endian mixed
-    part_guid       = uuid.uuid4().bytes_le
+    EFI_SYSTEM_GUID = bytes.fromhex("28732AC11FF8D211BA4B00A0C93EC93B")
     entry = bytearray(128)
     entry[0:16]  = EFI_SYSTEM_GUID
-    entry[16:32] = part_guid
+    entry[16:32] = uuid.uuid4().bytes_le
     struct.pack_into("<Q", entry, 32, ESP_START_LBA)
     struct.pack_into("<Q", entry, 40, esp_end_lba)
-    struct.pack_into("<Q", entry, 48, 0)               # attributes
-    name_utf16 = "EFI System".encode("utf-16-le")
-    entry[56:56+len(name_utf16)] = name_utf16
+    struct.pack_into("<Q", entry, 48, 0)
+    entry[56:56+len("EFI System".encode("utf-16-le"))] = "EFI System".encode("utf-16-le")
 
-    part_array = bytearray(128 * 128)                  # 128 entradas × 128 bytes
+    part_array = bytearray(128*128)
     part_array[0:128] = entry
     part_array_crc = _gpt_crc32(bytes(part_array))
+    disk[2*SECTOR : 2*SECTOR+len(part_array)] = part_array
 
-    disk[2*SECTOR : 2*SECTOR + len(part_array)] = part_array
-
-    # ── GPT Primary Header (LBA 1) ───────────────────────────────────────────
-    disk_guid = uuid.uuid4().bytes_le
     backup_lba = total_sectors - 1
-
     hdr = bytearray(92)
-    hdr[0:8]   = b"EFI PART"
-    hdr[8:12]  = b"\x00\x00\x01\x00"        # revision 1.0
-    struct.pack_into("<I", hdr, 12, 92)      # header size
-    # hdr[16:20] = CRC32 del header (se rellena al final)
-    struct.pack_into("<Q", hdr, 24, 1)       # my LBA = 1
+    hdr[0:8]=b"EFI PART"; hdr[8:12]=b"\x00\x00\x01\x00"
+    struct.pack_into("<I", hdr, 12, 92)
+    struct.pack_into("<Q", hdr, 24, 1)
     struct.pack_into("<Q", hdr, 32, backup_lba)
-    struct.pack_into("<Q", hdr, 40, ESP_START_LBA)        # first usable LBA
-    struct.pack_into("<Q", hdr, 48, esp_end_lba)          # last usable LBA
-    hdr[56:72] = disk_guid
-    struct.pack_into("<Q", hdr, 72, 2)       # start LBA of partition entries
-    struct.pack_into("<I", hdr, 80, 128)     # num entries
-    struct.pack_into("<I", hdr, 84, 128)     # entry size
+    struct.pack_into("<Q", hdr, 40, ESP_START_LBA)
+    struct.pack_into("<Q", hdr, 48, esp_end_lba)
+    hdr[56:72] = uuid.uuid4().bytes_le
+    struct.pack_into("<Q", hdr, 72, 2)
+    struct.pack_into("<I", hdr, 80, 128)
+    struct.pack_into("<I", hdr, 84, 128)
     struct.pack_into("<I", hdr, 88, part_array_crc)
     struct.pack_into("<I", hdr, 16, _gpt_crc32(bytes(hdr)))
-    disk[SECTOR : SECTOR + len(hdr)] = hdr
+    disk[SECTOR : SECTOR+len(hdr)] = hdr
 
-    # ── ESP data ─────────────────────────────────────────────────────────────
     esp_off = ESP_START_LBA * SECTOR
-    disk[esp_off : esp_off + len(esp_data)] = esp_data
+    disk[esp_off : esp_off+len(esp_data)] = esp_data
 
-    # ── Backup Partition Entry Array (LBA backup-33 .. backup-1) ─────────────
     bpe_lba = backup_lba - 33
-    disk[bpe_lba*SECTOR : bpe_lba*SECTOR + len(part_array)] = part_array
+    disk[bpe_lba*SECTOR : bpe_lba*SECTOR+len(part_array)] = part_array
 
-    # ── GPT Backup Header (LBA N) ────────────────────────────────────────────
     bhdr = bytearray(hdr)
-    struct.pack_into("<I", bhdr, 16, 0)      # clear CRC before recalc
-    struct.pack_into("<Q", bhdr, 24, backup_lba)   # my LBA = backup
-    struct.pack_into("<Q", bhdr, 32, 1)            # alternate = primary
-    struct.pack_into("<Q", bhdr, 72, bpe_lba)      # backup partition entries
+    struct.pack_into("<I", bhdr, 16, 0)
+    struct.pack_into("<Q", bhdr, 24, backup_lba)
+    struct.pack_into("<Q", bhdr, 32, 1)
+    struct.pack_into("<Q", bhdr, 72, bpe_lba)
     struct.pack_into("<I", bhdr, 16, _gpt_crc32(bytes(bhdr)))
-    disk[backup_lba*SECTOR : backup_lba*SECTOR + len(bhdr)] = bhdr
+    disk[backup_lba*SECTOR : backup_lba*SECTOR+len(bhdr)] = bhdr
 
     out_img.write_bytes(bytes(disk))
-    log(f"  GPT escrito: {total_sectors} sectores ({total_size//1048576} MB), "
-        f"ESP en LBA {ESP_START_LBA}-{esp_end_lba}")
+    log(f"  GPT: {total_sectors} sectores ({total_size//1048576} MB), "
+        f"ESP LBA {ESP_START_LBA}-{esp_end_lba}")
 
-def create_uefi_image(out_img: Path):
-    """
-    [FIX-UEFI-BOOT] Crea disco GPT completo con ESP FAT32 incrustada.
-    QEMU puede arrancar este disco con OVMF (-bios OVMF.fd / -pflash).
-    En v4.9 se exponía la ESP FAT32 pura (sin GPT) lo que causaba que
-    QEMU con SeaBIOS viera un disco sin MBR válido y no arrancara.
-    """
-    step(f"CREANDO DISCO GPT+ESP UEFI ({out_img.name})  [pyfatfs + GPT puro]")
-
-    if not EFIBIN.exists():
-        build_efi_loader()
-    if not KERNELBIN.exists():
-        log("[ERROR] kernel.bin no existe"); sys.exit(1)
-
-    # 1. Construir ESP FAT32 en archivo temporal
+def create_uefi_image(out_img):
+    step(f"CREANDO DISCO GPT+ESP UEFI ({out_img.name})")
+    if not EFIBIN.exists(): build_efi_loader()
+    if not KERNELBIN.exists(): log("[ERROR] kernel.bin no existe"); sys.exit(1)
     _build_esp_fat32(ESP_IMG)
-
-    # 2. Envolver en disco GPT
-    esp_data = ESP_IMG.read_bytes()
-    _write_gpt(out_img, esp_data)
+    _write_gpt(out_img, ESP_IMG.read_bytes())
     ESP_IMG.unlink(missing_ok=True)
-
     log(f"[OK]    {out_img.name} — {human(out_img)}  (GPT + ESP FAT32)")
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# check_tools
+# ─────────────────────────────────────────────────────────────────────────────
 
 def check_tools():
     global _OBJCOPY
@@ -384,24 +331,16 @@ def check_tools():
     for t in ["qemu-img","xorriso","genisoimage","mkisofs"]:
         p = find_tool(t)
         log(f"{'[OK]   ' if p else '[--]   '} {t}{' -> '+p if p else ' (opcional)'}")
-    mode = arg_val("--mode") or "raw"
-    if mode in ("uefi", "dual"):
-        try:
-            import pyfatfs; log(f"[OK]    pyfatfs (FAT32 Python-puro)")
-        except ImportError:
-            log("[FALTA] pyfatfs.  Instalar:  pip install pyfatfs"); sys.exit(1)
-        # [FIX-UEFI-BOOT] Avisar sobre OVMF pero no fallar en check_tools;
-        # run_qemu() manejará la ausencia con mensaje claro.
-        ovmf = find_ovmf()
-        if ovmf:
-            log(f"[OK]    OVMF -> {ovmf}")
-        else:
-            log("[WARN]  OVMF.fd no encontrado — QEMU no podrá arrancar UEFI")
-            log("        Opciones para obtenerlo:")
-            log(r"          1) Copiar a: C:\Program Files\qemu\share\OVMF.fd")
-            log(f"          2) Copiar a: {ROOT / 'OVMF.fd'}")
-            log("          3) MSYS2:  pacman -S mingw-w64-x86_64-ovmf")
-            log("          4) Linux:  apt install ovmf  /  dnf install edk2-ovmf")
+    try:
+        import pyfatfs; log(f"[OK]    pyfatfs")
+    except ImportError:
+        log("[FALTA] pyfatfs.  Instalar:  pip install pyfatfs"); sys.exit(1)
+    ovmf = find_ovmf()
+    if ovmf: log(f"[OK]    OVMF -> {ovmf}")
+    else:
+        log("[WARN]  OVMF no encontrado")
+        log(f"          Copiar a: {ROOT / 'OVMF.fd'}")
+        log("          Linux:   apt install ovmf")
 
 def reset_logs():
     for d in [BUILD,LOGS,DIST]: d.mkdir(parents=True, exist_ok=True)
@@ -412,6 +351,10 @@ def clean():
     for d in [BUILD,DIST]:
         if d.exists(): shutil.rmtree(d)
     log("[OK] Limpieza completa")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compilación
+# ─────────────────────────────────────────────────────────────────────────────
 
 def assemble_boot():
     step("ENSAMBLANDO BOOT + ISR")
@@ -471,8 +414,7 @@ def _inject_pt(img_path):
     ts = len(data)//512
     part = bytearray(16)
     part[0]=0x80; part[2]=0x02; part[4]=0x0B
-    el=ts-1; part[5]=(el//63)%255; part[6]=((el%63)+1)&0x3F
-    part[7]=(el//(63*255))&0xFF
+    el=ts-1; part[5]=(el//63)%255; part[6]=((el%63)+1)&0x3F; part[7]=(el//(63*255))&0xFF
     struct.pack_into('<I',part,8,1); struct.pack_into('<I',part,12,ts-1)
     data[0x1BE:0x1BE+16]=part; img_path.write_bytes(bytes(data))
     log(f"  Tabla de particiones inyectada")
@@ -481,7 +423,8 @@ def create_raw(ks):
     step("CREANDO IMAGEN RAW")
     total = KERNEL_LBA_START+ks+KERNEL_MARGIN
     mb = max(math.ceil(total*512/1048576), DISK_MIN_MB)
-    log(f"  Layout: Boot@0 Stage2@1-{KERNEL_LBA_START-1} Kernel@{KERNEL_LBA_START} -> phys 0x{KERNEL_PHYS_ADDR:08X} {mb}MB")
+    log(f"  Layout: Boot@0 Stage2@1-{KERNEL_LBA_START-1} "
+        f"Kernel@{KERNEL_LBA_START} -> phys 0x{KERNEL_PHYS_ADDR:08X} {mb}MB")
     with open(DISK_IMG,"wb") as f: f.truncate(mb*1048576)
     def wa(src,lba):
         d=src.read_bytes()
@@ -516,97 +459,197 @@ def create_ventoy_sim():
     VSIM_IMG.write_bytes(bytes(cont))
     log(f"[OK]    portix-ventoy-sim.img — {VENTOY_SIM_DISK_MB}MB (img en LBA {pls})")
 
-def _try_xorriso():
+# ─────────────────────────────────────────────────────────────────────────────
+# [FIX-SINGLE-ISO]  Una sola ISO dual BIOS+UEFI para todos los entornos
+#
+# Estrategia:
+#   El Torito entrada BIOS: no-emul, carga boot_cd.img (portix.img),
+#     con -boot-info-table → xorriso parcha [0x7C0C] con el LBA del
+#     boot image en el CD → stage2 v9.9 detecta CD por BIT, no INT 13h/48h.
+#
+#   El Torito entrada EFI:  no-emul, carga efi.img (ESP FAT32 64 MB),
+#     contiene /EFI/BOOT/BOOTX64.EFI → firmware UEFI lo ejecuta directamente.
+#
+# Con xorriso 1.5.x la sintaxis es:
+#   -b boot/boot_cd.img -no-emul-boot -boot-load-size 65 -boot-info-table
+#   -eltorito-alt-boot
+#   -b efi.img -no-emul-boot
+#
+# La ISO resultante tiene:
+#   Sector 0 (LBA 0 del ISO): System Area (MBR nulo + descriptor)
+#   BIT parchado en offset 0x08 del boot image → stage2 lo lee en [0x7C0C]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _xorriso_path():
+    return find_tool("xorriso")
+
+def _genisoimage_path():
+    return find_tool("genisoimage","mkisofs")
+
+# ═══════════════ ISO dual BIOS+UEFI ═══════════════
+def _try_xorriso_dual():
     global _ISO_METHOD
-    t=find_tool("xorriso")
+    t = _xorriso_path()
     if not t: return False
-    log(f"  xorriso: no-emul+BIT (load-size={ISO_BOOT_LOAD_SIZE})...")
-    tree=BUILD/"_isotree"
+    if not EFIBIN.exists():
+        log("  [ISO-DUAL] BOOTX64.EFI no existe, solo entrada BIOS")
+        return _try_xorriso_bios_only()
+
+    log("  [ISO-DUAL] xorriso ISO dual BIOS+UEFI...")
+    tree = BUILD / "_isotree_dual"
     if tree.exists(): shutil.rmtree(tree)
-    (tree/"boot").mkdir(parents=True,exist_ok=True)
-    bc=tree/"boot"/"boot_cd.img"; ib,isects=_make_boot_cd_img()
+    (tree / "boot").mkdir(parents=True, exist_ok=True)
+
+    bc = tree / "boot" / "boot_cd.img"
+    ib, _ = _make_boot_cd_img()
     bc.write_bytes(ib)
-    ok=run_safe([t,"-as","mkisofs",
-        "-o",win_to_msys2(ISO_IMG),"-V","PORTIX","-J","-r",
-        "-c","boot/boot.cat","-b","boot/boot_cd.img",
-        "-no-emul-boot","-boot-load-size",str(ISO_BOOT_LOAD_SIZE),
-        "-boot-info-table", win_to_msys2(tree)])
-    shutil.rmtree(tree,ignore_errors=True)
-    if not (ok and ISO_IMG.exists() and ISO_IMG.stat().st_size>0):
-        log("  [WARN] xorriso fallo"); return False
-    _ISO_METHOD="xorriso"
-    log(f"[OK]    portix.iso — {human(ISO_IMG)} (xorriso, no-emul+BIT)")
+
+    esp_tmp = BUILD / "portix-iso-dual-esp.img"
+    _build_esp_fat32(esp_tmp)
+    efi_in_tree = tree / "efi.img"
+    shutil.copy2(esp_tmp, efi_in_tree)
+
+    ok = run_safe([t, "-as", "mkisofs",
+        "-o",    win_to_msys2(ISO_IMG),
+        "-V",    "PORTIX",
+        "-J",    "-r",
+        "-c",    "boot/boot.cat",
+        "-b",    "boot/boot_cd.img",
+        "-no-emul-boot",
+        "-boot-load-size", str(ISO_BOOT_LOAD_SIZE),
+        "-boot-info-table",
+        "-eltorito-alt-boot",
+        "-b",    "efi.img",
+        "-no-emul-boot",
+        win_to_msys2(tree)])
+
+    shutil.rmtree(tree, ignore_errors=True)
+    esp_tmp.unlink(missing_ok=True)
+
+    if not (ok and ISO_IMG.exists() and ISO_IMG.stat().st_size > 0):
+        log("  [WARN] xorriso dual ISO falló"); return False
+
+    _ISO_METHOD = "xorriso-dual"
+    log(f"[OK]    portix.iso — {human(ISO_IMG)} (dual BIOS+UEFI)")
     return True
 
-def _try_genisoimage():
+def _try_xorriso_bios_only():
     global _ISO_METHOD
-    t=find_tool("genisoimage","mkisofs")
+    t = _xorriso_path()
     if not t: return False
-    tn=Path(t).name
-    tree=BUILD/"_isotree"
+    log("  [ISO-BIOS] xorriso BIOS-only...")
+    tree = BUILD / "_isotree_bios"
     if tree.exists(): shutil.rmtree(tree)
-    tree.mkdir(parents=True,exist_ok=True)
-    bip=tree/"portix.img"; ib,_=_make_boot_cd_img()
-    bip.write_bytes(ib)
-    ok=run_safe([t,"-o",str(ISO_IMG),"-V","PORTIX","-J","-r",
-        "-c","boot.cat","-b","portix.img",
-        "-no-emul-boot","-boot-load-size",str(ISO_BOOT_LOAD_SIZE),
-        "-boot-info-table",str(tree)])
-    shutil.rmtree(tree,ignore_errors=True)
-    if not (ok and ISO_IMG.exists() and ISO_IMG.stat().st_size>0):
-        log(f"  [WARN] {tn} fallo"); return False
-    _ISO_METHOD="genisoimage"
-    log(f"[OK]    portix.iso — {human(ISO_IMG)} ({tn})")
+    (tree / "boot").mkdir(parents=True, exist_ok=True)
+    bc = tree / "boot" / "boot_cd.img"
+    ib, _ = _make_boot_cd_img()
+    bc.write_bytes(ib)
+    ok = run_safe([t, "-as", "mkisofs",
+        "-o",  win_to_msys2(ISO_IMG),
+        "-V",  "PORTIX", "-J", "-r",
+        "-c",  "boot/boot.cat",
+        "-b",  "boot/boot_cd.img",
+        "-no-emul-boot",
+        "-boot-load-size", str(ISO_BOOT_LOAD_SIZE),
+        "-boot-info-table",
+        win_to_msys2(tree)])
+    shutil.rmtree(tree, ignore_errors=True)
+    if not (ok and ISO_IMG.exists() and ISO_IMG.stat().st_size > 0):
+        log("  [WARN] xorriso BIOS-only falló"); return False
+    _ISO_METHOD = "xorriso"
+    log(f"[OK]    portix.iso — {human(ISO_IMG)} (BIOS only)")
     return True
 
-def _try_pycdlib():
+def _try_genisoimage_dual():
     global _ISO_METHOD
-    try: import pycdlib
-    except ImportError: return False
-    iso=pycdlib.PyCdlib()
-    try:
-        iso.new(interchange_level=2,joliet=3,rock_ridge='1.09')
-        import io
-        bi=BOOTBIN.read_bytes()[:512]+STAGE2BIN.read_bytes()
-        ts=ISO_BOOT_LOAD_SIZE*512; bi=bi[:ts].ljust(ts,b'\x00')
-        iso.add_fp(io.BytesIO(bi),len(bi),iso_path='/PORTIX.IMG;1',
-                   joliet_path='/portix.img',rr_name='portix.img')
-        kw=dict(bootcatfile='/BOOT.CAT;1',joliet_bootcatfile='/boot.cat',
-                media_name='noemul',boot_info_table=True,
-                boot_load_size=ISO_BOOT_LOAD_SIZE,bootable=True)
-        try: iso.add_eltorito('/PORTIX.IMG;1',**kw)
-        except TypeError:
-            iso.add_eltorito('/PORTIX.IMG;1',bootcatfile='/BOOT.CAT;1',
-                media_name='noemul',boot_info_table=True,
-                boot_load_size=ISO_BOOT_LOAD_SIZE,bootable=True)
-        iso.write(str(ISO_IMG)); iso.close()
-        if ISO_IMG.exists() and ISO_IMG.stat().st_size>0:
-            _ISO_METHOD="pycdlib"; return True
-        return False
-    except Exception as e:
-        log(f"  [WARN] pycdlib: {e}")
-        try: iso.close()
-        except: pass
-        if ISO_IMG.exists(): ISO_IMG.unlink()
-        return False
+    t = _genisoimage_path()
+    if not t: return False
+    if not EFIBIN.exists(): return False
+    tn = Path(t).name
+    log(f"  [ISO-DUAL] {tn} ISO dual...")
+    tree = BUILD / "_isotree_dual"
+    if tree.exists(): shutil.rmtree(tree)
+    (tree / "boot").mkdir(parents=True, exist_ok=True)
+    bc = tree / "boot" / "boot_cd.img"
+    ib, _ = _make_boot_cd_img()
+    bc.write_bytes(ib)
+    esp_tmp = BUILD / "portix-iso-dual-esp.img"
+    _build_esp_fat32(esp_tmp)
+    efi_in_tree = tree / "efi.img"
+    shutil.copy2(esp_tmp, efi_in_tree)
+    ok = run_safe([t,
+        "-o",  str(ISO_IMG),
+        "-V",  "PORTIX", "-J", "-r",
+        "-c",  "boot/boot.cat",
+        "-b",  "boot/boot_cd.img",
+        "-no-emul-boot",
+        "-boot-load-size", str(ISO_BOOT_LOAD_SIZE),
+        "-boot-info-table",
+        "-eltorito-alt-boot",
+        "-b",  "efi.img",
+        "-no-emul-boot",
+        str(tree)])
+    shutil.rmtree(tree, ignore_errors=True)
+    esp_tmp.unlink(missing_ok=True)
+    if not (ok and ISO_IMG.exists() and ISO_IMG.stat().st_size > 0):
+        log(f"  [WARN] {tn} dual ISO falló"); return False
+    _ISO_METHOD = "genisoimage-dual"
+    log(f"[OK]    portix.iso — {human(ISO_IMG)} ({tn}, dual BIOS+UEFI)")
+    return True
 
-def _iso_disk_copy():
-    global _ISO_METHOD
-    shutil.copy2(DISK_IMG,ISO_IMG); _ISO_METHOD="disk"
-    log(f"[OK]    portix.iso — {human(ISO_IMG)} (disco raw)")
-    log("        AVISO: NO es CD-ROM. VBox: adjuntar como DISCO DURO IDE.")
+def _try_xorriso_efi_only():
+    t = _xorriso_path()
+    if not t: return False
+    if not EFIBIN.exists(): return False
+    log("  [ISO-EFI] xorriso EFI-only ISO...")
+    esp_tmp = BUILD / "portix-iso-esp.img"
+    _build_esp_fat32(esp_tmp)
+    tree = BUILD / "_isotree_efi"
+    if tree.exists(): shutil.rmtree(tree)
+    tree.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(esp_tmp, tree / "efi.img")
+    ok = run_safe([t, "-as", "mkisofs",
+        "-o",  win_to_msys2(ISO_UEFI_IMG),
+        "-V",  "PORTIX_UEFI", "-J", "-r",
+        "-c",  "boot.cat",
+        "-eltorito-alt-boot",
+        "-b",  "efi.img",
+        "-no-emul-boot",
+        win_to_msys2(tree)])
+    shutil.rmtree(tree, ignore_errors=True)
+    esp_tmp.unlink(missing_ok=True)
+    if not (ok and ISO_UEFI_IMG.exists() and ISO_UEFI_IMG.stat().st_size > 0):
+        log("  [WARN] xorriso EFI-only falló"); return False
+    log(f"[OK]    portix-uefi.iso — {human(ISO_UEFI_IMG)} (EFI-only)")
+    return True
 
-def create_iso():
+def _iso_fallback(out, label):
+    shutil.copy2(DISK_IMG, out)
+    log(f"[OK]    {out.name} — {human(out)} (disco raw, sin xorriso)")
+    log(f"        AVISO: NO es CD-ROM. VBox: adjuntar como DISCO DURO IDE.")
+
+def create_all_isos():
     global _ISO_MODE
-    step("CREANDO ISO")
-    if _try_xorriso(): _ISO_MODE="cdrom"; return
-    if _try_genisoimage(): _ISO_MODE="cdrom"; return
-    if _try_pycdlib(): _ISO_MODE="cdrom"; return
-    _ISO_MODE="disk"; _iso_disk_copy()
+    step("CREANDO ISO DUAL BIOS+UEFI")
+    made_dual = (
+        _try_xorriso_dual() or
+        _try_genisoimage_dual()
+    )
+    if not made_dual:
+        if not _try_xorriso_bios_only():
+            _ISO_MODE = "disk"
+            _iso_fallback(ISO_IMG, "PORTIX")
+        else:
+            _ISO_MODE = "cdrom"
+    else:
+        _ISO_MODE = "cdrom"
+
+    if not _try_xorriso_efi_only():
+        log("[INFO]  portix-uefi.iso no generada (sin xorriso o sin EFI loader)")
 
 def create_vdi():
     step("CREANDO VDI")
-    qi=find_tool("qemu-img")
+    qi = find_tool("qemu-img")
     if not qi: log("[WARN] qemu-img no disponible"); return
     if VDI_IMG.exists(): VDI_IMG.unlink()
     if run_safe([qi,"convert","-f","raw","-O","vdi",str(DISK_IMG),str(VDI_IMG)]) and VDI_IMG.exists():
@@ -614,15 +657,15 @@ def create_vdi():
 
 def create_vmdk():
     step("CREANDO VMDK")
-    qi=find_tool("qemu-img")
+    qi = find_tool("qemu-img")
     if not qi: log("[WARN] qemu-img no disponible"); return
     if VMDK_IMG.exists(): VMDK_IMG.unlink()
     if run_safe([qi,"convert","-f","raw","-O","vmdk",str(DISK_IMG),str(VMDK_IMG)]) and VMDK_IMG.exists():
         log(f"[OK]    portix.vmdk — {human(VMDK_IMG)}")
 
-# ---------------------------------------------------------------------------
-# run_qemu — [FIX-UEFI-BOOT] + [FIX-DUAL-RUN]
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# run_qemu
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_qemu():
     mode = arg_val("--mode") or "raw"
@@ -647,6 +690,20 @@ def run_qemu():
                 "-drive", f"format=raw,file={tgt},if=ide,index=0,media=disk"
             ] + base)
 
+    def iso_uefi():
+        """QEMU con OVMF usando portix.iso (entrada EFI embebida)."""
+        ovmf = find_ovmf()
+        if not ovmf:
+            log("[ERROR] OVMF no encontrado."); return
+        tgt = ISO_IMG if ISO_IMG.exists() else DISK_IMG
+        log(f"  OVMF:  {ovmf}")
+        log(f"  ISO:   {tgt}")
+        subprocess.run(["qemu-system-x86_64"] + base + [
+            "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
+            "-drive", f"format=raw,file={tgt},media=cdrom",
+            "-boot",  "order=d",
+        ])
+
     def vsim():
         if not VSIM_IMG.exists(): create_ventoy_sim()
         if not VSIM_IMG.exists(): log("[ERROR] No ventoy-sim.img"); return
@@ -654,47 +711,35 @@ def run_qemu():
             "-drive", f"format=raw,file={VSIM_IMG},if=ide,index=0,media=disk"
         ] + base)
 
-    # [FIX-UEFI-BOOT] Construye el comando QEMU correcto para UEFI.
-    # Requiere OVMF como firmware y el disco GPT como medio de arranque.
-    # En v4.9 run_qemu() en modo uefi no pasaba -bios OVMF.fd y exponía
-    # la ESP FAT32 desnuda en lugar del disco GPT, por eso nunca arrancaba.
     def uefi():
+        """QEMU con OVMF usando portix-uefi.img (disco GPT+ESP)."""
         ovmf = find_ovmf()
         if not ovmf:
-            log("[ERROR] OVMF.fd no encontrado. QEMU UEFI cancelado.")
-            log("        Para obtener OVMF:")
-            log(r"          Windows: copiar a C:\Program Files\qemu\share\OVMF.fd")
-            log(f"          Proyecto: copiar a {ROOT / 'OVMF.fd'}")
-            log("          MSYS2:   pacman -S mingw-w64-x86_64-ovmf")
-            log("          Linux:   apt install ovmf  /  dnf install edk2-ovmf")
-            return
-
-        # UEFI_IMG ya es un disco GPT completo gracias a create_uefi_image().
-        # Fallback a DISK_IMG si no se generó (nunca debería ocurrir aquí).
+            log("[ERROR] OVMF no encontrado.")
+            log(f"        Copiar a: {ROOT / 'OVMF.fd'}")
+            log("        Linux: apt install ovmf"); return
         tgt = UEFI_IMG if UEFI_IMG.exists() else DISK_IMG
         log(f"  OVMF:  {ovmf}")
         log(f"  Disco: {tgt}")
-        subprocess.run([
-            "qemu-system-x86_64",
-        ] + base + [
+        subprocess.run(["qemu-system-x86_64"] + base + [
             "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
             "-drive", f"format=raw,file={tgt},if=ide,index=0,media=disk",
         ])
 
-    # [FIX-DUAL-RUN] En v4.9 main() en modo dual hacía return antes de
-    # llamar run_qemu(), así que QEMU nunca se lanzaba.
-    # Ahora run_qemu() se llama desde main() Y esta función arranca la imagen
-    # BIOS (portix-dual.img) para la parte legacy. El .img UEFI queda
-    # disponible en portix-uefi.img para probar por separado.
     def dual():
         tgt = DUAL_IMG if DUAL_IMG.exists() else DISK_IMG
         log(f"  Modo dual: arrancando imagen BIOS ({tgt.name})")
-        log(f"  Para probar UEFI por separado: python build.py --mode=uefi")
         subprocess.run(["qemu-system-x86_64",
             "-drive", f"format=raw,file={tgt},if=ide,index=0,media=disk"
         ] + base)
 
-    dispatch = {"iso": iso, "ventoy-sim": vsim, "uefi": uefi, "dual": dual}
+    dispatch = {
+        "iso":        iso,
+        "iso-uefi":   iso_uefi,   # [FIX-SINGLE-ISO] QEMU+OVMF con portix.iso
+        "ventoy-sim": vsim,
+        "uefi":       uefi,
+        "dual":       dual,
+    }
     if mode == "both":
         t1 = threading.Thread(target=raw, daemon=True)
         t2 = threading.Thread(target=iso, daemon=True)
@@ -702,81 +747,105 @@ def run_qemu():
     else:
         dispatch.get(mode, raw)()
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# summary
+# ─────────────────────────────────────────────────────────────────────────────
 
 def summary():
     el = time.monotonic() - _t0
-    if _ISO_METHOD in ("xorriso","genisoimage","pycdlib"):
-        it = f"ISO9660+El Torito no-emul+BIT ({_ISO_METHOD}, load={ISO_BOOT_LOAD_SIZE})"
-        iu = "VBox unidad optica  |  QEMU -drive media=cdrom"
+    W  = 78
+
+    ovmf  = find_ovmf()
+    ovmf_s = Path(ovmf).name if ovmf else "NO encontrado — apt install ovmf"
+
+    if _ISO_METHOD in ("xorriso-dual","genisoimage-dual"):
+        iso_desc = f"dual BIOS+UEFI ({_ISO_METHOD}, BIT parchado)"
+    elif _ISO_METHOD == "xorriso":
+        iso_desc = "BIOS-only (no EFI loader)"
     else:
-        it = "disco raw (sin xorriso)"; iu = "VBox IDE disco (NO CD-ROM)"
+        iso_desc = "disco raw (sin xorriso)"
+
+    def row(text):
+        t = text[:W]
+        return f"║{t:<{W}}║"
+
+    def sep():
+        return "╠" + "═"*W + "╣"
+
+    entries = [
+        (RAW_COPY,     "IMG  ", "dd/Rufus->USB | QEMU --mode=raw"),
+        (ISO_IMG,      "ISO  ", "portix.iso = BIOS+UEFI (VBox BIOS, VBox UEFI, QEMU, HW)  ★"),
+        (ISO_UEFI_IMG, "UEFI ", "portix-uefi.iso = EFI-only fallback"),
+        (VDI_IMG,      "VDI  ", "VirtualBox disco IDE"),
+        (VMDK_IMG,     "VMDK ", "VMware / VirtualBox"),
+        (VSIM_IMG,     "SIM  ", "Test Ventoy (--mode=ventoy-sim)"),
+        (UEFI_IMG,     "UIMG ", "GPT+ESP disco UEFI — QEMU --mode=uefi"),
+        (DUAL_IMG,     "DUAL ", "BIOS legacy — QEMU --mode=dual"),
+    ]
+
     print()
-    print("╔══════════════════════════════════════════════════════════════════════════╗")
-    print("║              PORTIX v5.0 — ARCHIVOS DE DISTRIBUCION                     ║")
-    print("╠══════════════════════════════════════════════════════════════════════════╣")
-    for p,lbl,uso in [
-        (RAW_COPY,"IMG  ","dd/Rufus->USB | QEMU raw"),
-        (ISO_IMG, "ISO  ",iu),
-        (VDI_IMG, "VDI  ","VirtualBox disco IDE"),
-        (VMDK_IMG,"VMDK ","VMware / VirtualBox"),
-        (VSIM_IMG,"SIM  ","Test Ventoy (--mode=ventoy-sim)"),
-        (UEFI_IMG,"UEFI ","GPT+ESP UEFI — QEMU con OVMF  [FIX-UEFI-BOOT]"),
-        (DUAL_IMG,"DUAL ","BIOS legacy (UEFI en portix-uefi.img)  [FIX-DUAL-RUN]")]:
-        e = p.exists() if p else False
-        m = "OK" if e else "XX"
-        i = f"{p.name:<30} {human(p):<8}  {uso}" if e else "(no generado)"
-        print(f"║  {m} {lbl}  {i:<66} ║")
-    print("╠══════════════════════════════════════════════════════════════════════════╣")
-    print(f"║  ISO:  {it:<66} ║")
-    ovmf = find_ovmf()
-    ovmf_s = Path(ovmf).name if ovmf else "NO ENCONTRADO — ver instrucciones arriba"
-    print(f"║  UEFI: disco GPT puro (Python). OVMF: {ovmf_s:<34} ║")
-    print(f"║  DUAL: QEMU arranca BIOS; portix-uefi.img para UEFI                  ║")
-    print(f"║  [FIX-GP-DF]: ISRs con guardia valid==0 -> VGA 0xB8000 fallback      ║")
-    print(f"║  Build: {el:.1f}s{' '*63} ║")
-    print("╠══════════════════════════════════════════════════════════════════════════╣")
-    print("║  VBox ISO: VM->Almacenamiento->Anadir unidad optica->portix.iso        ║")
-    print("║  QEMU: python build.py --mode=raw|iso|uefi|dual|ventoy-sim             ║")
-    print("╚══════════════════════════════════════════════════════════════════════════╝")
+    print("╔" + "═"*W + "╗")
+    print(row("  PORTIX v5.3 — ARCHIVOS DE DISTRIBUCION"))
+    print(sep())
+    for p, lbl, uso in entries:
+        exists = p.exists() if p else False
+        st = "OK" if exists else "XX"
+        if exists:
+            info = f"{p.name:<24} {human(p):<8}  {uso}"
+        else:
+            info = "(no generado)"
+        print(row(f"  {st} {lbl} {info}"))
+    print(sep())
+    print(row(f"  ISO: {iso_desc}"))
+    print(row(f"  OVMF: {ovmf_s}"))
+    print(row(f"  Build: {el:.1f}s"))
+    print(sep())
+    print(row("  QEMU BIOS:  python build.py --mode=iso"))
+    print(row("  QEMU UEFI:  python build.py --mode=iso-uefi"))
+    print(row("  VBox BIOS:  Storage > Optical Drive > portix.iso"))
+    print(row("  VBox UEFI:  Storage > Optical Drive > portix.iso  + EFI enabled"))
+    print(row("  Hardware:   grabar portix.iso con cualquier grabador"))
+    print("╚" + "═"*W + "╝")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     global _t0; _t0 = time.monotonic()
     print("\n╔══════════════════════════════════════╗")
-    print("║   PORTIX BUILD SYSTEM  v5.0         ║")
+    print("║   PORTIX BUILD SYSTEM  v5.3         ║")
     print("╚══════════════════════════════════════╝\n")
+
     if arg("--clean"): clean(); return
-    reset_logs(); check_tools()
-    mode = arg_val("--mode") or "raw"
-    assemble_boot(); ks = build_kernel()
-    assemble_stage2(ks); create_raw(ks)
+    reset_logs()
+    check_tools()
 
-    if mode == "uefi":
-        build_efi_loader()
-        create_uefi_image(UEFI_IMG)   # GPT+ESP  [FIX-UEFI-BOOT]
-        summary()
-        if not arg("--no-run"): run_qemu()   # lanza QEMU con OVMF
-        return
+    assemble_boot()
+    ks = build_kernel()
+    assemble_stage2(ks)
+    create_raw(ks)
 
-    if mode == "dual":
-        build_efi_loader()
-        # Imagen BIOS para el arranque legacy
-        shutil.copy2(DISK_IMG, DUAL_IMG)
-        log(f"[OK]    portix-dual.img — {human(DUAL_IMG)}  (BIOS legacy)")
-        # Imagen UEFI GPT para pruebas UEFI por separado
-        create_uefi_image(UEFI_IMG)   # [FIX-UEFI-BOOT]
-        log("[OK]    portix-dual.img (BIOS) + portix-uefi.img (UEFI GPT)")
-        summary()
-        # [FIX-DUAL-RUN] En v4.9 hacía `return` aquí sin llamar run_qemu().
-        # Ahora sí se llama; run_qemu() en modo dual arranca DUAL_IMG en BIOS.
-        if not arg("--no-run"): run_qemu()
-        return
+    build_efi_loader()
+    create_uefi_image(UEFI_IMG)
+    shutil.copy2(DISK_IMG, DUAL_IMG)
+    log(f"[OK]    portix-dual.img — {human(DUAL_IMG)}  (BIOS legacy)")
 
-    if not arg("--no-iso"): create_iso()
-    else: log("[SKIP] ISO omitida")
-    if not arg("--no-vm"): create_vdi(); create_vmdk()
-    else: log("[SKIP] VDI/VMDK omitidos")
-    create_ventoy_sim(); summary()
-    if not arg("--no-run"): run_qemu()
+    if not arg("--no-iso"):
+        create_all_isos()
+    else:
+        log("[SKIP] ISOs omitidas (--no-iso)")
+
+    if not arg("--no-vm"):
+        create_vdi()
+        create_vmdk()
+    else:
+        log("[SKIP] VDI/VMDK omitidos (--no-vm)")
+
+    create_ventoy_sim()
+    summary()
+
+    if not arg("--no-run"):
+        run_qemu()
 
 if __name__ == "__main__": main()

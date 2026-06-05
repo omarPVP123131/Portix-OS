@@ -10,7 +10,7 @@
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
-#![allow(static_mut_refs)] // kernel bare-metal single-thread — safe
+#![allow(static_mut_refs)]
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
 

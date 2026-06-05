@@ -128,3 +128,4 @@ desktop.ini
 # scripts/
 # linker.ld
 # Cargo.toml
+.aider*

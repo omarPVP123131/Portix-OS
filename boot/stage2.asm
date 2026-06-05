@@ -1,46 +1,44 @@
-; boot/stage2.asm — PORTIX Stage-2 v9.8
+; boot/stage2.asm — PORTIX Stage-2 v9.10
 ; nasm -f bin -DKERNEL_SECTORS=N [-DKERNEL_LBA=N] stage2.asm -o stage2.bin
 ;
 ; ══════════════════════════════════════════════════════════════════════════════
-; CAMBIOS vs v9.7
+; CAMBIOS vs v9.9
 ; ══════════════════════════════════════════════════════════════════════════════
 ;
-;   [FIX-PAGING-CRASH]  El triple fault en la activación de paginación se
-;                       debía a que PML4/PDPT/PD estaban en 0x800000..0x803000,
-;                       pero el identity map solo cubría 0x000000..0x7FFFFF
-;                       (4 entradas × 2 MB). Las page tables caían exactamente
-;                       1 byte fuera del rango mapeado → #PF al activar CR0.PG
-;                       → double fault → triple fault.
+;   [FIX-BIT-OFFSETS]  Los defines BIT_* estaban desplazados 8 bytes.
 ;
-;                       SOLUCIÓN: page tables movidas al primer MB libre
-;                       (0x1000..0x4FFF), zona siempre cubierta por la entrada
-;                       0 del identity map (0x000000..0x1FFFFF).
+;                      El Torito Boot Information Table (spec):
+;                        xorriso con -boot-info-table parcha el boot image
+;                        a partir del byte 0 del boot image (= 0x7C00 en RAM).
 ;
-;                       Layout del primer MB con este fix:
-;                         0x0000..0x03FF  IVT (BIOS)
-;                         0x0400..0x04FF  BDA (BIOS)
-;                         0x0500..0x0FFF  libre
-;                         0x1000..0x1FFF  PML4  ← (antes 0x800000)
-;                         0x2000..0x2FFF  PDPT  ← (antes 0x801000)
-;                         0x3000..0x3FFF  PD_IDENT ← (antes 0x802000)
-;                         0x4000..0x4FFF  PD_LFB   ← (antes 0x803000)
-;                         0x5000..0x7BFF  libre
-;                         0x7BF0          CANARY
-;                         0x7C00          boot.bin (512 B)
-;                         0x7E00          base_lba (dword, escrito por boot.asm)
-;                         0x8000..0xFFFF  stage2.bin (este archivo, 32 KB)
-;                         0x10000..0x9FFFF staging kernel
+;                        offset +0x00  bi_pvd    LBA del PVD         (u32 LE)
+;                        offset +0x04  bi_file   LBA del boot image  (u32 LE)  ← el que importa
+;                        offset +0x08  bi_length longitud en bytes   (u32 LE)
+;                        offset +0x0C  bi_csum   checksum            (u32 LE)
 ;
-;                       Identity map: 5 entradas × 2 MB = 10 MB (0..0x9FFFFF)
-;                       cubre: IVT, BDA, page tables, stack, BIOS data, stage2,
-;                       staging y las primeras instrucciones del kernel.
-;                       El kernel vive en 0x200000..N dentro de ese rango.
+;                      Antes (v9.9) — INCORRECTO:
+;                        BIT_PVD_LBA   equ 0x7C08  ← era bi_length, siempre != 0
+;                        BIT_BOOT_LBA  equ 0x7C0C  ← era bi_csum, valor basura
+;                        BIT_IMAGE_LEN equ 0x7C10  ← fuera del BIT
+;                        BIT_CHECKSUM  equ 0x7C14  ← fuera del BIT
 ;
-;   [FIX-ISO-HDEMU]   (de v9.7) ISO usa El Torito no-emul. detect_cdrom()
-;                     devuelve is_cdrom=0 con HD-emul. do_cdrom_load() es
-;                     fallback para CD-ROM físico no-emul futuro.
+;                      Ahora (v9.10) — CORRECTO:
+;                        BIT_PVD_LBA   equ 0x7C00
+;                        BIT_BOOT_LBA  equ 0x7C04  ← LBA real del boot image
+;                        BIT_IMAGE_LEN equ 0x7C08
+;                        BIT_CHECKSUM  equ 0x7C0C
 ;
-;   [FIX-BIT-REMOVE]  (de v9.7) Eliminada lectura del BIT para HD-emul.
+;                      Consecuencia del bug anterior:
+;                        - [0x7C0C] = bi_csum podía ser != 0 → bit_valid=1
+;                        - cdap_lba = bi_csum + 17  → LBA completamente incorrecto
+;                        - Kernel leído de posición basura → pantalla negra
+;                        - VDI/VMDK funcionaban porque no usan esta ruta
+;
+; Heredado de v9.9:
+;   [FIX-VBOX-CD-BIOS]  Detección de CD por BIT, no INT 13h/48h.
+;   [FIX-VBOX-UEFI]     BOOTX64.EFI para la entrada EFI de la ISO.
+;   [FIX-PAGING-CRASH]  Page tables en 0x1000..0x4FFF.
+;   [FIX-ISO-HDEMU]     ISO usa El Torito no-emul.
 ;
 ; ══════════════════════════════════════════════════════════════════════════════
 
@@ -72,6 +70,22 @@ BASE_LBA_ADDR    equ 0x7E00
 STACK_TOP        equ 0x7C00
 CANARY_ADDR      equ 0x7BF0
 CANARY_VAL       equ 0xDEAD
+
+; ──────────────────────────────────────────────────────────────────────────────
+; BIT (Boot Information Table) — offsets correctos
+;
+; xorriso -boot-info-table parcha el boot image desde su byte 0.
+; El boot image se carga en 0x7C00, así que en RAM:
+;
+;   0x7C00  bi_pvd    LBA del PVD en el CD       (u32 LE)
+;   0x7C04  bi_file   LBA absoluto del boot image (u32 LE, sectores 2048B)
+;   0x7C08  bi_length longitud del boot image     (u32 LE, bytes)
+;   0x7C0C  bi_csum   checksum del boot image     (u32 LE)
+; ──────────────────────────────────────────────────────────────────────────────
+BIT_PVD_LBA   equ 0x7C00   ; bi_pvd   (antes: 0x7C08 — INCORRECTO)
+BIT_BOOT_LBA  equ 0x7C04   ; bi_file  (antes: 0x7C0C — INCORRECTO)
+BIT_IMAGE_LEN equ 0x7C08   ; bi_length(antes: 0x7C10 — INCORRECTO)
+BIT_CHECKSUM  equ 0x7C0C   ; bi_csum  (antes: 0x7C14 — INCORRECTO)
 
 BINFO_BASE    equ 0x9000
 BINFO_E820CNT equ BINFO_BASE + 0x00
@@ -131,15 +145,10 @@ CACHE_UNKNOWN equ 0
 CACHE_UC      equ 1
 CACHE_WB      equ 4
 
-; ── [FIX-PAGING-CRASH] Page tables en el primer MB ──────────────────────────
-; Zona 0x0500..0x7BEF está libre (no la usa BIOS, BDA ni el stack de stage2).
-; Estas direcciones siempre quedan cubiertas por la primera entrada 2 MB
-; del identity map (0x000000..0x1FFFFF) — se mapean a sí mismas antes de
-; que CR0.PG se active, así que el MMU puede leerlas sin #PF.
-PML4_ADDR     equ 0x1000   ; era 0x800000 → fuera del identity map → CRASH
-PDPT_ADDR     equ 0x2000   ; era 0x801000
-PD_IDENT_ADDR equ 0x3000   ; era 0x802000
-PD_LFB_ADDR   equ 0x4000   ; era 0x803000
+PML4_ADDR     equ 0x1000
+PDPT_ADDR     equ 0x2000
+PD_IDENT_ADDR equ 0x3000
+PD_LFB_ADDR   equ 0x4000
 
 BOOT_STACK_TOP equ 0x508000
 
@@ -167,7 +176,7 @@ start2:
     mov  si, msg_stage2
     call print
 
-    call detect_cdrom
+    call detect_cdrom_bit
     call check_long_mode
     call enable_a20
     call probe_e820
@@ -194,7 +203,6 @@ start2:
     call setup_vesa
     call setup_paging
 
-    ; Deshabilitar IRQ IDE
     mov  al, 0x02
     mov  dx, 0x3F6
     out  dx, al
@@ -209,9 +217,20 @@ start2:
     hlt
 
 ; ══════════════════════════════════════════════════════════════════════════════
-; detect_cdrom
+; detect_cdrom_bit  [FIX-BIT-OFFSETS]
+;
+; Lee [BIT_BOOT_LBA] = [0x7C04] = bi_file.
+;
+; bi_file es el LBA absoluto del boot image en el CD en sectores de 2048B.
+; xorriso lo parcha cuando se usa -boot-info-table.
+; Si bi_file != 0 → estamos arrancando desde CD no-emul con BIT parchado.
+;
+; IMPORTANTE: antes (v9.9) se leía [0x7C0C] = bi_csum, que es la suma de
+; comprobación del boot image. bi_csum casi siempre es != 0, así que
+; bit_valid quedaba en 1 con un valor basura, y el LBA del kernel resultante
+; apuntaba a basura → pantalla negra en todos los entornos ISO.
 ; ══════════════════════════════════════════════════════════════════════════════
-detect_cdrom:
+detect_cdrom_bit:
     push ax
     push bx
     push cx
@@ -219,6 +238,25 @@ detect_cdrom:
     push es
     push di
 
+    xor  ax, ax
+    mov  ds, ax
+
+    ; Leer bi_file = LBA absoluto del boot image (offset +0x04 del boot image)
+    ; El boot image está en 0x7C00, por tanto bi_file está en 0x7C04
+    mov  eax, [BIT_BOOT_LBA]    ; = [0x7C04]
+    test eax, eax
+    jz   .try_int13
+
+    ; bi_file != 0 → BIT fue parchado por xorriso → es CD no-emul
+    mov  byte [is_cdrom], 1
+    mov  byte [bit_valid], 1
+    mov  si, msg_cdrom_bit
+    call print
+    jmp  .done
+
+.try_int13:
+    ; Fallback: INT 13h/48h (para QEMU SeaBIOS que no tiene BIT,
+    ; o hardware donde xorriso no parchó el BIT por alguna razón)
     xor  ax, ax
     mov  es, ax
 
@@ -498,36 +536,22 @@ setup_vesa:
 
 ; ══════════════════════════════════════════════════════════════════════════════
 ; setup_paging
-;
-; [FIX-PAGING-CRASH] Las page tables ahora están en 0x1000..0x4FFF,
-; dentro del primer MB, siempre cubiertos por la entrada 0 del identity map
-; (0x000000..0x1FFFFF). El identity map se amplía de 4 a 5 entradas de 2 MB
-; para cubrir también 0x800000..0x9FFFFF donde puede vivir el LFB en QEMU.
 ; ══════════════════════════════════════════════════════════════════════════════
 setup_paging:
-    ; Limpiar 4 tablas × 4 KB = 16 KB en 0x1000..0x4FFF
-    ; Usar edi como puntero (32 bits OK en modo protegido antes de long mode)
     mov  edi, PML4_ADDR
     xor  eax, eax
     mov  ecx, 0x4000 / 4
     rep  stosd
 
-    ; PML4[0] → PDPT (bit 0=Present, bit 1=R/W)
     mov  dword [dword PML4_ADDR],     PDPT_ADDR | 0x03
     mov  dword [dword PML4_ADDR + 4], 0
 
-    ; PDPT[0] → PD_IDENT (primer GiB)
     mov  dword [dword PDPT_ADDR],     PD_IDENT_ADDR | 0x03
     mov  dword [dword PDPT_ADDR + 4], 0
 
-    ; PD_IDENT: identity map 0..96 MB (48 entradas × 2 MB)
-    ; Cubre: IVT/BDA, page tables (0x1000..0x4FFF), stage2 (0x8000..0xFFFF),
-    ;        staging (0x10000..0x9FFFF), kernel (0x200000..N),
-    ;        BOOTINFO (0x600000..0x61AFFF), BOOT_STACK_TOP (0x508000),
-    ;        HEAP (0x1000000..0x4FFFFFF), BACKBUF (0x5000000..0x57FFFFF).
     mov  edi, PD_IDENT_ADDR
-    mov  eax, 0x00000083        ; Present + R/W + PS (2 MB page)
-    mov  ecx, 48                ; 48 × 2MB = 96 MB (cubre heap + backbuffer)
+    mov  eax, 0x00000083
+    mov  ecx, 48
 .fill_pd:
     mov  [edi],         eax
     mov  dword [edi+4], 0
@@ -535,7 +559,6 @@ setup_paging:
     add  edi, 8
     loop .fill_pd
 
-    ; Mapear LFB si está fuera del primer GiB
     mov  ebx, [BINFO_LFB]
     test ebx, ebx
     jz   .done
@@ -543,7 +566,7 @@ setup_paging:
     mov  eax, ebx
     shr  eax, 30
     and  eax, 0x1FF
-    jz   .map_lfb_low           ; LFB dentro del primer GiB → mapear abajo
+    jz   .map_lfb_low
 
     shl  eax, 3
     cmp  dword [PDPT_ADDR + eax], 0
@@ -566,7 +589,6 @@ setup_paging:
     jmp  .done
 
 .map_lfb_low:
-    ; LFB dentro del primer GiB pero fuera de la identidad mínima
     mov  eax, ebx
     and  eax, 0xFFE00000
     mov  edi, ebx
@@ -625,25 +647,19 @@ enter_long_mode:
     lgdt [gdt64_desc]
     lidt [idt_null_desc]
 
-    ; CR4.PAE = 1
     mov  eax, cr4
     or   eax, (1 << 5)
     mov  cr4, eax
 
-    ; CR3 = PML4 (ahora en 0x1000, siempre mapeado)
     mov  eax, PML4_ADDR
     mov  cr3, eax
 
-    ; EFER.LME = 1
     mov  ecx, 0xC0000080
     rdmsr
     or   eax, (1 << 8)
     xor  edx, edx
     wrmsr
 
-    ; CR0.PG + CR0.PE = 1
-    ; Ahora que CR3 apunta a tablas dentro del identity map,
-    ; el primer acceso del MMU (PML4 en 0x1000) está mapeado → sin #PF.
     mov  eax, cr0
     or   eax, (1 << 31) | (1 << 0)
     mov  cr0, eax
@@ -811,16 +827,45 @@ try_vesa_mode:
 
 ; ══════════════════════════════════════════════════════════════════════════════
 ; do_cdrom_load
+;
+; Calcula el LBA del kernel en el CD.
+;
+; Modo BIT (bit_valid=1 — VirtualBox, hardware real):
+;   bi_file = [0x7C04] = LBA absoluto del boot image en sectores CD (2048B)
+;   kernel  = bi_file + KERNEL_LBA/4
+;
+;   Por qué KERNEL_LBA/4:
+;     boot image = 65 sectores×512B = 33280 bytes
+;     ceil(33280 / 2048) = 17 sectores CD
+;     KERNEL_LBA/4 = 68/4 = 17  → coincide exactamente
+;
+; Modo SeaBIOS (bit_valid=0 — QEMU):
+;   SeaBIOS virtualiza el acceso: LBA 0 en INT 13h/42h = boot image[0]
+;   kernel = 0 + KERNEL_LBA/4 = 17
 ; ══════════════════════════════════════════════════════════════════════════════
 do_cdrom_load:
     pusha
 
-    mov  eax, [base_lba]
-    add  eax, KERNEL_LBA
+    cmp  byte [bit_valid], 1
+    jne  .use_seabios
+
+    ; Modo BIT: bi_file está en [0x7C04] (corregido de 0x7C0C en v9.9)
+    mov  eax, [BIT_BOOT_LBA]          ; = [0x7C04] = bi_file
+    mov  ecx, KERNEL_LBA
+    shr  ecx, 2                        ; KERNEL_LBA/4 = sectores CD
+    add  eax, ecx                      ; LBA CD absoluto del kernel
+    mov  [cdap_lba_lo], eax
+    mov  dword [cdap_lba_hi], 0
+    jmp  .load
+
+.use_seabios:
+    ; Modo SeaBIOS: LBA relativo al boot image
+    mov  eax, KERNEL_LBA
     shr  eax, 2
     mov  [cdap_lba_lo], eax
     mov  dword [cdap_lba_hi], 0
 
+.load:
     mov  eax, KERNEL_SECTORS
     add  eax, 3
     shr  eax, 2
@@ -1110,7 +1155,7 @@ error_disk:
 ; ══════════════════════════════════════════════════════════════════════════════
 ; DATOS
 ; ══════════════════════════════════════════════════════════════════════════════
-msg_stage2       db "S2 v9.8 OK", 13, 10, 0
+msg_stage2       db "S2 v9.10 OK", 13, 10, 0
 msg_kernel_ok    db "Kernel OK", 13, 10, 0
 msg_err_disk     db "DISK ERR ", 0
 msg_a20_warn     db "A20 WARN", 13, 10, 0
@@ -1118,7 +1163,8 @@ msg_kern_warn    db "KERN EMPTY?", 13, 10, 0
 msg_no_cpuid     db "NO CPUID!", 13, 10, 0
 msg_no_lm        db "NO LM CPU!", 13, 10, 0
 msg_stack_smash  db "STACK WARN", 13, 10, 0
-msg_cdrom_native db "CD NATIVE", 13, 10, 0
+msg_cdrom_native db "CD INT13", 13, 10, 0
+msg_cdrom_bit    db "CD BIT OK", 13, 10, 0
 msg_crlf         db 13, 10, 0
 str_0x           db "0x", 0
 
@@ -1126,6 +1172,7 @@ boot_drive      db 0
 lba_drive       db 0x80
 chs_drive       db 0x80
 is_cdrom        db 0
+bit_valid       db 0
 base_lba        dd 0
 lba_remain      dw 0
 cd_remain       dw 0
@@ -1160,8 +1207,8 @@ drive_params_buf: times 66 db 0
 align 8
 gdt64:
     dq 0x0000000000000000
-    dq 0x00AF9A000000FFFF   ; Code 64-bit
-    dq 0x00CF92000000FFFF   ; Data 32/64-bit
+    dq 0x00AF9A000000FFFF
+    dq 0x00CF92000000FFFF
 gdt64_end:
 
 gdt64_desc:
@@ -1195,7 +1242,6 @@ long_mode_entry:
     mov  rsp, BOOT_STACK_TOP
     xor  rbp, rbp
 
-    ; Copiar kernel desde staging (< 1 MB) a dirección física final
     mov  rsi, KERNEL_STAGING
     mov  rdi, KERNEL_PHYS_ADDR
     mov  rcx, (KERNEL_SECTORS * 512) / 8

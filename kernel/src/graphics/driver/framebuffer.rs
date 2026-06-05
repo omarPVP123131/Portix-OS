@@ -291,11 +291,13 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
-pub fn new() -> Self {
+    pub fn new() -> Self {
         unsafe {
+            let mut needs_vbe_init;
             let (mut lfb, mut w_raw, mut h_raw, p_raw, mut bpp_raw) =
                 if let Some(info) = bootinfo::get() {
                     let fb = &info.framebuffer;
+                    needs_vbe_init = fb.source != 1;
                     (
                         fb.base,
                         fb.width as usize,
@@ -304,6 +306,7 @@ pub fn new() -> Self {
                         fb.bpp as u8,
                     )
                 } else {
+                    needs_vbe_init = true;
                     (
                         core::ptr::read_volatile(LEGACY_LFB_PTR_ADDR) as u64,
                         core::ptr::read_volatile(LEGACY_WIDTH_ADDR) as usize,
@@ -319,26 +322,29 @@ pub fn new() -> Self {
                 if pci_fb != 0 {
                     serial::log("FB", "framebuffer via PCI BAR");
                     lfb = pci_fb;
-                    // Inicializar VBE si es necesario y leer resolución
-                    let (vbe_w, vbe_h, vbe_bpp) = bochs_vbe_setup();
-                    serial::log("FB", "VBE resolution (w x h x bpp):");
-                    serial::write_usize(vbe_w as usize);
-                    serial::write_byte(b'x');
-                    serial::write_usize(vbe_h as usize);
-                    serial::write_byte(b'x');
-                    serial::write_usize(vbe_bpp as usize);
-                    serial::write_byte(b'\n');
-                    if vbe_w > 0 && vbe_h > 0 && vbe_bpp >= 15 {
-                        w_raw = vbe_w as usize;
-                        h_raw = vbe_h as usize;
-                        bpp_raw = vbe_bpp as u8;
-                    } else {
-                        w_raw = 1024;
-                        h_raw = 768;
-                        bpp_raw = 32;
-                    }
+                    needs_vbe_init = true;
                 } else {
                     serial::log("FB", "PCI BAR fallback: no VGA found");
+                }
+            }
+
+            if needs_vbe_init && lfb != 0 {
+                let (vbe_w, vbe_h, vbe_bpp) = bochs_vbe_setup();
+                serial::log("FB", "VBE resolution (w x h x bpp):");
+                serial::write_usize(vbe_w as usize);
+                serial::write_byte(b'x');
+                serial::write_usize(vbe_h as usize);
+                serial::write_byte(b'x');
+                serial::write_usize(vbe_bpp as usize);
+                serial::write_byte(b'\n');
+                if vbe_w > 0 && vbe_h > 0 && vbe_bpp >= 15 {
+                    w_raw = vbe_w as usize;
+                    h_raw = vbe_h as usize;
+                    bpp_raw = vbe_bpp as u8;
+                } else {
+                    w_raw = 1024;
+                    h_raw = 768;
+                    bpp_raw = 32;
                 }
             }
 

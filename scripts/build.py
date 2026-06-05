@@ -13,7 +13,7 @@
 #
 #                      Comando xorriso:
 #                        -b boot/boot_cd.img   -no-emul-boot
-#                        -boot-load-size 65    -boot-info-table   ← BIT parchado
+#                        -boot-load-size <N>   -boot-info-table   ← dinámico segun kernel
 #                        -eltorito-alt-boot
 #                        -b efi.img            -no-emul-boot      ← EFI entry
 #
@@ -79,7 +79,7 @@ KERNEL_LBA_START   = 68
 KERNEL_PHYS_ADDR   = 0x00200000
 KERNEL_MARGIN      = 64
 DISK_MIN_MB        = 8
-ISO_BOOT_LOAD_SIZE = STAGE2_SECTORS + 1  # 65 sectores × 512B = boot.bin + stage2
+# ISO_BOOT_LOAD_SIZE ahora es dinámico basado en portix.img en _make_boot_cd_img()
 
 ESP_SIZE_MB        = 64
 
@@ -182,11 +182,23 @@ def arg_val(prefix):
     return None
 
 def _make_boot_cd_img():
-    """Boot image para El Torito no-emul: portix.img con tabla de particiones borrada."""
-    raw = bytearray(DISK_IMG.read_bytes())
-    raw[0x1BE:0x1FE] = bytes(0x40)
-    assert raw[0x1FE]==0x55 and raw[0x1FF]==0xAA
-    return bytes(raw), len(raw)//512
+    """Boot image para El Torito no-emul: portix.img LBA 0 hasta fin de kernel.
+    
+    Incluye boot.bin (LBA 0), stage2.bin (LBA 1-64), gap (LBA 65-67),
+    y kernel.bin (LBA 68+). Esto asegura que stage2 pueda leer el kernel
+    desde CD via INT 13h/42h con LDA = BIT_BOOT_LBA + KERNEL_LBA/4,
+    ya que los datos del kernel están en sectores CD consecutivos tras la
+    boot image.
+    """
+    if not DISK_IMG.exists():
+        log("[ERROR] portix.img no existe, no se puede crear boot_cd.img")
+        sys.exit(1)
+    ks = sectors_of(KERNELBIN)
+    total_sectors = KERNEL_LBA_START + ks
+    total_bytes = total_sectors * 512
+    raw = DISK_IMG.read_bytes()[:total_bytes]
+    log(f"  Boot CD img: {len(raw)}B ({total_sectors} sectores, LBA 0-{total_sectors-1})")
+    return bytes(raw), total_sectors
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -471,7 +483,7 @@ def create_ventoy_sim():
 #     contiene /EFI/BOOT/BOOTX64.EFI → firmware UEFI lo ejecuta directamente.
 #
 # Con xorriso 1.5.x la sintaxis es:
-#   -b boot/boot_cd.img -no-emul-boot -boot-load-size 65 -boot-info-table
+#   -b boot/boot_cd.img -no-emul-boot -boot-load-size <N> -boot-info-table
 #   -eltorito-alt-boot
 #   -b efi.img -no-emul-boot
 #
@@ -501,7 +513,7 @@ def _try_xorriso_dual():
     (tree / "boot").mkdir(parents=True, exist_ok=True)
 
     bc = tree / "boot" / "boot_cd.img"
-    ib, _ = _make_boot_cd_img()
+    ib, boot_sectors = _make_boot_cd_img()
     bc.write_bytes(ib)
 
     esp_tmp = BUILD / "portix-iso-dual-esp.img"
@@ -516,7 +528,7 @@ def _try_xorriso_dual():
         "-c",    "boot/boot.cat",
         "-b",    "boot/boot_cd.img",
         "-no-emul-boot",
-        "-boot-load-size", str(ISO_BOOT_LOAD_SIZE),
+        "-boot-load-size", str(boot_sectors),
         "-boot-info-table",
         "-eltorito-alt-boot",
         "-b",    "efi.img",
@@ -530,7 +542,7 @@ def _try_xorriso_dual():
         log("  [WARN] xorriso dual ISO falló"); return False
 
     _ISO_METHOD = "xorriso-dual"
-    log(f"[OK]    portix.iso — {human(ISO_IMG)} (dual BIOS+UEFI)")
+    log(f"[OK]    portix.iso — {human(ISO_IMG)} (dual BIOS+UEFI, boot={boot_sectors}s)")
     return True
 
 def _try_xorriso_bios_only():
@@ -542,7 +554,7 @@ def _try_xorriso_bios_only():
     if tree.exists(): shutil.rmtree(tree)
     (tree / "boot").mkdir(parents=True, exist_ok=True)
     bc = tree / "boot" / "boot_cd.img"
-    ib, _ = _make_boot_cd_img()
+    ib, boot_sectors = _make_boot_cd_img()
     bc.write_bytes(ib)
     ok = run_safe([t, "-as", "mkisofs",
         "-o",  win_to_msys2(ISO_IMG),
@@ -550,14 +562,14 @@ def _try_xorriso_bios_only():
         "-c",  "boot/boot.cat",
         "-b",  "boot/boot_cd.img",
         "-no-emul-boot",
-        "-boot-load-size", str(ISO_BOOT_LOAD_SIZE),
+        "-boot-load-size", str(boot_sectors),
         "-boot-info-table",
         win_to_msys2(tree)])
     shutil.rmtree(tree, ignore_errors=True)
     if not (ok and ISO_IMG.exists() and ISO_IMG.stat().st_size > 0):
         log("  [WARN] xorriso BIOS-only falló"); return False
     _ISO_METHOD = "xorriso"
-    log(f"[OK]    portix.iso — {human(ISO_IMG)} (BIOS only)")
+    log(f"[OK]    portix.iso — {human(ISO_IMG)} (BIOS only, boot={boot_sectors}s)")
     return True
 
 def _try_genisoimage_dual():
@@ -571,7 +583,7 @@ def _try_genisoimage_dual():
     if tree.exists(): shutil.rmtree(tree)
     (tree / "boot").mkdir(parents=True, exist_ok=True)
     bc = tree / "boot" / "boot_cd.img"
-    ib, _ = _make_boot_cd_img()
+    ib, boot_sectors = _make_boot_cd_img()
     bc.write_bytes(ib)
     esp_tmp = BUILD / "portix-iso-dual-esp.img"
     _build_esp_fat32(esp_tmp)
@@ -583,7 +595,7 @@ def _try_genisoimage_dual():
         "-c",  "boot/boot.cat",
         "-b",  "boot/boot_cd.img",
         "-no-emul-boot",
-        "-boot-load-size", str(ISO_BOOT_LOAD_SIZE),
+        "-boot-load-size", str(boot_sectors),
         "-boot-info-table",
         "-eltorito-alt-boot",
         "-b",  "efi.img",
@@ -594,7 +606,7 @@ def _try_genisoimage_dual():
     if not (ok and ISO_IMG.exists() and ISO_IMG.stat().st_size > 0):
         log(f"  [WARN] {tn} dual ISO falló"); return False
     _ISO_METHOD = "genisoimage-dual"
-    log(f"[OK]    portix.iso — {human(ISO_IMG)} ({tn}, dual BIOS+UEFI)")
+    log(f"[OK]    portix.iso — {human(ISO_IMG)} ({tn}, dual BIOS+UEFI, boot={boot_sectors}s)")
     return True
 
 def _try_xorriso_efi_only():

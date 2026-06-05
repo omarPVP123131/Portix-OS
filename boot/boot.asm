@@ -1,40 +1,16 @@
-; boot/boot.asm  -  PORTIX Stage-1  v9.8
+; boot/boot.asm  -  PORTIX Stage-1  v9.15
 ; nasm -f bin boot.asm -o boot.bin
 ;
-; CORRECCIONES vs v9.7:
+; FIXES vs v9.14:
 ;
-;   [FIX-BIT-PATCH-AREA]  xorriso -boot-info-table parcha el boot image
-;                         empezando en offset +2 (tras el jmp/nop inicial).
-;                         En v9.7 los primeros bytes eran cli/xor/etc.,
-;                         que quedaban corrompidos → crash inmediato en CD.
+;   [FIX-XORRISO-ZERO]  xorriso -boot-info-table pone a cero bytes 24-63 del
+;                        primer sector (no documentado). start_real movido
+;                        de offset 0x18 a 0x40 (byte 64) para evitarlo.
 ;
-;                         SOLUCIÓN: jmp short al inicio que salta a
-;                         start_real en offset +0x10, dejando 13 bytes
-;                         libres para el BIT entre offset +0x03 y +0x0F.
-;
-;   [FIX-NO-CD-DETECT]    Boot.asm ya no intenta detectar CD (evita toda
-;                         la lógica BIT / INT 13h/48h que era frágil).
-;                         En su lugar, comprueba si stage2 ya está en RAM
-;                         buscando el magic dword STAGE2_MAGIC en 0x8000.
-;
-;                         Con boot-load-size=65, El Torito carga 65×512 B
-;                         que incluye boot.bin (512 B) + stage2.bin (64×512 B).
-;                         stage2.bin se carga en 0x7E00..0xA1FF; su ORG
-;                         es 0x8000, así que los primeros 4 bytes en 0x8000
-;                         son el magic "ST92" (0x32395453 LE).
-;
-;                         En HDD/USB solo se carga 1 sector (512 B =
-;                         boot.bin). [0x8000] contiene RAM sin inicializar
-;                         o datos del BIOS; la probabilidad de un falso
-;                         positivo con el magic es despreciable.
-;
-;                         REQUISITO: stage2.asm debe exportar el magic en
-;                         sus primeros 4 bytes (ver stage2.asm v9.11).
-;
-; Heredado de v9.6/v9.7:
-;   [FIX-DAP-CLOBBER]   Buffer edd_buf eliminado (ya no se usa INT 13h/48h
-;                       en boot.asm). DAP limpio antes de su primer uso.
-;   Path HDD/USB LBA+CHS sin cambios.
+; Heredado de v9.14:
+;   [FIX-CD-RAM-COPY]   CD path copia stage2 de RAM (0x7E00→0x8000), no usa INT 13h.
+;   [FIX-BIT-SAFE]      Área BIT expandida a bytes 2-23.
+;   [REMOVE-CHS]        CHS fallback eliminado.
 
 BITS 16
 ORG 0x7C00
@@ -43,20 +19,24 @@ STAGE2_SECTORS equ 64
 STAGE2_SEG     equ 0x0800
 BASE_LBA_ADDR  equ 0x7E00
 
-; Magic que stage2.asm pone en sus primeros 4 bytes (en 0x8000).
-; Valor: "ST92" en little-endian = 53 54 39 32.
-STAGE2_MAGIC   equ 0x32395453
-
-; ── Offset 0x00: jmp short sobre el área BIT ──────────────────────────
-; xorriso parcha el boot image desde offset +2 (tras el jmp/nop).
-; El código real empieza en start_real (offset 0x10).
+; ── Offset 0x00: jmp short sobre BIT + zona zero de xorriso ──────────
+; xorriso -boot-info-table parcha bytes 8-23 del boot image:
+;   0x7C08  PVD LBA    (u32)
+;   0x7C0C  File LBA   (u32)  ← BIT_BOOT_LBA, usado por stage2
+;   0x7C10  Image len  (u32)
+;   0x7C14  Checksum   (u32)
+;
+; IMPORTANTE: xorriso 1.5.6 con -boot-info-table también pone a cero
+; bytes 24-63 del primer sector (no solo bytes 8-23). start_real debe
+; estar en offset ≥64 (0x40) para evitar que el código sea destruido.
     jmp  short start_real
     nop
-    ; Offsets 0x03..0x0F: área BIT (13 bytes, rellenada por xorriso con
-    ; bi_pvd, bi_file, bi_length, bi_csum). No ejecutada.
-    times 13 db 0
+    times 61 db 0
 
-start_real:                 ; offset 0x10 desde ORG = 0x7C10
+; ══════════════════════════════════════════════════════════════════════════════
+; start_real — Entry point real (offset 0x40 = 0x7C40)
+; ══════════════════════════════════════════════════════════════════════════════
+start_real:
     cli
     xor  ax, ax
     mov  ds, ax
@@ -64,81 +44,48 @@ start_real:                 ; offset 0x10 desde ORG = 0x7C10
     mov  ss, ax
     mov  sp, 0x7C00
     sti
-    mov  [boot_drive_orig], dl
+    mov  [boot_drive_orig], dl    ; DL = boot drive from BIOS
     mov  [boot_drive],      dl
     mov  di, si
 
-    ; Geometría CHS dinámica
-    push es
-    mov  ah, 0x08
-    mov  dl, [boot_drive]
-    int  0x13
-    jc   .geom_done
-    and  cx, 0x003F
-    jz   .geom_done
-    mov  [spt], cx
-    movzx ax, dh
-    inc  ax
-    mov  [heads], ax
-.geom_done:
-    pop  es
-    xor  ax, ax
-    mov  ds, ax
-    mov  es, ax
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; Detectar CD-ROM: DL = 0xE0-0xEF (El Torito estándar)
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; En CD, el BIOS ya cargó la boot image completa en RAM a 0x7C00
+    ; (con -boot-load-size <N>). Stage2 está en 0x7E00. Solo copiamos de RAM.
+    cmp  dl, 0xE0
+    jae  .cd_fallback_copy
+
+    ; ── Path HDD/USB (DL=0x00-0x9F) ──────────────────────────────────────
+    ; Leer stage2 del disco a 0x8000 mediante INT 13h AH=0x42
 
     ; base_lba desde entrada de partición en DI (SI original)
+    ; Si no hay partición (DI=0), usa LBA=1
     xor  eax, eax
-    mov  [BASE_LBA_ADDR], eax
     test di, di
-    jz   .base_done
-    mov  eax, [di + 8]
+    jz   .hdd_lba_set
+    mov  eax, [di + 8]           ; LBA de inicio de partición
     test eax, eax
-    jz   .base_done
-    mov  [BASE_LBA_ADDR], eax
-.base_done:
-
-    ; ══════════════════════════════════════════════════════════════════════
-    ; Detectar si stage2 ya está en RAM (arrancó desde CD con
-    ; boot-load-size=65). Comprobar el magic en 0x8000.
-    ; ══════════════════════════════════════════════════════════════════════
-    mov  eax, [0x8000]
-    cmp  eax, STAGE2_MAGIC
-    jne  .load_stage2
-
-    ; Stage2 ya en RAM → es CD. Limpiar base_lba y saltar.
+    jnz  .hdd_lba_set
     xor  eax, eax
-    mov  [BASE_LBA_ADDR], eax
-    mov  dl, [boot_drive_orig]
-    jmp  0x0000:0x8000
+.hdd_lba_set:
+    inc  eax                     ; stage2 en LBA 1 (siguiente sector)
 
-    ; ══════════════════════════════════════════════════════════════════════
-.load_stage2:
-    ; ── Path HDD/USB: leer stage2 del disco ───────────────────────────
-    mov  byte [drive_idx], 0
-
-.pick_drive:
-    mov  al, [drive_idx]
-    cmp  al, 0
-    je   .pick_orig
-    cmp  al, 2
-    jae  .use_chs
-    mov  dl, 0x80
-    cmp  dl, [boot_drive_orig]
-    je   .pick_next
-    jmp  .do_lba
-.pick_orig:
-    mov  dl, [boot_drive_orig]
-.do_lba:
-    mov  [boot_drive], dl
-
-    mov  eax, [BASE_LBA_ADDR]
-    inc  eax
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; .read_prep — Preparar DAP y leer stage2
+    ;
+    ; Entrada: eax = LBA de stage2 (sectores 512B)
+    ; ══════════════════════════════════════════════════════════════════════════
+.read_prep:
     mov  [dap_lba_lo],  eax
-    mov  dword [dap_lba_hi], 0
+    xor  eax, eax
+    mov  [dap_lba_hi],  eax
     mov  word [dap_segment], STAGE2_SEG
     mov  word [dap_offset],  0
+    mov  word [dap_count],   STAGE2_SECTORS
     mov  word [remaining],   STAGE2_SECTORS
 
+    ; ── .lba_blk — Lector LBA con reintentos ─────────────────────────────
 .lba_blk:
     mov  ax, [remaining]
     test ax, ax
@@ -163,9 +110,7 @@ start_real:                 ; offset 0x10 desde ORG = 0x7C10
     int  0x13
     pop  cx
     loop .lba_try
-.pick_next:
-    inc  byte [drive_idx]
-    jmp  .pick_drive
+    jmp  disk_error
 
 .lba_ok:
     mov  ax, [dap_count]
@@ -178,71 +123,25 @@ start_real:                 ; offset 0x10 desde ORG = 0x7C10
     sub  word [remaining], ax
     jmp  .lba_blk
 
-.use_chs:
-    mov  dl, [boot_drive_orig]
-    mov  [boot_drive], dl
-    mov  eax, [BASE_LBA_ADDR]
-    inc  eax
-    cmp  eax, 0x0000FFFF
-    ja   disk_error
-    mov  [current_lba], ax
-    mov  ax, STAGE2_SEG
-    mov  es, ax
-    xor  bx, bx
-    mov  cx, STAGE2_SECTORS
-.chs_loop:
-    push cx
-    mov  ax, [current_lba]
-    call lba_to_chs_hd
-    mov  cx, 3
-.chs_try:
-    push cx
-    mov  ah, 0x02
-    mov  al, 1
-    mov  dl, [boot_drive]
-    int  0x13
-    pop  cx
-    jnc  .chs_ok
-    push cx
-    xor  ah, ah
-    mov  dl, [boot_drive]
-    int  0x13
-    mov  ax, [current_lba]
-    call lba_to_chs_hd
-    pop  cx
-    loop .chs_try
-    jmp  disk_error
-.chs_ok:
-    mov  ax, es
-    add  ax, 0x20
-    mov  es, ax
-    xor  bx, bx
-    inc  word [current_lba]
-    pop  cx
-    loop .chs_loop
-
 .loaded:
     mov  dl, [boot_drive_orig]
     jmp  0x0000:0x8000
 
-lba_to_chs_hd:
-    push ax
-    push bx
-    xor  dx, dx
-    mov  bx, [spt]
-    div  bx
-    inc  dx
-    mov  cl, dl
-    xor  dx, dx
-    mov  bx, [heads]
-    div  bx
-    mov  dh, dl
-    mov  ch, al
-    shl  ah, 6
-    or   cl, ah
-    pop  bx
-    pop  ax
-    ret
+; ══════════════════════════════════════════════════════════════════════════════
+; .cd_fallback_copy — Copia stage2 de RAM (El Torito carga boot image a 0x7C00)
+;
+; El BIOS ya cargó la boot image completa en RAM a 0x7C00 (incluyendo stage2
+; en 0x7E00). Solo copiamos a 0x8000 donde stage2 espera estar por ORG.
+; ══════════════════════════════════════════════════════════════════════════════
+.cd_fallback_copy:
+    std                             ; DF=1 → backward (evita overlap)
+    mov  si, 0x7E00 + STAGE2_SECTORS * 512 - 2
+    mov  di, 0x8000 + STAGE2_SECTORS * 512 - 2
+    mov  cx, STAGE2_SECTORS * 512 / 2
+    rep  movsw
+    cld
+    mov  dl, [boot_drive_orig]
+    jmp  0x0000:0x8000
 
 disk_error:
     mov  ah, 0x0E
@@ -253,13 +152,9 @@ disk_error:
     hlt
 
 ; === Datos ===
-spt             dw 63
-heads           dw 255
 boot_drive_orig db 0x80
 boot_drive      db 0x80
-current_lba     dw 0
 remaining       dw 0
-drive_idx       db 0
 
 dap:
     db 0x10, 0x00

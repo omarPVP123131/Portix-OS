@@ -72,20 +72,24 @@ CANARY_ADDR      equ 0x7BF0
 CANARY_VAL       equ 0xDEAD
 
 ; ──────────────────────────────────────────────────────────────────────────────
-; BIT (Boot Information Table) — offsets correctos
+; BIT (Boot Information Table) — offsets VERIFICADOS contra ISO real
 ;
-; xorriso -boot-info-table parcha el boot image desde su byte 0.
-; El boot image se carga en 0x7C00, así que en RAM:
+; xorriso -boot-info-table parcha el boot image en bytes 8-23 (NO byte 0).
+; El boot image se carga en 0x7C00. Verificado empíricamente: xorriso 1.5.6
+; escribe BIT en bytes 8-23 del boot image, por tanto en RAM:
 ;
-;   0x7C00  bi_pvd    LBA del PVD en el CD       (u32 LE)
-;   0x7C04  bi_file   LBA absoluto del boot image (u32 LE, sectores 2048B)
-;   0x7C08  bi_length longitud del boot image     (u32 LE, bytes)
-;   0x7C0C  bi_csum   checksum del boot image     (u32 LE)
+;   0x7C08  bi_pvd    LBA del PVD en el CD       (u32 LE)
+;   0x7C0C  bi_file   LBA absoluto del boot image (u32 LE, sectores 2048B)
+;   0x7C10  bi_length longitud del boot image     (u32 LE, bytes)
+;   0x7C14  bi_csum   checksum del boot image     (u32 LE)
+;
+; IMPORTANTE: v9.10 "fix" cambió estos valores a 0x7C00/0x7C04/0x7C08/0x7C0C,
+; pero eso fue INCORRECTO. El BIT REAL está en bytes 8-23 (0x7C08-0x7C17).
 ; ──────────────────────────────────────────────────────────────────────────────
-BIT_PVD_LBA   equ 0x7C00   ; bi_pvd   (antes: 0x7C08 — INCORRECTO)
-BIT_BOOT_LBA  equ 0x7C04   ; bi_file  (antes: 0x7C0C — INCORRECTO)
-BIT_IMAGE_LEN equ 0x7C08   ; bi_length(antes: 0x7C10 — INCORRECTO)
-BIT_CHECKSUM  equ 0x7C0C   ; bi_csum  (antes: 0x7C14 — INCORRECTO)
+BIT_PVD_LBA   equ 0x7C08   ; bi_pvd
+BIT_BOOT_LBA  equ 0x7C0C   ; bi_file  (LBA del boot image en CD)
+BIT_IMAGE_LEN equ 0x7C10   ; bi_length
+BIT_CHECKSUM  equ 0x7C14   ; bi_csum
 
 BINFO_BASE    equ 0x9000
 BINFO_E820CNT equ BINFO_BASE + 0x00
@@ -177,6 +181,8 @@ start2:
     call print
 
     call detect_cdrom_bit
+    mov  al, 'A'
+    call print_char
     call check_long_mode
     call enable_a20
     call probe_e820
@@ -185,6 +191,8 @@ start2:
     jmp  error_disk
 
 .kernel_loaded:
+    mov  al, 'B'
+    call print_char
     mov  si, msg_kernel_ok
     call print
 
@@ -193,6 +201,8 @@ start2:
     mov  si, msg_kern_warn
     call print
 .kernel_ok:
+    mov  al, 'C'
+    call print_char
 
     cmp  word [CANARY_ADDR], CANARY_VAL
     je   .canary_ok
@@ -201,7 +211,10 @@ start2:
 .canary_ok:
 
     call setup_vesa
+    call pci_fallback_fb
     call setup_paging
+    mov  al, 'G'
+    call print_char
 
     mov  al, 0x02
     mov  dx, 0x3F6
@@ -212,23 +225,26 @@ start2:
     out  0x80, al
 
     call remap_pic
+    mov  al, 'H'
+    call print_char
     call enter_long_mode
     cli
     hlt
 
 ; ══════════════════════════════════════════════════════════════════════════════
-; detect_cdrom_bit  [FIX-BIT-OFFSETS]
+; detect_cdrom_bit
 ;
-; Lee [BIT_BOOT_LBA] = [0x7C04] = bi_file.
+; Lee [BIT_BOOT_LBA] = [0x7C0C] = bi_file (LBA absoluto del boot image).
 ;
-; bi_file es el LBA absoluto del boot image en el CD en sectores de 2048B.
-; xorriso lo parcha cuando se usa -boot-info-table.
-; Si bi_file != 0 → estamos arrancando desde CD no-emul con BIT parchado.
+; xorriso -boot-info-table escribe bi_file en byte 12 del boot image
+; (= RAM 0x7C0C). Si != 0 → CD no-emul con BIT parchado.
 ;
-; IMPORTANTE: antes (v9.9) se leía [0x7C0C] = bi_csum, que es la suma de
-; comprobación del boot image. bi_csum casi siempre es != 0, así que
-; bit_valid quedaba en 1 con un valor basura, y el LBA del kernel resultante
-; apuntaba a basura → pantalla negra en todos los entornos ISO.
+; NOTA HISTÓRICA:
+;   v9.9 leía [0x7C0C] = bi_csum (checksum) por error → siempre != 0,
+;   bit_valid=1 con LBA basura → kernel cargado de posición incorrecta.
+;   v9.10 "fix" cambió BIT_BOOT_LBA a 0x7C04 pero eso también era
+;   incorrecto (leyó padding). v9.13 finalmente usa 0x7C0C que es
+;   donde xorriso realmente escribe bi_file.
 ; ══════════════════════════════════════════════════════════════════════════════
 detect_cdrom_bit:
     push ax
@@ -503,6 +519,8 @@ setup_vesa:
     mov  [BINFO_PITCH],  ax
     mov  byte [BINFO_BPP], 0
     mov  word [BINFO_FLAGS], 0
+    mov  al, 'D'
+    call print_char
     ret
 
 .activate:
@@ -826,6 +844,131 @@ try_vesa_mode:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════════════
+; pci_fallback_fb
+;
+; Fallback cuando VESA no encuentra framebuffer.
+; Escanea PCI (I/O ports 0xCF8/0xCFC) buscando controlador VGA (class 0x0300),
+; luego itera los 6 BARs (0x10..0x24) para hallar el primer MMIO BAR.
+; En VirtualBox el framebuffer está en BAR2 (BAR0 es I/O, BAR1 es VBE I/O).
+; Configura BINFO con defaults 1024x768x32.
+; Solo modifica BINFO si BINFO_LFB == 0.
+; ══════════════════════════════════════════════════════════════════════════════
+pci_fallback_fb:
+    cmp  dword [BINFO_LFB], 0
+    jne  .done
+
+    pusha
+    mov  al, 'E'
+    call print_char
+
+    mov  byte [pci_bus], 0
+.bus_loop:
+    mov  byte [pci_dev], 0
+.dev_loop:
+    xor  ax, ax
+    mov  al, [pci_bus]
+    mov  cl, [pci_dev]
+    xor  ch, ch
+    xor  dl, dl
+    call pci_read32
+    mov  bx, ax
+    cmp  bx, 0xFFFF
+    je   .next_dev
+
+    mov  al, [pci_bus]
+    mov  cl, [pci_dev]
+    xor  ch, ch
+    mov  dl, 8
+    call pci_read32
+    shr  eax, 16
+    cmp  ax, 0x0300
+    jne  .next_dev
+
+    ; Found VGA controller — scan BARs 0-5 (offsets 0x10..0x24)
+    mov  byte [pci_bar], 0x10
+.bar_loop:
+    mov  al, [pci_bus]
+    mov  cl, [pci_dev]
+    xor  ch, ch
+    mov  dl, [pci_bar]
+    call pci_read32
+    test al, 1           ; bit 0 = 1 → I/O BAR, skip
+    jnz  .next_bar
+    and  eax, 0xFFFFFFF0
+    jz   .next_bar       ; zero address, skip
+
+    ; Valid MMIO BAR found
+    mov  [BINFO_LFB], eax
+    mov  al, 'F'
+    call print_char
+    mov  word [BINFO_WIDTH], 1024
+    mov  word [BINFO_HEIGHT], 768
+    mov  word [BINFO_PITCH], 4096
+    mov  byte [BINFO_BPP], 32
+    mov  word [BINFO_FLAGS], 2
+
+    popa
+    ret
+
+.next_bar:
+    add  byte [pci_bar], 4
+    cmp  byte [pci_bar], 0x24
+    jbe  .bar_loop
+
+.next_dev:
+    inc  byte [pci_dev]
+    cmp  byte [pci_dev], 32
+    jb   .dev_loop
+.next_bus:
+    inc  byte [pci_bus]
+    cmp  byte [pci_bus], 2
+    jb   .bus_loop
+
+    popa
+.done:
+    ret
+
+; ── pci_read32 ──
+; Lee un DWORD del espacio de configuración PCI (I/O 0xCF8/0xCFC).
+; Input:  al = bus, cl = device, ch = function, dl = register
+; Output: eax = valor 32-bit
+pci_read32:
+    push bx
+    push cx
+
+    xor  ebx, ebx
+    mov  bl, al
+    shl  ebx, 16
+
+    xor  eax, eax
+    mov  al, cl
+    shl  eax, 11
+    or   ebx, eax
+
+    xor  eax, eax
+    mov  al, ch
+    shl  eax, 8
+    or   ebx, eax
+
+    xor  eax, eax
+    mov  al, dl
+    and  al, 0xFC
+    or   ebx, eax
+
+    or   ebx, 0x80000000
+
+    mov  dx, 0xCF8
+    mov  eax, ebx
+    out  dx, eax
+
+    mov  dx, 0xCFC
+    in   eax, dx
+
+    pop  cx
+    pop  bx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════════════
 ; do_cdrom_load
 ;
 ; Calcula el LBA del kernel en el CD.
@@ -1119,6 +1262,16 @@ print:
     popa
     ret
 
+; ── print_char ──
+; Imprime un carácter en AL (AH=0x0E, INT 0x10)
+print_char:
+    pusha
+    mov  ah, 0x0E
+    mov  bh, 0
+    int  0x10
+    popa
+    ret
+
 print_err_code:
     pusha
     mov  si, str_0x
@@ -1182,6 +1335,9 @@ disk_err_code   db 0
 vesa_mode       dw 0
 spt             dw 63
 heads           dw 255
+pci_bus         db 0
+pci_dev         db 0
+pci_bar         db 0
 
 align 4
 dap:
@@ -1249,6 +1405,13 @@ long_mode_entry:
 
     call build_bootinfo
 
+    ; Red pixel on LFB to confirm kernel entry
+    mov  edi, [dword BINFO_LFB]
+    test edi, edi
+    jz   .no_lfb
+    mov  dword [edi], 0x00FF0000
+.no_lfb:
+
     mov  rdi, BOOTINFO_BASE
     mov  rax, KERNEL_PHYS_ADDR
     jmp  rax
@@ -1309,6 +1472,10 @@ build_bootinfo:
     movzx eax, byte [BINFO_BPP]
     mov  [BOOTINFO_BASE + 0x6C], eax
     mov  dword [BOOTINFO_BASE + 0x70], 1
+    test word [BINFO_FLAGS], 2
+    jz   .fb_src_done
+    mov  dword [BOOTINFO_BASE + 0x70], 2
+.fb_src_done:
     mov  dword [BOOTINFO_BASE + 0x74], 1
     cmp  eax, 16
     jne  .fb_not_565

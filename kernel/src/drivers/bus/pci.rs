@@ -128,8 +128,9 @@ unsafe fn pci_read_bar_base(bus: u8, dev: u8, func: u8, reg: u8) -> u64 {
 
 /// Escanea PCI buscando un controlador VGA (class=0x03, subclass=0x00)
 /// y devuelve la dirección física del framebuffer.
-/// Soporta: Bochs VGA (BAR0), virtio-vga (BAR1), QXL, VMware SVGA.
-/// Usado como fallback cuando GOP/UEFI no provee framebuffer.
+/// Itera los 6 BARs (0x10..0x24) para hallar el primer MMIO.
+/// VirtualBox tiene el framebuffer en BAR2 (BAR0/BAR1 son I/O).
+/// Usado como fallback cuando VESA/legacy no provee framebuffer.
 pub fn pci_find_vga_framebuffer() -> u64 {
     unsafe {
         for b in 0u8..=255u8 {
@@ -146,24 +147,11 @@ pub fn pci_find_vga_framebuffer() -> u64 {
                     if (cls >> 24) as u8 != 0x03 || ((cls >> 16) & 0xFF) as u8 != 0x00 {
                         continue;
                     }
-                    // VGA controller found — select framebuffer BAR por vendor
-                    let fb_addr = match vendor {
-                        0x1AF4 => {
-                            // virtio-vga / QXL: BAR1 = framebuffer, BAR0 = legacy I/O
-                            let a = pci_read_bar_base(b, d, f, 0x14);
-                            if a != 0 { a } else { pci_read_bar_base(b, d, f, 0x10) }
-                        }
-                        0x15AD | 0x80EE => {
-                            // VMware SVGA, VirtualBox: BAR0 = framebuffer
-                            pci_read_bar_base(b, d, f, 0x10)
-                        }
-                        _ => {
-                            // Bochs VGA / default: BAR0, fallback BAR1
-                            let a = pci_read_bar_base(b, d, f, 0x10);
-                            if a != 0 { a } else { pci_read_bar_base(b, d, f, 0x14) }
-                        }
-                    };
-                    if fb_addr != 0 { return fb_addr; }
+                    // VGA controller found — scan all 6 BARs for first MMIO
+                    for reg in (0x10u8..=0x24u8).step_by(4) {
+                        let a = pci_read_bar_base(b, d, f, reg);
+                        if a != 0 { return a; }
+                    }
                 }
             }
         }

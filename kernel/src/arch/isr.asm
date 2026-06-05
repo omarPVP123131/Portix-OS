@@ -107,7 +107,7 @@ global reload_segments
     mov     [crash_frame + 136], r15
 
     ; Marcar como válido
-    mov     byte [crash_frame + 144], 1
+    mov     byte [crash_frame + 152], 1
 
     pop     rdx
     pop     rcx
@@ -214,7 +214,7 @@ ISR_NOERR  4, isr_generic_handler
 ISR_NOERR  5, isr_bound_range
 ISR_NOERR  6, isr_ud_handler
 ISR_NOERR  7, isr_generic_handler
-ISR_NOERR  8, isr_double_fault      ; #DF error code siempre 0, tratado como NOERR
+ISR_ERR  8, isr_double_fault        ; #DF error code siempre 0
 ISR_ERR   10, isr_generic_handler   ; #TS
 ISR_ERR   11, isr_generic_handler   ; #NP
 ISR_ERR   12, isr_generic_handler   ; #SS

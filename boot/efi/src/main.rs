@@ -335,7 +335,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
     // Estrategia: LocateHandleBuffer encuentra TODOS los handles GOP,
     //             fallback a ConsoleOutHandle si no se encuentra ninguno.
     let locate_hb_gop: FnLocateHandleBuffer = bs_call(bs, 312);
-    let open_proto_gop: FnOpenProto = bs_call(bs, 280);
+    let open_proto_gop: FnOpenProto = bs_call(bs, 288);
     let free_pool_gop: FnFreePool = bs_call(bs, 72);
 
     let mut candidates: [EfiHandle; 8] = [core::ptr::null_mut(); 8];
@@ -367,7 +367,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
             image, core::ptr::null_mut(), 0x02) == EFI_SUCCESS && !gop_iface.is_null()
         {
             let mode_ptr = unsafe {
-                core::ptr::read_unaligned((gop_iface as *const u8).add(8) as *const *mut u8)
+                core::ptr::read_unaligned((gop_iface as *const u8).add(24) as *const *mut u8)
             };
             if !mode_ptr.is_null() {
                 fb_base = unsafe { core::ptr::read_unaligned(mode_ptr.add(24) as *const u64) };
@@ -378,7 +378,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
                 if !info_ptr.is_null() {
                     fb_width = unsafe { core::ptr::read_unaligned(info_ptr.add(4) as *const u32) };
                     fb_height = unsafe { core::ptr::read_unaligned(info_ptr.add(8) as *const u32) };
-                    let ppsl = unsafe { core::ptr::read_unaligned(info_ptr.add(32) as *const u32) };
+                    let ppsl = unsafe { core::ptr::read_unaligned(info_ptr.add(16) as *const u32) };
                     fb_pitch = ppsl * 4;
                     let pix_fmt = unsafe { core::ptr::read_unaligned(info_ptr.add(12) as *const u32) };
                     fb_fmt = match pix_fmt {
@@ -518,7 +518,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
         data1: 0x964E5B21, data2: 0x6459, data3: 0x11D2,
         data4: [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
     };
-    let open_proto: FnOpenProto = bs_call(bs, 280);
+    let open_proto: FnOpenProto = bs_call(bs, 288);
     let allocate_pool: FnAllocPool = bs_call(bs, 64);
     let free_pool: FnFreePool = bs_call(bs, 72);
     let allocate_pages: FnAllocPages = bs_call(bs, 40);
@@ -845,7 +845,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
     unsafe { serial_puts(b"EFI:exit_bs\n"); }
 
     // ── 6. Exit boot services ───────────────────────────────────────────
-    let exit_bs: FnExitBS = bs_call(bs, 232);
+    let exit_bs: FnExitBS = bs_call(bs, 240);
     if exit_bs(image, mmap_key) != EFI_SUCCESS {
         // Retry: get key again
         let mut retry_key: usize = 0;

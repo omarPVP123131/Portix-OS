@@ -731,7 +731,17 @@ if f.valid == 0 {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[no_mangle]
-extern "C" fn isr_double_fault() {
+extern "C" fn isr_double_fault(_ec: u64) {
+    let f = frame();
+    if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #DF  DOUBLE FAULT  |  Sistema detenido             ",
+                b"  (crash_frame.valid=0 - framebuffer no disponible). EC=0.",
+            );
+        }
+        halt_loop()
+    }
     unsafe {
         let v = 0xB8000usize as *mut u16;
         for i in 0..160usize { core::ptr::write_volatile(v.add(i), 0x4F20); }

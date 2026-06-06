@@ -66,11 +66,12 @@
 #![allow(dead_code)]
 
 use core::fmt;
+use crate::drivers::storage::traits::BlockDevice;
 
 // ── Puertos ATA ────────────────────────────────────────────────────────────────
 
 /// Offsets desde la base del canal
-mod reg {
+pub(crate) mod reg {
     pub const DATA:       u16 = 0;
     pub const ERROR:      u16 = 1;
     pub const FEATURES:   u16 = 1;
@@ -97,7 +98,7 @@ mod dctl {
     pub const HOB:   u8 = 1 << 7;
 }
 
-mod cmd {
+pub(crate) mod cmd {
     pub const READ_PIO:        u8 = 0x20;
     pub const READ_PIO_EXT:    u8 = 0x24;
     pub const WRITE_PIO:       u8 = 0x30;
@@ -106,6 +107,7 @@ mod cmd {
     pub const CACHE_FLUSH_EXT: u8 = 0xEA;
     pub const IDENTIFY:        u8 = 0xEC;
     pub const IDENTIFY_PACKET: u8 = 0xA1;
+    pub const PACKET:          u8 = 0xA0;
 }
 
 // ── Tipos públicos ─────────────────────────────────────────────────────────────
@@ -190,65 +192,65 @@ pub type AtaResult<T> = Result<T, AtaError>;
 
 // ── Canal ATA (privado) ────────────────────────────────────────────────────────
 
-struct Channel {
-    base:    u16,
-    control: u16,
+pub(crate) struct Channel {
+    pub(crate) base:    u16,
+    pub(crate) control: u16,
 }
 
 impl Channel {
-    const fn primary()   -> Self { Channel { base: 0x1F0, control: 0x3F6 } }
-    const fn secondary() -> Self { Channel { base: 0x170, control: 0x376 } }
+    pub(crate) const fn primary()   -> Self { Channel { base: 0x1F0, control: 0x3F6 } }
+    pub(crate) const fn secondary() -> Self { Channel { base: 0x170, control: 0x376 } }
 
-    #[inline] unsafe fn inb(&self, r: u16) -> u8 {
+    #[inline] pub(crate) unsafe fn inb(&self, r: u16) -> u8 {
         let v: u8;
         core::arch::asm!("in al, dx",
             out("al") v, in("dx") self.base + r,
             options(nostack, nomem));
         v
     }
-    #[inline] unsafe fn outb(&self, r: u16, v: u8) {
+    #[inline] pub(crate) unsafe fn outb(&self, r: u16, v: u8) {
         core::arch::asm!("out dx, al",
             in("dx") self.base + r, in("al") v,
             options(nostack, nomem));
     }
-    #[inline] unsafe fn inw(&self) -> u16 {
+    #[inline] pub(crate) unsafe fn inw(&self) -> u16 {
         let v: u16;
         core::arch::asm!("in ax, dx",
             out("ax") v, in("dx") self.base + reg::DATA,
             options(nostack, nomem));
         v
     }
-    #[inline] unsafe fn outw(&self, v: u16) {
+    #[inline] pub(crate) unsafe fn outw(&self, v: u16) {
         core::arch::asm!("out dx, ax",
             in("dx") self.base + reg::DATA, in("ax") v,
             options(nostack, nomem));
     }
-    #[inline] unsafe fn ctrl_inb(&self) -> u8 {
+    #[inline] pub(crate) unsafe fn ctrl_inb(&self) -> u8 {
         let v: u8;
         core::arch::asm!("in al, dx",
             out("al") v, in("dx") self.control,
             options(nostack, nomem));
         v
     }
-    #[inline] unsafe fn ctrl_outb(&self, v: u8) {
+    #[inline] pub(crate) unsafe fn ctrl_outb(&self, v: u8) {
         core::arch::asm!("out dx, al",
             in("dx") self.control, in("al") v,
             options(nostack, nomem));
     }
 
     /// 400 ns de espera (4× lectura del registro de control alternativo).
-    #[inline] unsafe fn delay400ns(&self) {
+    #[inline] pub(crate) unsafe fn delay400ns(&self) {
         for _ in 0..4 { let _ = self.ctrl_inb(); }
     }
 
     /// Pausa mínima entre palabras en escritura PIO (≈ "jmp $+2").
-    #[inline] unsafe fn tiny_pause(&self) {
+    #[inline] pub(crate) unsafe fn tiny_pause(&self) {
         let _ = self.ctrl_inb();
     }
 
     /// Realiza un soft-reset del canal y desactiva las IRQs (nIEN).
     /// ⚠️  COSTOSO — solo debe llamarse durante AtaBus::scan() en el arranque.
-    unsafe fn reset_and_init(&self) {
+    pub(crate) unsafe fn reset_and_init(&self) {
         self.ctrl_outb(dctl::NIEN | dctl::SRST);
         for _ in 0..25 { let _ = self.ctrl_inb(); }
         self.ctrl_outb(dctl::NIEN);
@@ -257,7 +259,7 @@ impl Channel {
         }
     }
 
-    unsafe fn wait_not_busy(&self) -> AtaResult<u8> {
+    pub(crate) unsafe fn wait_not_busy(&self) -> AtaResult<u8> {
         for _ in 0..100_000u32 {
             let st = self.ctrl_inb();
             if st & status::BSY == 0 {
@@ -267,7 +269,7 @@ impl Channel {
         Err(AtaError::Timeout)
     }
 
-    unsafe fn wait_ready(&self) -> AtaResult<()> {
+    pub(crate) unsafe fn wait_ready(&self) -> AtaResult<()> {
         for _ in 0..100_000u32 {
             let st = self.ctrl_inb();
             if st & status::BSY == 0 && st & status::RDY != 0 {
@@ -278,7 +280,7 @@ impl Channel {
         Err(AtaError::Timeout)
     }
 
-    unsafe fn wait_drq(&self) -> AtaResult<()> {
+    pub(crate) unsafe fn wait_drq(&self) -> AtaResult<()> {
         for _ in 0..100_000u32 {
             let st = self.ctrl_inb();
             if st & status::BSY != 0 { continue; }
@@ -298,7 +300,7 @@ impl Channel {
         Err(AtaError::Timeout)
     }
 
-    unsafe fn select_drive(&self, head_val: u8) -> AtaResult<()> {
+    pub(crate) unsafe fn select_drive(&self, head_val: u8) -> AtaResult<()> {
         self.wait_not_busy()?;
         self.outb(reg::DRIVE_HEAD, head_val);
         self.delay400ns();
@@ -350,18 +352,13 @@ impl AtaDrive {
     /// Crea un handle de E/S desde un DriveInfo ya conocido, sin re-escanear el bus.
     /// ✅ NO llama reset_and_init() — seguro de usar en cualquier momento.
     pub fn from_info(info: DriveInfo) -> Self {
-        let (chan, is_slave) = match info.id {
-            DriveId::Primary0   => (&PRIMARY,   false),
-            DriveId::Primary1   => (&PRIMARY,   true),
-            DriveId::Secondary0 => (&SECONDARY, false),
-            DriveId::Secondary1 => (&SECONDARY, true),
-        };
+        let (chan, is_slave) = resolve_channel(info.id);
         AtaDrive { info, chan, is_slave }
     }
 
     pub fn info(&self) -> &DriveInfo { &self.info }
 
-    pub fn read_sectors(&self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
+    pub fn read_sectors(&mut self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
         self.check(lba, count, buf.len())?;
         if count == 0 { return Ok(()); }
         if self.info.lba48 || lba >= (1 << 28) {
@@ -371,7 +368,7 @@ impl AtaDrive {
         }
     }
 
-    pub fn write_sectors(&self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
+    pub fn write_sectors(&mut self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
         self.check(lba, count, buf.len())?;
         if count == 0 { return Ok(()); }
         if self.info.lba48 || lba >= (1 << 28) {
@@ -381,7 +378,7 @@ impl AtaDrive {
         }
     }
 
-    pub fn flush(&self) -> AtaResult<()> {
+    pub fn flush(&mut self) -> AtaResult<()> {
         unsafe {
             let c = self.chan;
             let head = if self.is_slave { 0xB0u8 } else { 0xA0u8 };
@@ -389,12 +386,18 @@ impl AtaDrive {
             c.outb(reg::FEATURES, 0);
             c.outb(reg::COMMAND,
                 if self.info.lba48 { cmd::CACHE_FLUSH_EXT } else { cmd::CACHE_FLUSH });
-            let _ = c.wait_not_busy();
+            let st = c.wait_not_busy()?;
+            if st & status::DF != 0 {
+                return Err(AtaError::DriveFault);
+            }
+            if st & status::ERR != 0 {
+                return Err(AtaError::DeviceError(c.inb(reg::ERROR)));
+            }
             Ok(())
         }
     }
 
-    unsafe fn read28(&self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
+    unsafe fn read28(&mut self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
         let c = self.chan;
         let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
@@ -413,7 +416,7 @@ impl AtaDrive {
         Ok(())
     }
 
-    unsafe fn write28(&self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
+    unsafe fn write28(&mut self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
         let c = self.chan;
         let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
@@ -432,7 +435,7 @@ impl AtaDrive {
         Ok(())
     }
 
-    unsafe fn read48(&self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
+    unsafe fn read48(&mut self, lba: u64, count: usize, buf: &mut [u8]) -> AtaResult<()> {
         let c = self.chan;
         let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
@@ -456,7 +459,7 @@ impl AtaDrive {
         Ok(())
     }
 
-    unsafe fn write48(&self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
+    unsafe fn write48(&mut self, lba: u64, count: usize, buf: &[u8]) -> AtaResult<()> {
         let c = self.chan;
         let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
@@ -509,10 +512,41 @@ impl AtaDrive {
     }
 }
 
+impl BlockDevice for AtaDrive {
+    fn read_sectors(&mut self, lba: u64, count: usize, buf: &mut [u8]) -> Result<(), AtaError> {
+        self.read_sectors(lba, count, buf)
+    }
+
+    fn write_sectors(&mut self, lba: u64, count: usize, buf: &[u8]) -> Result<(), AtaError> {
+        self.write_sectors(lba, count, buf)
+    }
+
+    fn flush_cache(&mut self) -> Result<(), AtaError> {
+        self.flush()
+    }
+
+    fn total_sectors(&self) -> u64 {
+        self.info.total_sectors
+    }
+
+    fn device_info(&self) -> DriveInfo {
+        self.info
+    }
+}
+
 // ── Bus ────────────────────────────────────────────────────────────────────────
 
-static PRIMARY:   Channel = Channel::primary();
-static SECONDARY: Channel = Channel::secondary();
+pub(crate) fn resolve_channel(id: DriveId) -> (&'static Channel, bool) {
+    match id {
+        DriveId::Primary0   => (&PRIMARY,   false),
+        DriveId::Primary1   => (&PRIMARY,   true),
+        DriveId::Secondary0 => (&SECONDARY, false),
+        DriveId::Secondary1 => (&SECONDARY, true),
+    }
+}
+
+pub(crate) static PRIMARY:   Channel = Channel::primary();
+pub(crate) static SECONDARY: Channel = Channel::secondary();
 
 pub struct AtaBus {
     drives: [Option<DriveInfo>; 4],

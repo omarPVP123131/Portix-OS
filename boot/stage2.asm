@@ -1,4 +1,4 @@
-; boot/stage2.asm — PORTIX Stage-2 v9.10
+; boot/stage2.asm — PORTIX Stage-2 v9.11
 ; nasm -f bin -DKERNEL_SECTORS=N [-DKERNEL_LBA=N] stage2.asm -o stage2.bin
 ;
 ; ══════════════════════════════════════════════════════════════════════════════
@@ -172,10 +172,22 @@ start2:
     mov  sp, STACK_TOP
     sti
 
+    ; Debug: '0' = stage2 entered
+    mov  ah, 0x0E
+    mov  al, '0'
+    xor  bx, bx
+    int  0x10
+
     mov  word [CANARY_ADDR], CANARY_VAL
 
     mov  eax, [BASE_LBA_ADDR]
     mov  [base_lba], eax
+
+    ; Debug: '1' = about to print title
+    mov  ah, 0x0E
+    mov  al, '1'
+    xor  bx, bx
+    int  0x10
 
     mov  si, msg_stage2
     call print
@@ -183,9 +195,25 @@ start2:
     call detect_cdrom_bit
     mov  al, 'A'
     call print_char
+
+    ; Debug: 'L' = about to check long mode
+    mov  al, 'L'
+    call print_char
     call check_long_mode
+    ; Debug: 'M' = long mode OK
+    mov  al, 'M'
+    call print_char
     call enable_a20
+    ; Debug: 'N' = A20 done
+    mov  al, 'N'
+    call print_char
     call probe_e820
+    ; Debug: 'O' = E820 done
+    mov  al, 'O'
+    call print_char
+    ; Debug: 'P' = about to load kernel
+    mov  al, 'P'
+    call print_char
     call load_kernel
     jnc  .kernel_loaded
     jmp  error_disk
@@ -211,6 +239,9 @@ start2:
 .canary_ok:
 
     call setup_vesa
+    ; Debug: 'Q' = VESA done (may display 'D' if failed)
+    mov  al, 'Q'
+    call print_char
     call pci_fallback_fb
     call setup_paging
     mov  al, 'G'
@@ -1308,7 +1339,7 @@ error_disk:
 ; ══════════════════════════════════════════════════════════════════════════════
 ; DATOS
 ; ══════════════════════════════════════════════════════════════════════════════
-msg_stage2       db "S2 v9.10 OK", 13, 10, 0
+msg_stage2       db "S2 v9.11 OK", 13, 10, 0
 msg_kernel_ok    db "Kernel OK", 13, 10, 0
 msg_err_disk     db "DISK ERR ", 0
 msg_a20_warn     db "A20 WARN", 13, 10, 0

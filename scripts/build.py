@@ -58,6 +58,9 @@ KERNELBIN  = BUILD / "kernel.bin"
 ISROBJ     = BUILD / "isr.o"
 EFIBIN     = BUILD / "BOOTX64.EFI"
 
+PERSISTENT_DISK = BUILD / "portix-persistent.img"
+PERSISTENT_MB   = 8192
+
 # ── Imágenes de distribución ──────────────────────────────────────────────────
 # [FIX-SINGLE-ISO] Una sola ISO dual BIOS+UEFI
 ISO_IMG      = DIST / "portix.iso"          # ISO dual BIOS+UEFI (TODOS los entornos)
@@ -360,8 +363,16 @@ def reset_logs():
 
 def clean():
     step("LIMPIANDO")
+    persist_data = None
+    if arg_val("--persistence") is not None and PERSISTENT_DISK.exists():
+        persist_data = PERSISTENT_DISK.read_bytes()
+        log(f"  Persistiendo {PERSISTENT_DISK.name} ({len(persist_data)//1048576} MB)")
     for d in [BUILD,DIST]:
         if d.exists(): shutil.rmtree(d)
+    if persist_data is not None:
+        BUILD.mkdir(parents=True, exist_ok=True)
+        PERSISTENT_DISK.write_bytes(persist_data)
+        log(f"[OK]    {PERSISTENT_DISK.name} restaurado")
     log("[OK] Limpieza completa")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -684,23 +695,28 @@ def run_qemu():
     step(f"EJECUTANDO QEMU (modo: {mode})")
     vga_type = arg_val("--vga") or "std"
     base = ["-cpu","max","-m","256M","-vga",vga_type,"-serial","stdio",
-            "-no-reboot","-no-shutdown","-d","int,guest_errors","-D",str(DEBUG_LOG)]
+            "-no-reboot","-d","int,guest_errors","-D",str(DEBUG_LOG)]
+
+    persist_drive = []
+    if arg_val("--persistence") is not None and PERSISTENT_DISK.exists():
+        persist_drive = ["-drive", f"format=raw,file={PERSISTENT_DISK},if=ide,index=1,media=disk"]
+        log(f"  Disco persistente: {PERSISTENT_DISK} ({PERSISTENT_DISK.stat().st_size // 1048576} MB)")
 
     def raw():
         subprocess.run(["qemu-system-x86_64",
             "-drive", f"format=raw,file={DISK_IMG},if=ide,index=0,media=disk"
-        ] + base)
+        ] + persist_drive + base)
 
     def iso():
         tgt = ISO_IMG if ISO_IMG.exists() else DISK_IMG
         if _ISO_MODE == "cdrom":
             subprocess.run(["qemu-system-x86_64",
                 "-drive", f"format=raw,file={tgt},media=cdrom", "-boot","order=d"
-            ] + base)
+            ] + persist_drive + base)
         else:
             subprocess.run(["qemu-system-x86_64",
                 "-drive", f"format=raw,file={tgt},if=ide,index=0,media=disk"
-            ] + base)
+            ] + persist_drive + base)
 
     def iso_uefi():
         """QEMU con OVMF usando portix.iso (entrada EFI embebida)."""
@@ -714,14 +730,14 @@ def run_qemu():
             "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
             "-drive", f"format=raw,file={tgt},media=cdrom",
             "-boot",  "order=d",
-        ])
+        ] + persist_drive)
 
     def vsim():
         if not VSIM_IMG.exists(): create_ventoy_sim()
         if not VSIM_IMG.exists(): log("[ERROR] No ventoy-sim.img"); return
         subprocess.run(["qemu-system-x86_64",
             "-drive", f"format=raw,file={VSIM_IMG},if=ide,index=0,media=disk"
-        ] + base)
+        ] + persist_drive + base)
 
     def uefi():
         """QEMU con OVMF usando portix-uefi.img (disco GPT+ESP)."""
@@ -736,14 +752,14 @@ def run_qemu():
         subprocess.run(["qemu-system-x86_64"] + base + [
             "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
             "-drive", f"format=raw,file={tgt},if=ide,index=0,media=disk",
-        ])
+        ] + persist_drive)
 
     def dual():
         tgt = DUAL_IMG if DUAL_IMG.exists() else DISK_IMG
         log(f"  Modo dual: arrancando imagen BIOS ({tgt.name})")
         subprocess.run(["qemu-system-x86_64",
             "-drive", f"format=raw,file={tgt},if=ide,index=0,media=disk"
-        ] + base)
+        ] + persist_drive + base)
 
     dispatch = {
         "iso":        iso,
@@ -834,8 +850,13 @@ def main():
     check_tools()
 
     assemble_boot()
+    # Two-pass stage2: placeholder first, then real KERNEL_SECTORS after kernel is built.
+    # This resolves the circular dependency: stage2.bin needs KERNEL_SECTORS, but the
+    # kernel (which embeds stage2.bin via include_bytes!) determines KERNEL_SECTORS.
+    assemble_stage2(1)
     ks = build_kernel()
     assemble_stage2(ks)
+    ks = build_kernel()
     create_raw(ks)
 
     build_efi_loader()
@@ -855,6 +876,16 @@ def main():
         log("[SKIP] VDI/VMDK omitidos (--no-vm)")
 
     create_ventoy_sim()
+
+    if arg_val("--persistence") is not None and not PERSISTENT_DISK.exists():
+        step("CREANDO DISCO PERSISTENTE")
+        raw = arg_val("--persistence")
+        mb = int(raw) if raw is not None and raw.isdigit() else PERSISTENT_MB
+        PERSISTENT_DISK.parent.mkdir(parents=True, exist_ok=True)
+        size = mb * 1024 * 1024
+        PERSISTENT_DISK.write_bytes(b'\x00' * size)
+        log(f"[OK]    {PERSISTENT_DISK.name} — {mb} MB")
+
     summary()
 
     if not arg("--no-run"):

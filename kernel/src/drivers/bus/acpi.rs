@@ -16,13 +16,31 @@ unsafe fn inb(p: u16) -> u8 {
     v
 }
 
-/// Power off the machine.
-/// Tries QEMU → Bochs → VirtualBox in sequence.
-pub fn poweroff() -> ! {
+#[inline(always)]
+unsafe fn io_wait() {
+    outb(0x80, 0);
+}
+
+fn sync_disks() {
+    crate::drivers::storage::registry::flush_all();
     unsafe {
-        outw(0x604,  0x2000); // QEMU ≥ 2.x  ACPI PM1a
-        outw(0xB004, 0x2000); // Bochs / old QEMU
+        for _ in 0..16 {
+            io_wait();
+        }
+    }
+}
+
+/// Power off the machine.
+/// Tries VirtualBox → QEMU → Bochs in sequence.
+pub fn poweroff() -> ! {
+    sync_disks();
+    unsafe {
         outw(0x4004, 0x3400); // VirtualBox
+        for _ in 0..16 { io_wait(); }
+        outw(0x604,  0x2000); // QEMU ≥ 2.x  ACPI PM1a
+        for _ in 0..16 { io_wait(); }
+        outw(0xB004, 0x2000); // Bochs / old QEMU
+        for _ in 0..16 { io_wait(); }
         // Last resort: triple-fault via null IDT
         core::arch::asm!(
             "cli",
@@ -39,11 +57,15 @@ pub fn poweroff() -> ! {
 
 /// Reboot via keyboard controller pulse.
 pub fn reboot() -> ! {
+    sync_disks();
     unsafe {
+        core::arch::asm!("cli", options(nostack, nomem));
         // Drain the KBC input buffer
         let mut limit = 100_000u32;
         while inb(0x64) & 0x02 != 0 && limit > 0 { limit -= 1; }
+        for _ in 0..16 { io_wait(); }
         outb(0x64, 0xFE); // Pulse CPU reset line
+        for _ in 0..16 { io_wait(); }
         // Fallback: QEMU ISA reset
         outb(0x92, 0x01);
         loop { core::arch::asm!("hlt", options(nostack, nomem)); }

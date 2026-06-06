@@ -6,6 +6,7 @@ pub mod debug;
 pub mod convert;
 pub mod fun;
 pub mod disk;
+pub mod install;
 
 use crate::console::terminal::{Terminal, LineColor, INPUT_MAX};
 
@@ -93,6 +94,10 @@ pub fn dispatch(
 
         // ── Archivos ─────────────────────────────────────────────────────────
 
+        // ── Instalación (CD → HDD) ────────────────────────────────────────
+        b"install"
+            => install::cmd_install(t, args),
+
 b"cat" | b"type"
     => disk::cmd_cat(t, args),
         b"touch" | b"nuevo"
@@ -109,6 +114,10 @@ b"cat" | b"type"
             => disk::cmd_stat(t, args),
         b"edit" | b"nano" | b"editor"
             => disk::cmd_edit(t, args),
+
+        // ── Formateo ─────────────────────────────────────────────────────────
+        b"mkfs" | b"format"
+            => disk::cmd_mkfs(t, args),
 
         // ── Disco ATA / DiskPart ─────────────────────────────────────────────
         b"diskpart" | b"diskinfo" | b"drives"

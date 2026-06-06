@@ -384,7 +384,7 @@ impl ExplorerState {
         self.status_len = n; self.status_ok = ok;
     }
 
-    pub fn refresh(&mut self, vol: &Fat32Volume) {
+    pub fn refresh(&mut self, vol: &mut Fat32Volume) {
         self.entry_count = 0;
         const NONE_ENTRY: Option<DirEntryInfo> = None;
         self.entries = [NONE_ENTRY; MAX_ENTRIES];
@@ -403,7 +403,7 @@ impl ExplorerState {
         self.set_status("Directorio cargado", true);
     }
 
-    pub fn load_preview(&mut self, vol: &Fat32Volume) {
+    pub fn load_preview(&mut self, vol: &mut Fat32Volume) {
         if let Some(entry) = self.entries[self.selected].as_ref() {
             if entry.is_dir { self.preview_len = 0; return; }
             let mut n = [0u8; 256];

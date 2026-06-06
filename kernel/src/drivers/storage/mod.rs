@@ -1,4 +1,8 @@
 pub mod ata;
+pub mod atapi;
 pub mod fat32;
-pub mod vfs;
+pub mod iso9660;
 pub mod mkfs;
+pub mod registry;
+pub mod traits;
+pub mod vfs;

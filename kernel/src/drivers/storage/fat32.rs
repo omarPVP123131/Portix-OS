@@ -8,7 +8,8 @@
 
 #![allow(dead_code)]
 
-use crate::drivers::storage::ata::{AtaDrive, AtaError};
+use crate::drivers::storage::ata::AtaError;
+use crate::drivers::storage::traits::BlockDevice;
 
 // ── Errores ───────────────────────────────────────────────────────────────────
 
@@ -146,8 +147,8 @@ impl DirEntryInfo {
 
 // ── Volumen ───────────────────────────────────────────────────────────────────
 
-pub struct Fat32Volume {
-    drive:         AtaDrive,
+pub struct Fat32Volume<'a> {
+    drive:         &'a mut dyn BlockDevice,
     part_lba:      u64,
     bytes_per_sec: u16,
     sec_per_clus:  u32,
@@ -159,8 +160,8 @@ pub struct Fat32Volume {
     clus_count:    u32,
 }
 
-impl Fat32Volume {
-    pub fn mount(drive: AtaDrive) -> FatResult<Self> {
+impl<'a> Fat32Volume<'a> {
+    pub fn mount(drive: &'a mut dyn BlockDevice) -> FatResult<Self> {
         let mut mbr = [0u8; 512];
         drive.read_sectors(0, 1, &mut mbr).map_err(FatError::Ata)?;
         let part_lba = Self::find_fat32_partition(&mbr)?;
@@ -224,7 +225,7 @@ impl Fat32Volume {
     fn bpc(&self) -> usize { self.bytes_per_sec as usize * self.sec_per_clus as usize }
     fn is_eoc(&self, c: u32) -> bool { c >= FAT_EOC }
 
-    fn read_fat(&self, cluster: u32) -> FatResult<u32> {
+    fn read_fat(&mut self, cluster: u32) -> FatResult<u32> {
         let lba = self.fat_lba(cluster);
         let off = self.fat_offset(cluster);
         let mut sec = [0u8; 512];
@@ -232,7 +233,7 @@ impl Fat32Volume {
         Ok(u32::from_le_bytes([sec[off], sec[off+1], sec[off+2], sec[off+3]]) & 0x0FFF_FFFF)
     }
 
-    fn write_fat(&self, cluster: u32, value: u32) -> FatResult<()> {
+    fn write_fat(&mut self, cluster: u32, value: u32) -> FatResult<()> {
         let lba = self.fat_lba(cluster);
         let off = self.fat_offset(cluster);
         let mut sec = [0u8; 512];
@@ -248,7 +249,7 @@ impl Fat32Volume {
         Ok(())
     }
 
-    fn alloc_cluster(&self) -> FatResult<u32> {
+    fn alloc_cluster(&mut self) -> FatResult<u32> {
         for c in 2..self.clus_count + 2 {
             if self.read_fat(c)? == FAT_FREE {
                 self.write_fat(c, 0x0FFF_FFFF)?;
@@ -258,7 +259,7 @@ impl Fat32Volume {
         Err(FatError::NoSpace)
     }
 
-    fn free_chain(&self, start: u32) -> FatResult<()> {
+    fn free_chain(&mut self, start: u32) -> FatResult<()> {
         let mut cur = start;
         while !self.is_eoc(cur) && cur >= 2 {
             let next = self.read_fat(cur)?;
@@ -268,12 +269,12 @@ impl Fat32Volume {
         Ok(())
     }
 
-    fn read_cluster(&self, cluster: u32, buf: &mut ClusterBuf) -> FatResult<()> {
+    fn read_cluster(&mut self, cluster: u32, buf: &mut ClusterBuf) -> FatResult<()> {
         self.drive.read_sectors(self.cluster_lba(cluster), self.sec_per_clus as usize, &mut buf.data[..buf.len])?;
         Ok(())
     }
 
-    fn write_cluster(&self, cluster: u32, buf: &ClusterBuf) -> FatResult<()> {
+    fn write_cluster(&mut self, cluster: u32, buf: &ClusterBuf) -> FatResult<()> {
         self.drive.write_sectors(self.cluster_lba(cluster), self.sec_per_clus as usize, &buf.data[..buf.len])?;
         Ok(())
     }
@@ -282,7 +283,7 @@ impl Fat32Volume {
 
     pub fn root_cluster(&self) -> u32 { self.root_clus }
 
-    pub fn list_dir<F>(&self, dir_cluster: u32, mut cb: F) -> FatResult<()>
+    pub fn list_dir<F>(&mut self, dir_cluster: u32, mut cb: F) -> FatResult<()>
     where F: FnMut(&DirEntryInfo)
     {
         let mut clus = dir_cluster;
@@ -322,7 +323,7 @@ impl Fat32Volume {
         Ok(())
     }
 
-    pub fn find_entry(&self, dir_cluster: u32, name: &str) -> FatResult<DirEntryInfo> {
+    pub fn find_entry(&mut self, dir_cluster: u32, name: &str) -> FatResult<DirEntryInfo> {
         let mut found: Option<DirEntryInfo> = None;
         self.list_dir(dir_cluster, |e| {
             if found.is_none() && names_eq(e.name_str(), name) {
@@ -332,7 +333,7 @@ impl Fat32Volume {
         found.ok_or(FatError::NotFound)
     }
 
-    pub fn read_file(&self, entry: &DirEntryInfo, buf: &mut [u8]) -> FatResult<usize> {
+    pub fn read_file(&mut self, entry: &DirEntryInfo, buf: &mut [u8]) -> FatResult<usize> {
         if entry.is_dir { return Err(FatError::IsDir); }
         let to_read = buf.len().min(entry.size as usize);
         let bpc = self.bpc();
@@ -349,7 +350,7 @@ impl Fat32Volume {
         Ok(done)
     }
 
-    pub fn write_file(&self, entry: &mut DirEntryInfo, data: &[u8]) -> FatResult<()> {
+    pub fn write_file(&mut self, entry: &mut DirEntryInfo, data: &[u8]) -> FatResult<()> {
         if entry.is_dir { return Err(FatError::IsDir); }
         let bpc = self.bpc();
         if entry.cluster != 0 { self.free_chain(entry.cluster)?; }
@@ -377,15 +378,15 @@ impl Fat32Volume {
         Ok(())
     }
 
-    pub fn create_file(&self, dir_cluster: u32, name: &str) -> FatResult<DirEntryInfo> {
+    pub fn create_file(&mut self, dir_cluster: u32, name: &str) -> FatResult<DirEntryInfo> {
         self.create_entry(dir_cluster, name, false)
     }
 
-    pub fn create_dir(&self, dir_cluster: u32, name: &str) -> FatResult<DirEntryInfo> {
+    pub fn create_dir(&mut self, dir_cluster: u32, name: &str) -> FatResult<DirEntryInfo> {
         self.create_entry(dir_cluster, name, true)
     }
 
-    fn create_entry(&self, dir_cluster: u32, name: &str, is_dir: bool) -> FatResult<DirEntryInfo> {
+    fn create_entry(&mut self, dir_cluster: u32, name: &str, is_dir: bool) -> FatResult<DirEntryInfo> {
         if name.len() > 255 { return Err(FatError::NameTooLong); }
         let clus = if is_dir {
             let c = self.alloc_cluster()?;
@@ -409,7 +410,7 @@ impl Fat32Volume {
         Ok(DirEntryInfo { name: nb, name_len: nl, is_dir, size: 0, cluster: clus, dir_sector, dir_offset })
     }
 
-    pub fn delete_entry(&self, entry: &DirEntryInfo) -> FatResult<()> {
+    pub fn delete_entry(&mut self, entry: &DirEntryInfo) -> FatResult<()> {
         if entry.cluster != 0 { self.free_chain(entry.cluster)?; }
         let mut sec = [0u8; 512];
         self.drive.read_sectors(entry.dir_sector, 1, &mut sec)?;
@@ -418,7 +419,7 @@ impl Fat32Volume {
         Ok(())
     }
 
-    fn write_dir_entry(&self, dir_cluster: u32, entry: &DirEntry83) -> FatResult<(u64, usize)> {
+    fn write_dir_entry(&mut self, dir_cluster: u32, entry: &DirEntry83) -> FatResult<(u64, usize)> {
         let bpc = self.bpc();
         let mut clus = dir_cluster;
         while !self.is_eoc(clus) && clus >= 2 {
@@ -449,7 +450,7 @@ impl Fat32Volume {
         Err(FatError::NoSpace)
     }
 
-    fn update_cluster_field(&self, entry: &DirEntryInfo, cluster: u32) -> FatResult<()> {
+    fn update_cluster_field(&mut self, entry: &DirEntryInfo, cluster: u32) -> FatResult<()> {
         let mut sec = [0u8; 512];
         self.drive.read_sectors(entry.dir_sector, 1, &mut sec)?;
         let off = entry.dir_offset;
@@ -461,7 +462,7 @@ impl Fat32Volume {
         Ok(())
     }
 
-    fn update_size_field(&self, entry: &DirEntryInfo, size: u32) -> FatResult<()> {
+    fn update_size_field(&mut self, entry: &DirEntryInfo, size: u32) -> FatResult<()> {
         let mut sec = [0u8; 512];
         self.drive.read_sectors(entry.dir_sector, 1, &mut sec)?;
         let off = entry.dir_offset;

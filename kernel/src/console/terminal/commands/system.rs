@@ -26,6 +26,8 @@ pub fn cmd_help(t: &mut Terminal) {
     t.write_empty();
 
     t.write_line("  DISCO ATA:", LineColor::Info);
+    t.write_line("    install [dev]             Instalar PORTIX en HDD (default: primer ATA)", LineColor::Normal);
+    t.write_line("    mkfs [dev]                Formatear dispositivo con FAT32", LineColor::Normal);
     t.write_line("    diskinfo                  Listar drives ATA detectados",    LineColor::Normal);
     t.write_line("    diskread [lba] [drive]    Hexdump de sector (sin editar)",  LineColor::Normal);
     t.write_line("    diskedit [lba] [drive]    Editor hexadecimal interactivo",  LineColor::Normal);

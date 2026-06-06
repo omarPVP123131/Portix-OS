@@ -75,6 +75,15 @@ use crate::drivers::storage::registry;
 use crate::drivers::storage::traits::BlockDevice;
 use crate::drivers::storage::vfs::{VfsMount, path_split, path_join, basename, parent_copy};
 
+// ── Caché global del volumen FAT32 ────────────────────────────────────────────
+// mount_vol() monta una sola vez y cachea; comandos posteriores reutilizan.
+
+static mut VOL_CACHE: Option<(Fat32Volume<'static>, VfsMount)> = None;
+
+pub fn invalidate_vol_cache() {
+    unsafe { VOL_CACHE = None; }
+}
+
 // ── Helpers privados ──────────────────────────────────────────────────────────
 
 fn drive_id(idx: usize) -> DriveId {
@@ -124,7 +133,13 @@ fn fat_err_msg(e: FatError) -> &'static [u8] {
     }
 }
 
-fn mount_vol(t: &mut Terminal) -> Option<(Fat32Volume<'static>, VfsMount)> {
+fn mount_vol(t: &mut Terminal) -> Option<(&'static mut Fat32Volume<'static>, &'static mut VfsMount)> {
+    unsafe {
+        if let Some(ref mut pair) = VOL_CACHE {
+            return Some((&mut pair.0, &mut pair.1));
+        }
+    }
+
     let count = registry::device_count();
     if count == 0 {
         t.write_line(
@@ -145,7 +160,11 @@ fn mount_vol(t: &mut Terminal) -> Option<(Fat32Volume<'static>, VfsMount)> {
             let root = vol.root_cluster();
             mnt.register("/", root);
             let _ = resolve_and_register(&mut vol, root, &mut mnt);
-            return Some((vol, mnt));
+            unsafe {
+                VOL_CACHE = Some((vol, mnt));
+                let pair = VOL_CACHE.as_mut().unwrap();
+                return Some((&mut pair.0, &mut pair.1));
+            }
         }
     }
 
@@ -280,7 +299,7 @@ fn fmt_size(buf: &mut [u8], pos: &mut usize, bytes: u32) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub fn cmd_ls(t: &mut Terminal, args: &[u8]) {
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cwd     = t.cwd;
     let cwd_len = t.cwd_len;
 
@@ -288,7 +307,7 @@ pub fn cmd_ls(t: &mut Terminal, args: &[u8]) {
         mnt.resolve(core::str::from_utf8(&cwd[..cwd_len]).unwrap_or("/"))
            .unwrap_or(mnt.root_cluster())
     } else {
-        match resolve_path(&mut vol, &mnt, &cwd, cwd_len, trim(args)) {
+        match resolve_path(vol, mnt, &cwd, cwd_len, trim(args)) {
             Ok(c) => c,
             Err(e) => {
                 let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -395,9 +414,9 @@ pub fn cmd_cd(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
-    let cluster = match resolve_path(&mut vol, &mnt, &t.cwd, t.cwd_len, args) {
+    let cluster = match resolve_path(vol, mnt, &t.cwd, t.cwd_len, args) {
         Ok(c) => c,
         Err(e) => {
             let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -419,13 +438,13 @@ pub fn cmd_cd(t: &mut Terminal, args: &[u8]) {
 }
 
 pub fn cmd_tree(t: &mut Terminal, args: &[u8]) {
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
     let cluster = if trim(args).is_empty() {
         mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
            .unwrap_or(mnt.root_cluster())
     } else {
-        match resolve_path(&mut vol, &mnt, &t.cwd, t.cwd_len, trim(args)) {
+        match resolve_path(vol, mnt, &t.cwd, t.cwd_len, trim(args)) {
             Ok(c) => c,
             Err(e) => {
                 let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -446,7 +465,7 @@ pub fn cmd_tree(t: &mut Terminal, args: &[u8]) {
         t.write_bytes(&buf[..pos], LineColor::Info);
     }
 
-    draw_tree(t, &mut vol, cluster, 0, 4);
+    draw_tree(t, vol, cluster, 0, 4);
     t.write_empty();
 }
 
@@ -484,7 +503,7 @@ pub fn cmd_cat(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
     let name = basename(core::str::from_utf8(args).unwrap_or(""));
     let mut par = [0u8; 256]; let par_len;
@@ -494,7 +513,7 @@ pub fn cmd_cat(t: &mut Terminal, args: &[u8]) {
         par_len = parent_copy(core::str::from_utf8(&abs[..abs_len]).unwrap_or("/"), &mut par);
     }
 
-    let dir_cluster = match resolve_path(&mut vol, &mnt, &par, par_len, b".") {
+    let dir_cluster = match resolve_path(vol, mnt, &par, par_len, b".") {
         Ok(c) => c,
         Err(_) => {
             mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
@@ -582,7 +601,7 @@ pub fn cmd_touch(t: &mut Terminal, args: &[u8]) {
         t.write_line("  Uso: touch <nombre_archivo>", LineColor::Warning);
         return;
     }
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -626,7 +645,7 @@ pub fn cmd_write(t: &mut Terminal, args: &[u8]) {
     let content    = trim(&args[sp + 1..]);
     let name = core::str::from_utf8(name_bytes).unwrap_or("archivo");
 
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
 
@@ -683,7 +702,7 @@ pub fn cmd_mkdir(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
     let name = core::str::from_utf8(args).unwrap_or("directorio");
@@ -713,7 +732,7 @@ pub fn cmd_rm(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let name = basename(core::str::from_utf8(args).unwrap_or(""));
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -755,7 +774,7 @@ pub fn cmd_stat(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let name = basename(core::str::from_utf8(args).unwrap_or(""));
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -834,7 +853,7 @@ pub fn cmd_mv(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
 
@@ -913,7 +932,7 @@ pub fn cmd_edit(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let name = core::str::from_utf8(args).unwrap_or("archivo");
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -1482,6 +1501,7 @@ pub fn cmd_mkfs(t: &mut Terminal, args: &[u8]) {
 
     match mkfs::auto_format(drive, total_secs) {
         Some(root_clus) => {
+            invalidate_vol_cache();
             let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
             append_str(&mut buf, &mut pos, b"  [OK] Formato completado. Cluster raiz: ");
             append_u32(&mut buf, &mut pos, root_clus);
@@ -1495,6 +1515,7 @@ pub fn cmd_mkfs(t: &mut Terminal, args: &[u8]) {
             t.write_line("  Ejecuta 'diskpart' para verificar el estado.", LineColor::Normal);
         }
         None => {
+            invalidate_vol_cache();
             t.write_line("  [ERROR] Fallo al formatear el dispositivo.", LineColor::Error);
             t.write_line("  Verifica que no este en uso y tenga al menos 8 MB.", LineColor::Warning);
         }

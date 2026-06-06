@@ -31,6 +31,7 @@ use console::terminal::LineColor;
 use core::arch::global_asm;
 use drivers::input::keyboard::Key;
 use alloc::boxed::Box;
+use crate::drivers::serial;
 use drivers::storage::traits::BlockDevice;
 use drivers::storage::ata::DriveType;
 use drivers::storage::{ata, atapi, fat32, mkfs, registry};
@@ -255,6 +256,11 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
         let bus = ata::AtaBus::scan();
         ata::log_drives(&bus);
 
+        // Cachear info del Primary0 para comandos sin re-escanear hardware
+        if let Some(info) = bus.info(ata::DriveId::Primary0) {
+            ata::store_primary_drive_info(*info);
+        }
+
         // Registrar todos los drives en el DeviceRegistry
         for info in bus.iter() {
             let dev: Box<dyn BlockDevice> = if info.kind == DriveType::Atapi {
@@ -270,6 +276,12 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
         let mut mount_ok = false;
 
         let dev0_kind = registry::get_device(0).map(|d| d.device_info().kind);
+
+        // Si device 0 es ATAPI (CD-ROM), mostrar guía en vez de montar/formatear
+        if let Some(DriveType::Atapi) = dev0_kind {
+            serial::log_level(serial::Level::Info, "BOOT",
+                "Boot desde CD-ROM detectado. Ejecuta 'install' para instalar PORTIX en disco duro.");
+        }
 
         if let Some(DriveType::Ata) = dev0_kind {
             if let Some(drive) = registry::get_device(0) {

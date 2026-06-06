@@ -1,6 +1,7 @@
 pub mod ata;
 pub mod atapi;
 pub mod fat32;
+pub mod file_handle;
 pub mod iso9660;
 pub mod mkfs;
 pub mod registry;

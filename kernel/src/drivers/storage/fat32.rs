@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+use alloc::vec;
+use alloc::boxed::Box;
 use crate::drivers::storage::ata::AtaError;
 use crate::drivers::storage::traits::BlockDevice;
 
@@ -567,12 +569,16 @@ fn make_83(name: &str) -> ([u8; 8], [u8; 3]) {
 const MAX_BPC: usize = 512 * 128; // 64 KiB
 
 struct ClusterBuf {
-    data: [u8; MAX_BPC],
+    data: Box<[u8]>,
     len:  usize,
 }
 
 impl ClusterBuf {
     fn new(len: usize) -> Self {
-        ClusterBuf { data: [0u8; MAX_BPC], len: len.min(MAX_BPC) }
+        let actual = len.min(MAX_BPC);
+        ClusterBuf {
+            data: vec![0u8; actual].into_boxed_slice(),
+            len: actual,
+        }
     }
 }

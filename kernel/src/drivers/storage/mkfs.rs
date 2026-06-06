@@ -22,24 +22,45 @@ const NUM_FATS:       u8  = 2;
 const PART_LBA_START: u32 = 2048;
 const FAT_SIZE_SECS:  u32 = 32;
 
+// GPT constants for disks > 2 TB
+const GPT_PART_LBA_START: u64 = 4096;
+const GPT_SIZE_THRESHOLD: u64 = 0xFFFFFFFF;
+
 // ── auto_format — formato completo con MBR ────────────────────────────────────
 
 pub fn auto_format(drive: &mut dyn BlockDevice, total_secs: u64) -> Option<u32> {
-    serial::log_level(serial::Level::Warn, "MKFS", "Disco sin FAT32 — iniciando formato...");
-
     if total_secs < 8192 {
         serial::log_level(serial::Level::Error, "MKFS", "Disco demasiado pequeno (<4 MB)");
         return None;
     }
 
-    if write_mbr(drive, total_secs).is_err() {
-        serial::log_level(serial::Level::Error, "MKFS", "Error escribiendo MBR");
-        return None;
-    }
-    serial::log_level(serial::Level::Ok, "MKFS", "MBR escrito");
+    let use_gpt = total_secs > GPT_SIZE_THRESHOLD;
 
-    let part_lba = PART_LBA_START as u64;
-    let part_secs = (total_secs as u32).saturating_sub(PART_LBA_START);
+    if use_gpt {
+        serial::log_level(serial::Level::Warn, "MKFS", "Disco grande (>2TB) — usando tabla GPT...");
+
+        if write_gpt(drive, total_secs).is_err() {
+            serial::log_level(serial::Level::Error, "MKFS", "Error escribiendo GPT");
+            return None;
+        }
+        serial::log_level(serial::Level::Ok, "MKFS", "GPT + MBR protector escrito");
+    } else {
+        serial::log_level(serial::Level::Warn, "MKFS", "Disco sin FAT32 — iniciando formato...");
+
+        if write_mbr(drive, total_secs).is_err() {
+            serial::log_level(serial::Level::Error, "MKFS", "Error escribiendo MBR");
+            return None;
+        }
+        serial::log_level(serial::Level::Ok, "MKFS", "MBR escrito");
+    }
+
+    let part_lba = if use_gpt { GPT_PART_LBA_START } else { PART_LBA_START as u64 };
+    let part_secs = if use_gpt {
+        let last_usable = total_secs - 1 - 33;
+        (last_usable.saturating_sub(GPT_PART_LBA_START) + 1) as u32
+    } else {
+        (total_secs as u32).saturating_sub(PART_LBA_START)
+    };
     if write_vbr(drive, part_lba, part_secs).is_err() {
         serial::log_level(serial::Level::Error, "MKFS", "Error escribiendo VBR");
         return None;
@@ -181,6 +202,93 @@ fn init_fat(drive: &mut dyn BlockDevice, part_lba: u64) -> Result<(), ()> {
 
     Ok(())
 }
+
+// ── GPT functions ─────────────────────────────────────────────────────────────
+
+fn write_protective_mbr(drive: &mut dyn BlockDevice) -> Result<(), ()> {
+    let mut mbr = [0u8; 512];
+    let has_valid = drive.read_sectors(0, 1, &mut mbr).is_ok()
+        && mbr[0x1FE] == 0x55 && mbr[0x1FF] == 0xAA;
+    if !has_valid {
+        mbr.fill(0);
+        mbr[0] = 0xEB; mbr[1] = 0xFE; mbr[2] = 0x90;
+    }
+    let off = 0x1BE;
+    mbr[off]     = 0x00;
+    mbr[off + 1] = 0x00;
+    mbr[off + 2] = 0x02;
+    mbr[off + 3] = 0x00;
+    mbr[off + 4] = 0xEE;
+    mbr[off + 5] = 0xFF;
+    mbr[off + 6] = 0xFF;
+    mbr[off + 7] = 0xFF;
+    mbr[off + 8..off + 12].copy_from_slice(&1u32.to_le_bytes());
+    mbr[off + 12..off + 16].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+    mbr[0x1FE] = 0x55;
+    mbr[0x1FF] = 0xAA;
+    drive.write_sectors(0, 1, &mbr).map_err(|_| ())
+}
+
+fn write_gpt_header_and_entries(drive: &mut dyn BlockDevice, total_secs: u64) -> Result<(), ()> {
+    let last_lba = total_secs - 1;
+    let part_last_lba = last_lba - 33;
+
+    let mut entries = [0u8; 512 * 32];
+    let pe = &mut entries[..128];
+    let fat32_guid: [u8; 16] = [0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7];
+    pe[..16].copy_from_slice(&fat32_guid);
+    let part_guid: [u8; 16] = [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00];
+    pe[16..32].copy_from_slice(&part_guid);
+    pe[32..40].copy_from_slice(&GPT_PART_LBA_START.to_le_bytes());
+    pe[40..48].copy_from_slice(&part_last_lba.to_le_bytes());
+    let name_utf16: &[u16] = &[
+        0x0050, 0x006F, 0x0072, 0x0074, 0x0069, 0x0078,
+        0x0020, 0x0046, 0x0041, 0x0054, 0x0033, 0x0032,
+    ];
+    for (i, &c) in name_utf16.iter().enumerate() {
+        let off = 56 + i * 2;
+        pe[off..off + 2].copy_from_slice(&c.to_le_bytes());
+    }
+
+    for s in 0..32u64 {
+        let offset = (s * 512) as usize;
+        drive.write_sectors(2 + s, 1, &entries[offset..offset + 512]).map_err(|_| ())?;
+    }
+
+    let mut hdr = [0u8; 512];
+    hdr[..8].copy_from_slice(b"EFI PART");
+    hdr[8..12].copy_from_slice(&0x00010000u32.to_le_bytes());
+    hdr[12..16].copy_from_slice(&92u32.to_le_bytes());
+    hdr[24..32].copy_from_slice(&1u64.to_le_bytes());
+    hdr[32..40].copy_from_slice(&last_lba.to_le_bytes());
+    hdr[40..48].copy_from_slice(&GPT_PART_LBA_START.to_le_bytes());
+    hdr[48..56].copy_from_slice(&part_last_lba.to_le_bytes());
+    let disk_guid: [u8; 16] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    hdr[56..72].copy_from_slice(&disk_guid);
+    hdr[72..80].copy_from_slice(&2u64.to_le_bytes());
+    hdr[80..84].copy_from_slice(&128u32.to_le_bytes());
+    hdr[84..88].copy_from_slice(&128u32.to_le_bytes());
+    drive.write_sectors(1, 1, &hdr).map_err(|_| ())?;
+
+    for s in 0..32u64 {
+        let offset = (s * 512) as usize;
+        let backup_lba = last_lba - 32 + s;
+        drive.write_sectors(backup_lba, 1, &entries[offset..offset + 512]).map_err(|_| ())?;
+    }
+
+    hdr[24..32].copy_from_slice(&last_lba.to_le_bytes());
+    hdr[32..40].copy_from_slice(&1u64.to_le_bytes());
+    drive.write_sectors(last_lba, 1, &hdr).map_err(|_| ())?;
+
+    Ok(())
+}
+
+fn write_gpt(drive: &mut dyn BlockDevice, total_secs: u64) -> Result<(), ()> {
+    write_protective_mbr(drive)?;
+    write_gpt_header_and_entries(drive, total_secs)
+}
+
+// ── create_dir_tree ───────────────────────────────────────────────────────────
 
 fn create_dir_tree(vol: &mut Fat32Volume, root: u32) {
     let dirs: &[&str] = &["bin", "etc", "home", "tmp", "usr", "var"];

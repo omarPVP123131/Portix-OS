@@ -68,7 +68,7 @@ extern "C" {
 // se debe usar para calcular el layout del disco y los sectores a escribir.
 fn get_kernel_info() -> (*const u8, usize, usize) {
     let kernel_start    = KERNEL_PHYS_ADDR;
-    let kernel_end_ptr  = unsafe { core::ptr::addr_of!(__kernel_end) as usize };
+    let kernel_end_ptr  = core::ptr::addr_of!(__kernel_end) as usize;
     let raw_size        = kernel_end_ptr.saturating_sub(kernel_start);
 
     // Alinear al multiplo de 512 superior (o igual si ya es multiplo).
@@ -543,4 +543,7 @@ pub fn cmd_install(t: &mut Terminal, args: &[u8]) {
         "  Luego apaga la VM, retira la ISO y arranca desde el HDD.",
         LineColor::Info,
     );
+
+    // Invalidar caché FAT32 para que los comandos vean el nuevo sistema
+    super::disk::invalidate_vol_cache();
 }

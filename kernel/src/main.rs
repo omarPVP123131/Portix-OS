@@ -30,7 +30,10 @@ use console::terminal::editor::draw_editor_tab;
 use console::terminal::LineColor;
 use core::arch::global_asm;
 use drivers::input::keyboard::Key;
-use drivers::storage::{ata, fat32, mkfs};
+use alloc::boxed::Box;
+use drivers::storage::traits::BlockDevice;
+use drivers::storage::ata::DriveType;
+use drivers::storage::{ata, atapi, fat32, mkfs, registry};
 use graphics::driver::framebuffer::{Color, Console, Layout};
 use mem::allocator::BuddyAllocator;
 use ui::tabs::explorer::ExplorerState;
@@ -249,47 +252,52 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
     }
 
   {
-        let ata = ata::AtaBus::scan();
-        ata::log_drives(&ata);
+        let bus = ata::AtaBus::scan();
+        ata::log_drives(&bus);
 
-        // v0.8.0: guardar DriveInfo ANTES de lanzar el loop principal.
-        // Desde este momento, todos los comandos del terminal pueden usar
-        // get_cached_drive_info() sin re-escanear el bus.
-        if let Some(info) = ata.info(ata::DriveId::Primary0) {
-            ata::store_primary_drive_info(*info);
+        // Registrar todos los drives en el DeviceRegistry
+        for info in bus.iter() {
+            let dev: Box<dyn BlockDevice> = if info.kind == DriveType::Atapi {
+                Box::new(atapi::AtapiDrive::new(*info))
+            } else {
+                Box::new(ata::AtaDrive::from_info(*info))
+            };
+            registry::register_device(dev);
         }
 
-        // Montar FAT32 o formatear si no existe
-        let vol_result = if let Some(drive_info) = ata::get_cached_drive_info() {
-            let drive = ata::AtaDrive::from_info(drive_info);
-            match fat32::Fat32Volume::mount(drive) {
-                Ok(vol) => Some(vol),
-                Err(_) => {
-                    // Disco sin FAT32 — formatear
-                    let drive_recovery = ata::AtaDrive::from_info(drive_info);
-                    if mkfs::auto_format(drive_recovery).is_some() {
-                        // Re-montar tras el formato
-                        let drive_final = ata::AtaDrive::from_info(drive_info);
-                        fat32::Fat32Volume::mount(drive_final).ok()
-                    } else {
-                        None
+        // Montar FAT32 o formatear si no existe (usa device 0 = Primary0)
+        let mut root_cluster = 2u32; // fallback
+        let mut mount_ok = false;
+
+        let dev0_kind = registry::get_device(0).map(|d| d.device_info().kind);
+
+        if let Some(DriveType::Ata) = dev0_kind {
+            if let Some(drive) = registry::get_device(0) {
+                if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
+                    root_cluster = vol.root_cluster();
+                    mount_ok = true;
+                }
+            }
+
+            // Solo formatear si NO se pudo montar (evita formatear en cada reboot)
+            if !mount_ok {
+                if let Some(drive) = registry::get_device(0) {
+                    let total_secs = drive.total_sectors();
+                    if mkfs::auto_format(drive, total_secs).is_some() {
+                        if let Some(drive) = registry::get_device(0) {
+                            if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
+                                root_cluster = vol.root_cluster();
+                            }
+                        }
                     }
                 }
             }
-        } else {
-            None
-        };
-
-        // Inicializar ExplorerState con el cluster raíz real del volumen
-        if let Some(vol) = vol_result {
-            let root = vol.root_cluster();
-            unsafe {
-                core::ptr::addr_of_mut!(EXPLORER_STORAGE)
-                    .write(core::mem::MaybeUninit::new(ExplorerState::new(root)));
-            }
         }
-        // Si vol_result == None, EXPLORER_STORAGE ya fue inicializado con
-        // ExplorerState::new(2) arriba — usa cluster 2 como fallback.
+
+        unsafe {
+            core::ptr::addr_of_mut!(EXPLORER_STORAGE)
+                .write(core::mem::MaybeUninit::new(ExplorerState::new(root_cluster)));
+        }
     }
 
     // Referencias limpias para el loop principal
@@ -452,10 +460,7 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
 
                     // ── Explorer ──────────────────────────────────────────
                     _ if tab == Tab::Explorer => {
-                        let prev_sel = explorer.selected;
                         explorer.handle_key(key);
-                        // Cargar preview si cambió la selección y hay FAT32
-                        let _ = prev_sel; // preview se carga en el render o con FAT32
                         if explorer.open_request {
                             explorer.open_request = false;
                             let name =

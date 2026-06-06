@@ -1,7 +1,11 @@
-; boot/boot.asm  -  PORTIX Stage-1  v9.15
+; boot/boot.asm  -  PORTIX Stage-1  v9.16
 ; nasm -f bin boot.asm -o boot.bin
 ;
 ; FIXES vs v9.14:
+;
+;   [FIX-HDD-WARMBOOT]  HDD boot no depende de SI/DI ni de RAM previa:
+;                        stage2 se lee desde LBA absoluto 1 y BASE_LBA_ADDR
+;                        (0x7E00) se fuerza a 0 antes del salto a stage2.
 ;
 ;   [FIX-XORRISO-ZERO]  xorriso -boot-info-table pone a cero bytes 24-63 del
 ;                        primer sector (no documentado). start_real movido
@@ -46,7 +50,6 @@ start_real:
     sti
     mov  [boot_drive_orig], dl    ; DL = boot drive from BIOS
     mov  [boot_drive],      dl
-    mov  di, si
 
     ; ══════════════════════════════════════════════════════════════════════════
     ; Detectar CD-ROM: DL = 0xE0-0xEF (El Torito estándar)
@@ -59,17 +62,26 @@ start_real:
     ; ── Path HDD/USB (DL=0x00-0x9F) ──────────────────────────────────────
     ; Leer stage2 del disco a 0x8000 mediante INT 13h AH=0x42
 
-    ; base_lba desde entrada de partición en DI (SI original)
-    ; Si no hay partición (DI=0), usa LBA=1
+    cld
     xor  eax, eax
-    test di, di
-    jz   .hdd_lba_set
-    mov  eax, [di + 8]           ; LBA de inicio de partición
-    test eax, eax
-    jnz  .hdd_lba_set
-    xor  eax, eax
-.hdd_lba_set:
+    mov  [BASE_LBA_ADDR], eax     ; stage2: base_lba=0 en HDD/warm reboot
     inc  eax                     ; stage2 en LBA 1 (siguiente sector)
+
+    ; SAVE eax before debug print
+    push eax
+    mov  ah, 0x0E
+    mov  al, 'H'
+    xor  bx, bx
+    int  0x10
+    pop  eax
+
+    ; Pequeña pausa para warm reboot — da tiempo al controlador ATA a estabilizarse
+    push eax
+    mov  cx, 0xFFFF
+.pause:
+    loop .pause
+    nop
+    pop  eax
 
     ; ══════════════════════════════════════════════════════════════════════════
     ; .read_prep — Preparar DAP y leer stage2
@@ -124,6 +136,12 @@ start_real:
     jmp  .lba_blk
 
 .loaded:
+    ; Debug: print 'S' before jumping to stage2
+    mov  ah, 0x0E
+    mov  al, 'S'
+    xor  bx, bx
+    int  0x10
+
     mov  dl, [boot_drive_orig]
     jmp  0x0000:0x8000
 

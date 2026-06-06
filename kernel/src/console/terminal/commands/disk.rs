@@ -67,10 +67,12 @@ use crate::console::terminal::{Terminal, LineColor, TERM_COLS};
 use crate::console::terminal::fmt::*;
 use crate::console::terminal::editor::EditorState;
 use crate::drivers::storage::ata::{
-    AtaBus, AtaError, AtaDrive, DriveId, DriveType,
-    get_cached_drive_info,  // v0.8.0: caché global — no re-escanea el bus
+    AtaBus, AtaError, DriveId, DriveType,
 };
 use crate::drivers::storage::fat32::{Fat32Volume, FatError};
+use crate::drivers::storage::mkfs;
+use crate::drivers::storage::registry;
+use crate::drivers::storage::traits::BlockDevice;
 use crate::drivers::storage::vfs::{VfsMount, path_split, path_join, basename, parent_copy};
 
 // ── Helpers privados ──────────────────────────────────────────────────────────
@@ -122,59 +124,43 @@ fn fat_err_msg(e: FatError) -> &'static [u8] {
     }
 }
 
-// ── mount_vol — v0.8.0 ────────────────────────────────────────────────────────
-//
-// Monta el volumen FAT32 usando el DriveInfo cacheado en boot.
-//
-// CAMBIO v0.8.0: eliminado AtaBus::scan() y bus.info(Primary0).
-// En su lugar: get_cached_drive_info() + AtaDrive::from_info().
-//
-// Por qué Fat32Volume::mount() consume el AtaDrive:
-//   mount() toma ownership del drive para realizar lecturas en el volumen.
-//   Esto significa que necesitamos crear un AtaDrive nuevo en cada llamada,
-//   pero usando from_info() (que NO toca el hardware), no scan() (que sí).
+fn mount_vol(t: &mut Terminal) -> Option<(Fat32Volume<'static>, VfsMount)> {
+    let count = registry::device_count();
+    if count == 0 {
+        t.write_line(
+            "  Error: no hay dispositivos de bloque disponibles.",
+            LineColor::Error,
+        );
+        return None;
+    }
 
-fn mount_vol(t: &mut Terminal) -> Option<(Fat32Volume, VfsMount)> {
-    // v0.8.0: usar caché en lugar de scan()
-    let info = match get_cached_drive_info() {
-        Some(i) => i,
-        None => {
-            t.write_line(
-                "  Error: no se detecta ningún drive ATA.",
-                LineColor::Error,
-            );
-            return None;
-        }
-    };
+    for i in 0..count {
+        let drive = match registry::get_device(i) {
+            Some(d) => d,
+            None => continue,
+        };
 
-    let drive = AtaDrive::from_info(info);
-
-    match Fat32Volume::mount(drive) {
-        Ok(vol) => {
+        if let Ok(mut vol) = Fat32Volume::mount(drive) {
             let mut mnt = VfsMount::new();
             let root = vol.root_cluster();
             mnt.register("/", root);
-            let _ = resolve_and_register(&vol, root, &mut mnt);
-            Some((vol, mnt))
-        }
-        Err(e) => {
-            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-            append_str(&mut buf, &mut pos, b"  Error: no se pudo montar el volumen FAT32: ");
-            let em = fat_err_msg(e);
-            buf[pos..pos + em.len()].copy_from_slice(em); pos += em.len();
-            buf[pos] = b'.'; pos += 1;
-            t.write_bytes(&buf[..pos], LineColor::Error);
-            t.write_line(
-                "  Sugerencia: ejecuta 'diskpart' para verificar el estado del disco.",
-                LineColor::Normal,
-            );
-            None
+            let _ = resolve_and_register(&mut vol, root, &mut mnt);
+            return Some((vol, mnt));
         }
     }
+
+    t.write_line(
+        "  Error: no se pudo montar FAT32 en ningun dispositivo.",
+        LineColor::Error,
+    );
+    t.write_line(
+        "  Sugerencia: ejecuta 'diskpart' para verificar el estado del disco.",
+        LineColor::Normal,
+    );
+    None
 }
 
-/// Puebla el VfsMount con las rutas conocidas recorriendo el árbol.
-fn resolve_and_register(vol: &Fat32Volume, root: u32, mnt: &mut VfsMount) -> Result<(), FatError> {
+fn resolve_and_register(vol: &mut Fat32Volume, root: u32, mnt: &mut VfsMount) -> Result<(), FatError> {
     let first_level = ["bin", "etc", "home", "tmp", "usr", "var"];
     for name in first_level {
         if let Ok(e) = vol.find_entry(root, name) {
@@ -196,7 +182,7 @@ fn resolve_and_register(vol: &Fat32Volume, root: u32, mnt: &mut VfsMount) -> Res
 }
 
 fn resolve_path(
-    vol:  &Fat32Volume,
+    vol:  &mut Fat32Volume,
     mnt:  &VfsMount,
     cwd:  &[u8],
     cwd_len: usize,
@@ -294,7 +280,7 @@ fn fmt_size(buf: &mut [u8], pos: &mut usize, bytes: u32) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub fn cmd_ls(t: &mut Terminal, args: &[u8]) {
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cwd     = t.cwd;
     let cwd_len = t.cwd_len;
 
@@ -302,7 +288,7 @@ pub fn cmd_ls(t: &mut Terminal, args: &[u8]) {
         mnt.resolve(core::str::from_utf8(&cwd[..cwd_len]).unwrap_or("/"))
            .unwrap_or(mnt.root_cluster())
     } else {
-        match resolve_path(&vol, &mnt, &cwd, cwd_len, trim(args)) {
+        match resolve_path(&mut vol, &mnt, &cwd, cwd_len, trim(args)) {
             Ok(c) => c,
             Err(e) => {
                 let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -409,9 +395,9 @@ pub fn cmd_cd(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
-    let cluster = match resolve_path(&vol, &mnt, &t.cwd, t.cwd_len, args) {
+    let cluster = match resolve_path(&mut vol, &mnt, &t.cwd, t.cwd_len, args) {
         Ok(c) => c,
         Err(e) => {
             let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -433,13 +419,13 @@ pub fn cmd_cd(t: &mut Terminal, args: &[u8]) {
 }
 
 pub fn cmd_tree(t: &mut Terminal, args: &[u8]) {
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
     let cluster = if trim(args).is_empty() {
         mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
            .unwrap_or(mnt.root_cluster())
     } else {
-        match resolve_path(&vol, &mnt, &t.cwd, t.cwd_len, trim(args)) {
+        match resolve_path(&mut vol, &mnt, &t.cwd, t.cwd_len, trim(args)) {
             Ok(c) => c,
             Err(e) => {
                 let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -460,11 +446,11 @@ pub fn cmd_tree(t: &mut Terminal, args: &[u8]) {
         t.write_bytes(&buf[..pos], LineColor::Info);
     }
 
-    draw_tree(t, &vol, cluster, 0, 4);
+    draw_tree(t, &mut vol, cluster, 0, 4);
     t.write_empty();
 }
 
-fn draw_tree(t: &mut Terminal, vol: &Fat32Volume, cluster: u32, depth: usize, max_depth: usize) {
+fn draw_tree(t: &mut Terminal, vol: &mut Fat32Volume, cluster: u32, depth: usize, max_depth: usize) {
     if depth >= max_depth { return; }
     let _ = vol.list_dir(cluster, |e| {
         let name = e.name_str();
@@ -498,7 +484,7 @@ pub fn cmd_cat(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
     let name = basename(core::str::from_utf8(args).unwrap_or(""));
     let mut par = [0u8; 256]; let par_len;
@@ -508,7 +494,7 @@ pub fn cmd_cat(t: &mut Terminal, args: &[u8]) {
         par_len = parent_copy(core::str::from_utf8(&abs[..abs_len]).unwrap_or("/"), &mut par);
     }
 
-    let dir_cluster = match resolve_path(&vol, &mnt, &par, par_len, b".") {
+    let dir_cluster = match resolve_path(&mut vol, &mnt, &par, par_len, b".") {
         Ok(c) => c,
         Err(_) => {
             mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
@@ -596,7 +582,7 @@ pub fn cmd_touch(t: &mut Terminal, args: &[u8]) {
         t.write_line("  Uso: touch <nombre_archivo>", LineColor::Warning);
         return;
     }
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -640,7 +626,7 @@ pub fn cmd_write(t: &mut Terminal, args: &[u8]) {
     let content    = trim(&args[sp + 1..]);
     let name = core::str::from_utf8(name_bytes).unwrap_or("archivo");
 
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
 
@@ -697,7 +683,7 @@ pub fn cmd_mkdir(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
     let name = core::str::from_utf8(args).unwrap_or("directorio");
@@ -727,7 +713,7 @@ pub fn cmd_rm(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let name = basename(core::str::from_utf8(args).unwrap_or(""));
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -769,7 +755,7 @@ pub fn cmd_stat(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let name = basename(core::str::from_utf8(args).unwrap_or(""));
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -848,7 +834,7 @@ pub fn cmd_mv(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
 
@@ -927,7 +913,7 @@ pub fn cmd_edit(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
-    let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
+    let (mut vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let name = core::str::from_utf8(args).unwrap_or("archivo");
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -980,13 +966,12 @@ pub fn cmd_edit(t: &mut Terminal, args: &[u8]) {
     let mut full_path = [0u8; 256];
     let fpl = make_abs_path(&t.cwd, t.cwd_len, args, &mut full_path);
 
-    // v0.8.0: usar caché en lugar de AtaBus::scan()
-    // ANTES: let bus = AtaBus::scan(); let info = bus.info(DriveId::Primary0).map(|i| *i);
-    // AHORA:
-    if let Some(drive_info) = get_cached_drive_info() {
+    if let Some(_drive) = registry::get_device(0) {
+        let drive_info = _drive.device_info();
+        let device_id = 0usize;
         t.editor = Some(EditorState::new_text(
             content, content_len,
-            entry, drive_info,
+            entry, drive_info, device_id,
             &full_path[..fpl],
         ));
         let mut msg = [0u8; TERM_COLS]; let mut mp = 0;
@@ -1000,6 +985,115 @@ pub fn cmd_edit(t: &mut Terminal, args: &[u8]) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+fn show_device_fat32(t: &mut Terminal, drive: &mut dyn BlockDevice, idx: usize) {
+    let mut hdr = [0u8; TERM_COLS]; let mut hp = 0;
+    append_str(&mut hdr, &mut hp, b"  VOLUMEN FAT32 (device ");
+    append_u32(&mut hdr, &mut hp, idx as u32);
+    append_str(&mut hdr, &mut hp, b"):");
+    t.write_bytes(&hdr[..hp], LineColor::Header);
+
+    let info = drive.device_info();
+
+    if info.kind == DriveType::Atapi {
+        t.write_line("  Tipo: CD-ROM (ATAPI) — sin MBR ni FAT32", LineColor::Info);
+        t.write_empty();
+        return;
+    }
+
+    let mut mbr = [0u8; 512];
+    match drive.read_sectors(0, 1, &mut mbr) {
+        Ok(()) => {
+            let sig_ok = mbr[510] == 0x55 && mbr[511] == 0xAA;
+            {
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  Firma MBR (0x55AA): ");
+                if sig_ok {
+                    append_str(&mut buf, &mut pos, b"VALIDA");
+                    t.write_bytes(&buf[..pos], LineColor::Success);
+                } else {
+                    append_str(&mut buf, &mut pos, b"NO ENCONTRADA");
+                    t.write_bytes(&buf[..pos], LineColor::Warning);
+                }
+            }
+
+            t.write_line("  Tabla de particiones:", LineColor::Info);
+            t.write_line("  #  Estado   Tipo    LBA inicio   Tamaño (sectores)", LineColor::Normal);
+            for i in 0..4usize {
+                let off    = 0x1BE + i * 16;
+                let status = mbr[off];
+                let ptype  = mbr[off + 4];
+                let lba    = u32::from_le_bytes([mbr[off+8], mbr[off+9], mbr[off+10], mbr[off+11]]);
+                let size   = u32::from_le_bytes([mbr[off+12], mbr[off+13], mbr[off+14], mbr[off+15]]);
+                if ptype == 0 { continue; }
+
+                let tipo_s: &[u8] = match ptype {
+                    0x0B | 0x0C => b"FAT32   ",
+                    0x0E        => b"FAT16   ",
+                    0x83        => b"Linux   ",
+                    0x07        => b"NTFS    ",
+                    _           => b"Otro    ",
+                };
+
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  ");
+                append_u32(&mut buf, &mut pos, (i + 1) as u32);
+                append_str(&mut buf, &mut pos, b"  ");
+                if status == 0x80 {
+                    append_str(&mut buf, &mut pos, b"Activa   ");
+                } else {
+                    append_str(&mut buf, &mut pos, b"Inactiva ");
+                }
+                buf[pos..pos + tipo_s.len()].copy_from_slice(tipo_s); pos += tipo_s.len();
+                append_str(&mut buf, &mut pos, b"  ");
+                append_u32(&mut buf, &mut pos, lba);
+                append_str(&mut buf, &mut pos, b"          ");
+                append_u32(&mut buf, &mut pos, size);
+                t.write_bytes(&buf[..pos], LineColor::Normal);
+            }
+        }
+        Err(e) => {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  Error leyendo MBR: ");
+            let em = ata_err_msg(e);
+            buf[pos..pos + em.len()].copy_from_slice(em); pos += em.len();
+            t.write_bytes(&buf[..pos], LineColor::Error);
+            t.write_empty();
+            return;
+        }
+    }
+
+    t.write_empty();
+    match Fat32Volume::mount(drive) {
+        Ok(mut vol) => {
+            let root = vol.root_cluster();
+            t.write_line("  Estado FAT32: MONTADO", LineColor::Success);
+            {
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  Cluster ra\xEDz : ");
+                append_u32(&mut buf, &mut pos, root);
+                t.write_bytes(&buf[..pos], LineColor::Normal);
+            }
+            let mut file_count = 0u32; let mut dir_count = 0u32;
+            let _ = vol.list_dir(root, |e| {
+                if e.is_dir { dir_count += 1; } else { file_count += 1; }
+            });
+            {
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  Entradas ra\xEDz: ");
+                append_u32(&mut buf, &mut pos, dir_count);
+                append_str(&mut buf, &mut pos, b" directorios, ");
+                append_u32(&mut buf, &mut pos, file_count);
+                append_str(&mut buf, &mut pos, b" archivos");
+                t.write_bytes(&buf[..pos], LineColor::Normal);
+            }
+        }
+        Err(_) => {
+            t.write_line("  Estado FAT32: NO MONTADO — ejecuta 'mkfs' para formatear", LineColor::Warning);
+        }
+    }
+    t.write_empty();
+}
+
 // DISKPART — Panel de información del disco
 // Conserva AtaBus::scan() propio: es un comando de diagnóstico.
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1007,147 +1101,77 @@ pub fn cmd_edit(t: &mut Terminal, args: &[u8]) {
 pub fn cmd_diskpart(t: &mut Terminal) {
     t.separador("DISKPART — GESTIÓN DE DISCO");
 
-    // scan() aquí es INTENCIONAL: diskpart debe mostrar el estado real del bus
-    // en el momento de la ejecución. Si el drive desapareciera físicamente,
-    // diskpart debe informarlo correctamente.
     let bus = AtaBus::scan();
     if bus.count() == 0 {
-        t.write_line("  No se detectaron unidades ATA.", LineColor::Warning);
-        t.write_empty(); return;
-    }
+        t.write_line("  No se detectaron unidades ATA en el bus legacy.", LineColor::Warning);
+    } else {
+        t.write_line("  UNIDADES ATA (bus legacy):", LineColor::Header);
+        t.write_line("  #   Canal         Tipo   Modo   Capacidad      Modelo", LineColor::Info);
+        t.write_line("  --- -----------   -----  -----  -------------  -----", LineColor::Normal);
 
-    t.write_line("  UNIDADES DETECTADAS:", LineColor::Header);
-    t.write_line("  #   Canal         Tipo   Modo   Capacidad      Modelo", LineColor::Info);
-    t.write_line("  --- -----------   -----  -----  -------------  -----", LineColor::Normal);
+        for info in bus.iter() {
+            let idx: usize = info.id as usize;
+            let canal: &[u8] = match info.id {
+                DriveId::Primary0   => b"ATA0-Master ",
+                DriveId::Primary1   => b"ATA0-Slave  ",
+                DriveId::Secondary0 => b"ATA1-Master ",
+                DriveId::Secondary1 => b"ATA1-Slave  ",
+            };
+            let tipo: &[u8]  = if info.kind == DriveType::Atapi { b"ATAPI" } else { b"ATA  " };
+            let modo: &[u8]  = if info.lba48 { b"LBA48" } else { b"LBA28" };
 
-    for info in bus.iter() {
-        let idx: usize = info.id as usize;
-        let canal: &[u8] = match info.id {
-            DriveId::Primary0   => b"ATA0-Master ",
-            DriveId::Primary1   => b"ATA0-Slave  ",
-            DriveId::Secondary0 => b"ATA1-Master ",
-            DriveId::Secondary1 => b"ATA1-Slave  ",
-        };
-        let tipo: &[u8]  = if info.kind == DriveType::Atapi { b"ATAPI" } else { b"ATA  " };
-        let modo: &[u8]  = if info.lba48 { b"LBA48" } else { b"LBA28" };
-
-        let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-        append_str(&mut buf, &mut pos, b"  ");
-        append_u32(&mut buf, &mut pos, idx as u32);
-        append_str(&mut buf, &mut pos, b"   ");
-        buf[pos..pos + canal.len()].copy_from_slice(canal); pos += canal.len();
-        append_str(&mut buf, &mut pos, b"  ");
-        buf[pos..pos + tipo.len()].copy_from_slice(tipo); pos += tipo.len();
-        append_str(&mut buf, &mut pos, b"  ");
-        buf[pos..pos + modo.len()].copy_from_slice(modo); pos += modo.len();
-        append_str(&mut buf, &mut pos, b"  ");
-        append_mib(&mut buf, &mut pos, info.capacity_mib);
-        append_str(&mut buf, &mut pos, b"       ");
-        let m  = info.model_str().as_bytes();
-        let ml = m.len().min(TERM_COLS - pos);
-        buf[pos..pos + ml].copy_from_slice(&m[..ml]); pos += ml;
-        t.write_bytes(&buf[..pos], LineColor::Normal);
-    }
-    t.write_empty();
-
-    t.write_line("  VOLUMEN FAT32 (ATA0-Master):", LineColor::Header);
-
-    // Segundo scan del diskpart: también intencional para leer el MBR en vivo
-    let bus2 = AtaBus::scan();
-    if let Some(info) = bus2.info(DriveId::Primary0) {
-        let info = *info;
-        let drive = AtaDrive::from_info(info);
-
-        let mut mbr = [0u8; 512];
-        match drive.read_sectors(0, 1, &mut mbr) {
-            Ok(()) => {
-                let sig_ok = mbr[510] == 0x55 && mbr[511] == 0xAA;
-                {
-                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-                    append_str(&mut buf, &mut pos, b"  Firma MBR (0x55AA): ");
-                    if sig_ok {
-                        append_str(&mut buf, &mut pos, b"VALIDA");
-                        t.write_bytes(&buf[..pos], LineColor::Success);
-                    } else {
-                        append_str(&mut buf, &mut pos, b"NO ENCONTRADA");
-                        t.write_bytes(&buf[..pos], LineColor::Warning);
-                    }
-                }
-
-                t.write_line("  Tabla de particiones:", LineColor::Info);
-                t.write_line("  #  Estado   Tipo    LBA inicio   Tamaño (sectores)", LineColor::Normal);
-                for i in 0..4usize {
-                    let off    = 0x1BE + i * 16;
-                    let status = mbr[off];
-                    let ptype  = mbr[off + 4];
-                    let lba    = u32::from_le_bytes([mbr[off+8], mbr[off+9], mbr[off+10], mbr[off+11]]);
-                    let size   = u32::from_le_bytes([mbr[off+12], mbr[off+13], mbr[off+14], mbr[off+15]]);
-                    if ptype == 0 { continue; }
-
-                    let tipo_s: &[u8] = match ptype {
-                        0x0B | 0x0C => b"FAT32   ",
-                        0x0E        => b"FAT16   ",
-                        0x83        => b"Linux   ",
-                        0x07        => b"NTFS    ",
-                        _           => b"Otro    ",
-                    };
-
-                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-                    append_str(&mut buf, &mut pos, b"  ");
-                    append_u32(&mut buf, &mut pos, (i + 1) as u32);
-                    append_str(&mut buf, &mut pos, b"  ");
-                    if status == 0x80 {
-                        append_str(&mut buf, &mut pos, b"Activa   ");
-                    } else {
-                        append_str(&mut buf, &mut pos, b"Inactiva ");
-                    }
-                    buf[pos..pos + tipo_s.len()].copy_from_slice(tipo_s); pos += tipo_s.len();
-                    append_str(&mut buf, &mut pos, b"  ");
-                    append_u32(&mut buf, &mut pos, lba);
-                    append_str(&mut buf, &mut pos, b"          ");
-                    append_u32(&mut buf, &mut pos, size);
-                    t.write_bytes(&buf[..pos], LineColor::Normal);
-                }
-            }
-            Err(e) => {
-                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-                append_str(&mut buf, &mut pos, b"  Error leyendo MBR: ");
-                let em = ata_err_msg(e);
-                buf[pos..pos + em.len()].copy_from_slice(em); pos += em.len();
-                t.write_bytes(&buf[..pos], LineColor::Error);
-            }
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  ");
+            append_u32(&mut buf, &mut pos, idx as u32);
+            append_str(&mut buf, &mut pos, b"   ");
+            buf[pos..pos + canal.len()].copy_from_slice(canal); pos += canal.len();
+            append_str(&mut buf, &mut pos, b"  ");
+            buf[pos..pos + tipo.len()].copy_from_slice(tipo); pos += tipo.len();
+            append_str(&mut buf, &mut pos, b"  ");
+            buf[pos..pos + modo.len()].copy_from_slice(modo); pos += modo.len();
+            append_str(&mut buf, &mut pos, b"  ");
+            append_mib(&mut buf, &mut pos, info.capacity_mib);
+            append_str(&mut buf, &mut pos, b"       ");
+            let m  = info.model_str().as_bytes();
+            let ml = m.len().min(TERM_COLS - pos);
+            buf[pos..pos + ml].copy_from_slice(&m[..ml]); pos += ml;
+            t.write_bytes(&buf[..pos], LineColor::Normal);
         }
-
         t.write_empty();
-        let drive2 = AtaDrive::from_info(info);
-        match Fat32Volume::mount(drive2) {
-            Ok(vol) => {
-                let root = vol.root_cluster();
-                t.write_line("  Estado FAT32: MONTADO", LineColor::Success);
-                {
-                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-                    append_str(&mut buf, &mut pos, b"  Cluster ra\xEDz : ");
-                    append_u32(&mut buf, &mut pos, root);
-                    t.write_bytes(&buf[..pos], LineColor::Normal);
-                }
-                let mut file_count = 0u32; let mut dir_count = 0u32;
-                let _ = vol.list_dir(root, |e| {
-                    if e.is_dir { dir_count += 1; } else { file_count += 1; }
-                });
-                {
-                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-                    append_str(&mut buf, &mut pos, b"  Entradas ra\xEDz: ");
-                    append_u32(&mut buf, &mut pos, dir_count);
-                    append_str(&mut buf, &mut pos, b" directorios, ");
-                    append_u32(&mut buf, &mut pos, file_count);
-                    append_str(&mut buf, &mut pos, b" archivos");
-                    t.write_bytes(&buf[..pos], LineColor::Normal);
-                }
-            }
-            Err(_) => {
-                t.write_line("  Estado FAT32: NO MONTADO — ejecuta 'mkfs' para formatear", LineColor::Warning);
+    }
+
+    let reg_count = registry::device_count();
+    if reg_count > 0 {
+        t.write_line("  DISPOSITIVOS REGISTRADOS:", LineColor::Header);
+        t.write_line("  #   Tipo   Capacidad      Modelo", LineColor::Info);
+        t.write_line("  --- -----  -------------  -----", LineColor::Normal);
+        for i in 0..reg_count {
+            if let Some(drive) = registry::get_device(i) {
+                let info = drive.device_info();
+                let kind_s: &[u8] = if info.kind == DriveType::Atapi { b"ATAPI" } else { b"ATA  " };
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  ");
+                append_u32(&mut buf, &mut pos, i as u32);
+                append_str(&mut buf, &mut pos, b"   ");
+                buf[pos..pos + kind_s.len()].copy_from_slice(kind_s); pos += kind_s.len();
+                append_str(&mut buf, &mut pos, b"  ");
+                append_mib(&mut buf, &mut pos, info.capacity_mib);
+                append_str(&mut buf, &mut pos, b"       ");
+                let m  = info.model_str().as_bytes();
+                let ml = m.len().min(TERM_COLS - pos);
+                buf[pos..pos + ml].copy_from_slice(&m[..ml]); pos += ml;
+                t.write_bytes(&buf[..pos], LineColor::Normal);
             }
         }
+        t.write_empty();
+
+        for i in 0..reg_count {
+            if let Some(drive) = registry::get_device(i) {
+                show_device_fat32(t, drive, i);
+            }
+        }
+    } else {
+        t.write_line("  No hay dispositivos de bloque registrados.", LineColor::Warning);
     }
 
     t.write_empty();
@@ -1175,31 +1199,43 @@ pub fn cmd_diskinfo(t: &mut Terminal) {
 // COMANDOS ATA RAW — v0.8.0: Primary0 usa caché, otros drives scan puntual
 // ═══════════════════════════════════════════════════════════════════════════════
 
+fn read_sector_raw(drv_idx: usize, lba: u64, sector: &mut [u8; 512]) -> Result<(), AtaError> {
+    if drv_idx == 0 {
+        let drive = registry::get_device(0).ok_or(AtaError::NoDrive)?;
+        drive.read_sectors(lba, 1, sector)
+    } else {
+        let bus = AtaBus::scan();
+        let id = drive_id(drv_idx);
+        let info = bus.info(id).ok_or(AtaError::NoDrive)?;
+        let mut drive = crate::drivers::storage::ata::AtaDrive::from_info(*info);
+        drive.read_sectors(lba, 1, sector)
+    }
+}
+
 pub fn cmd_diskread(t: &mut Terminal, args: &[u8]) {
     let (lba, drv_idx) = parse_lba_drive(args);
-    let id             = drive_id(drv_idx);
 
-    // v0.8.0: Primary0 usa caché; otros drives usan scan puntual (diagnóstico)
-    let info = if drv_idx == 0 {
-        match get_cached_drive_info() {
-            Some(i) => i,
-            None => { t.write_line("  Error: drive no inicializado.", LineColor::Error); return; }
+    // Verificar límites
+    if drv_idx == 0 {
+        if let Some(d) = registry::get_device(0) {
+            if lba >= d.total_sectors() {
+                t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
+            }
         }
     } else {
         let bus = AtaBus::scan();
-        match bus.info(id) {
-            Some(i) => *i,
-            None => { t.write_line("  Error: drive no detectado.", LineColor::Error); return; }
+        let id = drive_id(drv_idx);
+        if let Some(info) = bus.info(id) {
+            if lba >= info.total_sectors {
+                t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
+            }
+        } else {
+            t.write_line("  Error: drive no detectado.", LineColor::Error); return;
         }
-    };
-
-    if lba >= info.total_sectors {
-        t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
     }
 
-    let drive      = AtaDrive::from_info(info);
     let mut sector = [0u8; 512];
-    if let Err(e) = drive.read_sectors(lba, 1, &mut sector) {
+    if let Err(e) = read_sector_raw(drv_idx, lba, &mut sector) {
         let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Error leyendo LBA ");
         append_u32(&mut buf, &mut pos, lba as u32);
@@ -1210,6 +1246,7 @@ pub fn cmd_diskread(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
+    // Hexdump
     {
         let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
         append_str(&mut buf, &mut pos, b"  Sector LBA=");
@@ -1260,17 +1297,38 @@ pub fn cmd_diskread(t: &mut Terminal, args: &[u8]) {
 
 pub fn cmd_diskedit(t: &mut Terminal, args: &[u8]) {
     let (lba, drv_idx) = parse_lba_drive(args);
-    let id             = drive_id(drv_idx);
 
-    // v0.8.0: Primary0 usa caché; otros drives usan scan puntual
-    let info = if drv_idx == 0 {
-        match get_cached_drive_info() {
-            Some(i) => i,
-            None => { t.write_line("  Error: drive no inicializado.", LineColor::Error); return; }
+    if drv_idx == 0 {
+        let drive = match registry::get_device(0) {
+            Some(d) => d,
+            None => { t.write_line("  Error: dispositivo 0 no disponible.", LineColor::Error); return; }
+        };
+        if lba >= drive.total_sectors() {
+            t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
         }
+        let info = drive.device_info();
+        let mut sector = [0u8; 512];
+        if let Err(e) = drive.read_sectors(lba, 1, &mut sector) {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  Error leyendo sector: ");
+            let em = ata_err_msg(e);
+            buf[pos..pos + em.len()].copy_from_slice(em); pos += em.len();
+            t.write_bytes(&buf[..pos], LineColor::Error);
+            return;
+        }
+        {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  Abriendo editor hex: LBA=");
+            append_u32(&mut buf, &mut pos, lba as u32);
+            append_str(&mut buf, &mut pos, b" drive=");
+            append_u32(&mut buf, &mut pos, drv_idx as u32);
+            t.write_bytes(&buf[..pos], LineColor::Info);
+        }
+        t.editor = Some(EditorState::new_hex(sector, lba, info, drv_idx));
     } else {
         let bus = AtaBus::scan();
-        match bus.info(id) {
+        let id = drive_id(drv_idx);
+        let info = match bus.info(id) {
             Some(i) => *i,
             None => {
                 let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -1280,34 +1338,30 @@ pub fn cmd_diskedit(t: &mut Terminal, args: &[u8]) {
                 t.write_bytes(&buf[..pos], LineColor::Error);
                 return;
             }
+        };
+        if lba >= info.total_sectors {
+            t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
         }
-    };
-
-    if lba >= info.total_sectors {
-        t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
+        let mut drive = crate::drivers::storage::ata::AtaDrive::from_info(info);
+        let mut sector = [0u8; 512];
+        if let Err(e) = drive.read_sectors(lba, 1, &mut sector) {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  Error leyendo sector: ");
+            let em = ata_err_msg(e);
+            buf[pos..pos + em.len()].copy_from_slice(em); pos += em.len();
+            t.write_bytes(&buf[..pos], LineColor::Error);
+            return;
+        }
+        {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  Abriendo editor hex: LBA=");
+            append_u32(&mut buf, &mut pos, lba as u32);
+            append_str(&mut buf, &mut pos, b" drive=");
+            append_u32(&mut buf, &mut pos, drv_idx as u32);
+            t.write_bytes(&buf[..pos], LineColor::Info);
+        }
+        t.editor = Some(EditorState::new_hex(sector, lba, info, drv_idx));
     }
-
-    let drive      = AtaDrive::from_info(info);
-    let mut sector = [0u8; 512];
-    if let Err(e) = drive.read_sectors(lba, 1, &mut sector) {
-        let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-        append_str(&mut buf, &mut pos, b"  Error leyendo sector: ");
-        let em = ata_err_msg(e);
-        buf[pos..pos + em.len()].copy_from_slice(em); pos += em.len();
-        t.write_bytes(&buf[..pos], LineColor::Error);
-        return;
-    }
-
-    {
-        let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-        append_str(&mut buf, &mut pos, b"  Abriendo editor hex: LBA=");
-        append_u32(&mut buf, &mut pos, lba as u32);
-        append_str(&mut buf, &mut pos, b" drive=");
-        append_u32(&mut buf, &mut pos, drv_idx as u32);
-        t.write_bytes(&buf[..pos], LineColor::Info);
-    }
-
-    t.editor = Some(EditorState::new_hex(sector, lba, info));
 }
 
 pub fn cmd_diskwrite(t: &mut Terminal, args: &[u8]) {
@@ -1329,16 +1383,18 @@ pub fn cmd_diskwrite(t: &mut Terminal, args: &[u8]) {
         None => { t.write_line("  Error: patrón inválido (usa 0xNN).", LineColor::Error); return; }
     };
 
-    // v0.8.0: usar caché
-    let info = match get_cached_drive_info() {
-        Some(i) => i,
-        None => { t.write_line("  Error: drive 0 no disponible.", LineColor::Error); return; }
+    let drive = match registry::get_device(0) {
+        Some(d) => d,
+        None => { t.write_line("  Error: dispositivo 0 no disponible.", LineColor::Error); return; }
     };
-    if lba >= info.total_sectors {
+    if lba >= drive.total_sectors() {
         t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
     }
 
-    let drive = AtaDrive::from_info(info);
+    if lba < 68 {
+        t.write_line("  [ADVERTENCIA] LBA en area de boot (0-67). El sistema puede volverse inarrancable.", LineColor::Error);
+    }
+
     let buf   = [pat; 512];
     match drive.write_sectors(lba, 1, &buf) {
         Ok(()) => {
@@ -1352,5 +1408,95 @@ pub fn cmd_diskwrite(t: &mut Terminal, args: &[u8]) {
             t.write_bytes(&line[..lp], LineColor::Success);
         }
         Err(_) => { t.write_line("  Error: fallo al escribir sector.", LineColor::Error); }
+    }
+}
+
+fn parse_device_arg(args: &[u8]) -> Option<usize> {
+    let a = trim(args);
+    if a.is_empty() { return None; }
+    parse_u64(a).map(|n| n as usize)
+}
+
+pub fn cmd_mkfs(t: &mut Terminal, args: &[u8]) {
+    let dev_idx = match parse_device_arg(args) {
+        Some(n) => n,
+        None => {
+            let mut found: Option<usize> = None;
+            for i in 0..registry::device_count() {
+                if let Some(d) = registry::get_device(i) {
+                    if d.device_info().kind != DriveType::Atapi && d.total_sectors() > 0 {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(i) => i,
+                None => {
+                    t.write_line("  Uso: mkfs [device]", LineColor::Info);
+                    t.write_line("    mkfs 1        Formatear device 1", LineColor::Normal);
+                    t.write_line("    mkfs          Formatear primer device ATA no-ATAPI", LineColor::Normal);
+                    t.write_empty();
+                    return;
+                }
+            }
+        }
+    };
+
+    let drive = match registry::get_device(dev_idx) {
+        Some(d) => d,
+        None => {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  Error: device ");
+            append_u32(&mut buf, &mut pos, dev_idx as u32);
+            append_str(&mut buf, &mut pos, b" no disponible.");
+            t.write_bytes(&buf[..pos], LineColor::Error);
+            return;
+        }
+    };
+
+    let info = drive.device_info();
+    if info.kind == DriveType::Atapi {
+        t.write_line("  Error: no se puede formatear un CD-ROM (ATAPI).", LineColor::Error);
+        t.write_line("  Especifica un device ATA valido (ej: 'mkfs 1').", LineColor::Normal);
+        return;
+    }
+
+    let total_secs = drive.total_sectors();
+    if total_secs == 0 {
+        t.write_line("  Error: el dispositivo tiene 0 sectores.", LineColor::Error);
+        return;
+    }
+
+    let mut mb = [0u8; 32]; let mut mp = 0;
+    append_u32(&mut mb, &mut mp, (total_secs / 2048) as u32);
+    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+    append_str(&mut buf, &mut pos, b"  Formateando device ");
+    append_u32(&mut buf, &mut pos, dev_idx as u32);
+    append_str(&mut buf, &mut pos, b" (");
+    append_u32(&mut buf, &mut pos, total_secs as u32);
+    append_str(&mut buf, &mut pos, b" sectores = ");
+    t.write_bytes(&buf[..pos], LineColor::Info);
+    t.write_bytes(&mb[..mp], LineColor::Info);
+    t.write_line(" MiB)...", LineColor::Info);
+
+    match mkfs::auto_format(drive, total_secs) {
+        Some(root_clus) => {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  [OK] Formato completado. Cluster raiz: ");
+            append_u32(&mut buf, &mut pos, root_clus);
+            t.write_bytes(&buf[..pos], LineColor::Success);
+
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  Dispositivo ");
+            append_u32(&mut buf, &mut pos, dev_idx as u32);
+            append_str(&mut buf, &mut pos, b" listo para usar.");
+            t.write_bytes(&buf[..pos], LineColor::Normal);
+            t.write_line("  Ejecuta 'diskpart' para verificar el estado.", LineColor::Normal);
+        }
+        None => {
+            t.write_line("  [ERROR] Fallo al formatear el dispositivo.", LineColor::Error);
+            t.write_line("  Verifica que no este en uso y tenga al menos 8 MB.", LineColor::Warning);
+        }
     }
 }

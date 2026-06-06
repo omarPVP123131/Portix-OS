@@ -20,8 +20,9 @@
 #![allow(dead_code)]
 
 use crate::drivers::input::keyboard::Key;
-use crate::drivers::storage::ata::{AtaDrive, AtaError, DriveId, DriveInfo};
+use crate::drivers::storage::ata::{AtaError, DriveId, DriveInfo};
 use crate::drivers::storage::fat32::{Fat32Volume, DirEntryInfo};
+use crate::drivers::storage::registry;
 use crate::graphics::driver::framebuffer::{Color, Console, Layout};
 use crate::util::fmt as kfmt;
 
@@ -92,6 +93,8 @@ pub struct EditorState {
     pub lba:          u64,
     /// Info del drive para modo hex.
     pub drive_info:   DriveInfo,
+    /// ID del dispositivo en el DeviceRegistry.
+    pub device_id:    usize,
     /// Cursor en modo hex (índice de byte 0-511).
     pub cursor:       usize,
     /// Nibble alto (true) o bajo (false) en modo hex.
@@ -128,9 +131,9 @@ pub struct EditorState {
 impl EditorState {
     // ── Constructores ─────────────────────────────────────────────────────────
 
-    /// Crea el estado para el editor hexadecimal (sector raw).
-    pub fn new_hex(buf: [u8; 512], lba: u64, drive_info: DriveInfo) -> Self {
+    pub fn new_hex(buf: [u8; 512], lba: u64, drive_info: DriveInfo, device_id: usize) -> Self {
         let mut ed = Self::base(drive_info);
+        ed.device_id = device_id;
         ed.mode   = EditorMode::Hex;
         ed.buf    = buf;
         ed.lba    = lba;
@@ -141,16 +144,17 @@ impl EditorState {
         ed
     }
 
-    /// Crea el estado para el editor de texto tipo nano.
     pub fn new_text(
         content: [u8; EDITOR_MAX_BYTES],
         content_len: usize,
         entry: DirEntryInfo,
         drive_info: DriveInfo,
+        device_id: usize,
         path: &[u8],
     ) -> Self {
         let mut ed = Self::base(drive_info);
-        ed.mode       = EditorMode::Text;
+        ed.device_id = device_id;
+        ed.mode = EditorMode::Text;
         ed.text_buf   = content;
         ed.text_len   = content_len;
         ed.fat_entry  = Some(entry);
@@ -170,6 +174,7 @@ impl EditorState {
             buf:           [0u8; 512],
             lba:           0,
             drive_info,
+            device_id:     0,
             cursor:        0,
             hi_nibble:     true,
             scroll:        0,
@@ -190,9 +195,8 @@ impl EditorState {
         }
     }
 
-    // Mantener compatibilidad con código antiguo que usa new() para modo hex
-    pub fn new(buf: [u8; 512], lba: u64, drive_info: DriveInfo) -> Self {
-        Self::new_hex(buf, lba, drive_info)
+    pub fn new(buf: [u8; 512], lba: u64, drive_info: DriveInfo, device_id: usize) -> Self {
+        Self::new_hex(buf, lba, drive_info, device_id)
     }
 
     // ── Mensajes ─────────────────────────────────────────────────────────────
@@ -293,7 +297,15 @@ pub fn handle_key(&mut self, key: Key, ctrl: bool) -> bool {
     }
 
     fn save_hex(&mut self) {
-        let drive = AtaDrive::from_info(self.drive_info);
+        if self.lba < 68 {
+            self.set_msg(b"[ERROR] LBA en area de boot (0-67). No se puede guardar.", MsgKind::Error);
+            return;
+        }
+
+        let drive = match registry::get_device(self.device_id) {
+            Some(d) => d,
+            None => { self.set_msg(b"[ERROR] Dispositivo no disponible.", MsgKind::Error); return; }
+        };
         match drive.write_sectors(self.lba, 1, &self.buf) {
             Ok(()) => {
                 self.dirty = false;
@@ -531,17 +543,14 @@ fn handle_key_text(&mut self, key: Key, ctrl: bool) -> bool {
     // ── Guardar en FAT32 ─────────────────────────────────────────────────────
 
     fn save_text(&mut self) {
-        // Necesitamos montar el volumen para guardar
-        let bus  = crate::drivers::storage::ata::AtaBus::scan();
-        let info = match bus.info(DriveId::Primary0) {
-            Some(i) => *i,
+        let drive = match registry::get_device(self.device_id) {
+            Some(d) => d,
             None => {
-                self.set_msg(b"[ERROR] Drive no disponible.", MsgKind::Error);
+                self.set_msg(b"[ERROR] Dispositivo no disponible.", MsgKind::Error);
                 return;
             }
         };
-        let drive = AtaDrive::from_info(info);
-        let vol = match Fat32Volume::mount(drive) {
+        let mut vol = match Fat32Volume::mount(drive) {
             Ok(v) => v,
             Err(_) => {
                 self.set_msg(b"[ERROR] No se pudo montar el volumen FAT32.", MsgKind::Error);

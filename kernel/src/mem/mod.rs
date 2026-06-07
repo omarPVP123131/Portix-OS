@@ -1,6 +1,7 @@
 // kernel/src/mem/mod.rs
 
-pub mod allocator;  // ← pub, no solo mod
+pub mod allocator;
+pub mod paging;
 
 use core::sync::atomic::Ordering;
 

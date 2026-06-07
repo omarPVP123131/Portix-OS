@@ -853,6 +853,8 @@ def main():
     # Two-pass stage2: placeholder first, then real KERNEL_SECTORS after kernel is built.
     # This resolves the circular dependency: stage2.bin needs KERNEL_SECTORS, but the
     # kernel (which embeds stage2.bin via include_bytes!) determines KERNEL_SECTORS.
+    # Generate the ring-3 hello.elf first (needed by kernel's include_bytes!)
+    run(["python", str(ROOT / "scripts" / "mkhello.py")])
     assemble_stage2(1)
     ks = build_kernel()
     assemble_stage2(ks)

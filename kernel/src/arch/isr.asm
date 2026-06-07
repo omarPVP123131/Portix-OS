@@ -30,6 +30,9 @@ extern isr_double_fault
 extern isr_gp_handler
 extern isr_page_fault
 extern isr_generic_handler
+extern syscall_dispatch
+extern enter_ring3_setup
+extern __stack_top
 
 ; CrashFrame exportada desde Rust como #[no_mangle] static mut
 ; Offsets (ver struct CrashFrame en isr_handlers.rs):
@@ -58,6 +61,18 @@ global irq0_handler
 global irq_stub_master
 global irq_stub_slave
 global reload_segments
+global syscall_entry
+global int80_handler
+global ring3_exit_trampoline
+
+; ─── Guardar RSP de usuario (syscall_entry) ──────────────────────────────
+section .data
+syscall_count: dq 0
+user_rsp_save: dq 0
+user_rflags_save: dq 0   ; RFLAGS original (syscall los guarda en R11)
+user_rip_save: dq 0       ; RIP original (syscall lo guarda en RCX)
+global ring3_ret_rsp
+ring3_ret_rsp: dq 0       ; kernel RSP to restore on ring-3 exit (points to resume fn address)
 
 ; ─── Macro: llenar crash_frame ANTES de tocar los registros ─────────────────
 ; Se llama al inicio del stub, cuando el stack aún tiene el frame original.
@@ -142,9 +157,7 @@ global reload_segments
 ; ─── IRQ0: PIT tick ──────────────────────────────────────────────────────────
 irq0_handler:
     PUSH_REGS
-    push    rax                 ; dummy align
     call    pit_tick
-    pop     rax
     mov     al, 0x20
     out     0x20, al
     POP_REGS
@@ -185,9 +198,7 @@ global isr_16, isr_17, isr_18, isr_19
 isr_%1:
     CAPTURE_FRAME 0         ; RIP en [RSP+0] (antes de cualquier push)
     PUSH_REGS
-    push rax                ; align
     call %2
-    pop  rax
     POP_REGS
     iretq
 %endmacro
@@ -199,9 +210,7 @@ isr_%1:
     CAPTURE_FRAME 8         ; RIP en [RSP+8] (EC está en [RSP+0])
     pop     rdi             ; error code → RDI (primer arg Rust)
     PUSH_REGS
-    push    rax             ; align
     call    %2
-    pop     rax
     POP_REGS
     iretq
 %endmacro
@@ -224,3 +233,95 @@ ISR_NOERR 16, isr_generic_handler   ; #MF
 ISR_ERR   17, isr_generic_handler   ; #AC
 ISR_NOERR 18, isr_generic_handler   ; #MC
 ISR_NOERR 19, isr_generic_handler   ; #XM
+
+; ─── int 0x80 handler (ring 3 → ring 0 via int 0x80) ────────────────────────
+; On entry (CPU has already switched to ring-0 stack via TSS.RSP0):
+;   Stack: [RSP+0]=RIP, [RSP+8]=CS, [RSP+16]=RFLAGS, [RSP+24]=RSP, [RSP+32]=SS
+;   RAX = syscall number
+;   RDI, RSI, RDX, R10, R8, R9 = args 1-6
+;   (int preserves all registers)
+int80_handler:
+    swapgs
+    PUSH_REGS
+    ; Reorder args for syscall_dispatch(rdi=num, rsi=a1, rdx=a2, rcx=a3, r8=a4, r9=a5)
+    mov     r9, r8
+    mov     r8, r10
+    mov     rcx, rdx
+    mov     rdx, rsi
+    mov     rsi, rdi
+    mov     rdi, rax
+    call    syscall_dispatch
+    ; Replace saved RAX on stack with return value
+    mov     [rsp + 64], rax
+    POP_REGS
+    swapgs
+    iretq
+
+; ─── enter_ring3_asm — ring-3 transition with RSP save ──────────────────
+; Called from rust_main.  Saves return context on stack before calling
+; the Rust enter_ring3_setup which does IRETQ to ring 3.
+; At entry: [rsp] = return address to rust_main (pushed by call)
+global enter_ring3_asm
+enter_ring3_asm:
+    pop     rax                     ; RAX = return addr to rust_main
+    push    rax                     ; push it back
+    mov     [ring3_ret_rsp], rsp    ; save RSP = addr of return addr
+    call    enter_ring3_setup
+    ; Never reached — setup does IRETQ.  Trampoline restores RSP and rets.
+    hlt
+    jmp     enter_ring3_asm
+
+; ─── ring3_exit_trampoline — return from ring 3 to kernel main loop ───────
+; Called from sys_exit via ring3_exit_trampoline().
+; Restores kernel RSP (ring3_ret_rsp was set by enter_ring3_asm to point
+; to the return address to rust_main), then rets into rust_main's continuation.
+ring3_exit_trampoline:
+    mov     rsp, [ring3_ret_rsp]
+    ret
+
+; ─── syscall_entry (SYSCALL de ring 3 a ring 0) ─────────────────────────────
+; On entry (after SYSCALL):
+;   RAX = syscall number
+;   RCX = user RIP (poisoned by SYSCALL)
+;   R11 = user RFLAGS (poisoned by SYSCALL)
+;   RDI, RSI, RDX, R10, R8, R9 = args 1-6
+;   RSP = user RSP (unchanged)
+;   SS  = set to STAR[47:32]+8 by CPU (SS.DPL forced to 0)
+;   CS  = KERNEL_CS
+;
+; Registers preserved across syscall: RBX, RBP, R12-R15
+syscall_entry:
+    ; DEBUG: print 'E' BEFORE swapgs to confirm SYSCALL entry
+    push    rax
+    push    rdx
+    mov     al, 'E'
+    mov     dx, 0x3F8
+    out     dx, al
+    pop     rdx
+    pop     rax
+
+    swapgs
+
+    ; Save user context in callee-saved registers (preserved by C ABI)
+    mov     r12, rsp        ; user RSP
+    mov     r13, r11        ; user RFLAGS
+    mov     r14, rcx        ; user RIP
+
+    lea     rsp, [rel __stack_top]
+
+    ; Reorder: user RAX→RDI, RDI→RSI, RSI→RDX, RDX→RCX, R10→R8, R8→R9
+    mov     r9, r8          ; a5
+    mov     r8, r10         ; a4
+    mov     rcx, rdx        ; a3
+    mov     rdx, rsi        ; a2
+    mov     rsi, rdi        ; a1
+    mov     rdi, rax        ; syscall number
+
+    call    syscall_dispatch
+
+    ; Restore user RSP, RFLAGS(R11), RIP(RCX)
+    mov     rsp, r12
+    mov     r11, r13
+    mov     rcx, r14
+    swapgs
+    sysret

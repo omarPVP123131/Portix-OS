@@ -21,7 +21,10 @@ pub mod bootinfo;
 pub mod console;
 pub mod drivers;
 pub mod graphics;
+pub mod elf;
 pub mod mem;
+pub mod process;
+pub mod syscall;
 pub mod time;
 pub mod ui;
 pub mod util;
@@ -53,7 +56,7 @@ extern "Rust" fn __rust_alloc_error_handler(size: usize, align: usize) -> ! {
 extern "C" {
     static __bss_start: u8;
     static __bss_end: u8;
-    static __stack_top: u8;
+    pub static __stack_top: u8;
 }
 
 global_asm!(
@@ -213,12 +216,15 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
     unsafe { bootinfo::init(boot_info); }
     unsafe { init_cpu_features(); }
 
+    drivers::serial::init();  // serial antes que nada para debug
+
     // IDT primero — sin esto cualquier excepción = triple fault opaco
     unsafe { arch::idt::init_idt(); }  // instala GDT+TSS+IDT y hace STI
 
     unsafe { ALLOCATOR.init(); }
+    mem::paging::init();
+    process::init();
     init_page_pool();
-    drivers::serial::init();
     time::pit::init();
     drivers::serial::log("PIT", "temporizador 100 Hz");
 
@@ -342,6 +348,16 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
     ];
 
     c.clear(Color::PORTIX_BG);
+
+    // ── Ring 3 demo — ELF64 from embedded binary ─────────────────────────
+    let hello_elf = include_bytes!("../../build/hello.elf");
+    if let Some(pid) = elf::elf_load_and_create_process(hello_elf, "hello") {
+        process::set_current(pid);
+        unsafe { arch::ring3::enter_ring3_asm(); }
+        drivers::serial::log("R3", "Returned to ring 0 OK - main loop running");
+    } else {
+        drivers::serial::log("R3", "ERROR: failed to load ELF or create process");
+    }
 
     loop {
         let now = time::pit::ticks();

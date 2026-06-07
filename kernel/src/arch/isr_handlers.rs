@@ -547,6 +547,13 @@ if f.valid == 0 {
 extern "C" fn isr_page_fault(ec: u64) {
     let cr2: u64;
     unsafe { core::arch::asm!("mov {r}, cr2", r = out(reg) cr2, options(nostack, preserves_flags)); }
+
+    if crate::mem::paging::is_expecting_user_fault() {
+        crate::mem::paging::clear_expect_user_fault();
+        crate::drivers::serial::write_str("#PF recovered (expected user fault)\n");
+        return;
+    }
+
     let f = frame();
 
     // [FIX-GP-DF] Si valid == 0 el framebuffer puede no estar mapeado.
@@ -644,85 +651,60 @@ extern "C" fn isr_page_fault(ec: u64) {
 extern "C" fn isr_gp_handler(ec: u64) {
     let f = frame();
 
-    // [FIX-GP-DF] CRÍTICO: si valid == 0, Console::new() podría acceder al
-    // framebuffer en 0x01000000 (no mapeado en QEMU BIOS/raw), disparando
-    // otro #GP → cascada → #DF. Usar VGA text como fallback seguro.
-if f.valid == 0 {
+    if f.valid == 0 {
         unsafe {
             vga_error(
-                b"  PORTIX-OS  KERNEL PANIC  |  Sistema detenido             ",
-                b"  (crash_frame.valid=0 - framebuffer no disponible)         ",
+                b"  PORTIX-OS  #GP GENERAL PROTECTION FAULT  |  Sistema detenido",
+                b"  (crash_frame.valid=0 - ISR sin frame capturado). EC puede ser 0.",
             );
         }
         halt_loop()
     }
+
     let mut c = Console::new();
     let (w, h) = (c.width(), c.height());
 
     grad_v(&mut c, pal::GP_BG, pal::GP_BG2);
-    let mut seed: u64 = 0xDEAD_BEEF_C0FFEE ^ ec;
-    for _ in 0..220usize {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let px = ((seed>>33) as usize) % w; let py = ((seed>>17) as usize) % h;
-        let sz = if seed&7==0{2}else{1};    let a = (25+(seed&0x45)) as u8;
-        c.fill_rect(px, py, sz, sz, if seed&1==0{pal::GP_VIOLET.dim(a)}else{pal::GP_MAGENTA.dim(a)});
-    }
-    let mut y=0usize; while y<h { c.fill_rect(0,y,w,1,pal::GP_VIOLET.dim(8)); y+=8; }
-
+    watermark(&mut c, "PORTIX  #GP", Color::new(0x14, 0x00, 0x28));
+    dot_grid(&mut c, 0, 0, w, h, 20, Color::new(0x18, 0x00, 0x30));
     draw_top_bar(&mut c, pal::GP_VIOLET, pal::GP_MAGENTA);
-    badge(&mut c, "INT  0x0D  (#GP)", w.saturating_sub(148), 12, pal::GP_YELLOW, pal::GP_DIM);
     draw_corner_rip(&mut c, f.rip, f.valid);
 
-    let tx=50usize; let ty=38usize;
-    for r in (2usize..=7).rev() { let a=(10+(7-r)*14) as u8; c.write_at_tall("#GP",tx.saturating_sub(r),ty.saturating_sub(r/2),pal::GP_VIOLET.dim(a)); }
-    c.write_at_tall("#GP", tx, ty, pal::GP_MAGENTA);
-    write_glow(&mut c, "GENERAL  PROTECTION  FAULT", tx, ty+30, pal::GP_PINK, pal::GP_VIOLET.dim(38));
-    c.write_at("Violacion de proteccion de segmento o instruccion privilegiada.", tx, ty+44, pal::LIGHT);
-    diamond_sep(&mut c, ty+60, pal::GP_VIOLET);
-
-    let col_y = ty+70; let col2_x = w/2+20;
-    section_title(&mut c, "ERROR CODE  /  SELECTOR", tx, col_y, pal::GP_VIOLET.dim(180));
-    { let mut buf=[0u8;18]; c.write_at(fmt_hex(ec,&mut buf), tx+210, col_y, pal::GP_YELLOW); }
-
-    let is_ext=(ec&1)!=0; let is_idt=(ec&2)!=0; let is_ti=(ec&4)!=0; let index=(ec>>3)&0x1FFF;
-    let fields: &[(&str,&str,bool,Color)] = &[
-        ("EXT  bit 0","Origen externo al procesador",          is_ext, pal::GP_PINK),
-        ("IDT  bit 1","Referencia a la IDT",                   is_idt, pal::GP_PINK),
-        ("TI   bit 2",if is_ti{"LDT"}else{"GDT"},              is_ti,  pal::GP_VIOLET),
-    ];
-    for (i,(bit,desc,set,accent)) in fields.iter().enumerate() {
-        let fy = col_y+18+i*20;
-        let ind = if *set{*accent}else{pal::MID};
-        c.fill_rect(tx,fy+1,12,12,ind.dim(if *set{200}else{45}));
-        if *set{c.fill_rect(tx+3,fy+4,6,6,ind);}
-        c.write_at(bit, tx+16,fy+2,ind.dim(200));
-        c.write_at(desc,tx+90,fy+2,if *set{pal::WHITE}else{pal::MID});
+    let ix=42usize; let iy=38usize;
+    for dy in 0..4usize {
+        for dx in 0..dy*2+1 {
+            c.fill_rect(ix+11-dy+dx, iy+dy*4, 1, 4, pal::GP_VIOLET);
+        }
     }
-    {
-        let idx_y = col_y+18+fields.len()*20+6;
-        let mut buf=[0u8;18];
-        c.write_at("INDEX  bits[15:3]",tx,idx_y,pal::MID);
-        c.write_at(fmt_hex(index,&mut buf),tx+168,idx_y,pal::GP_YELLOW);
-        let known=match index{0=>"(NULL)",1=>"(kcode 0x08)",2=>"(kdata 0x10)",3=>"(ucode 0x18)",4=>"(udata 0x20)",_=>""};
-        if !known.is_empty(){c.write_at(known,tx+240,idx_y,pal::GP_VIOLET.dim(180));}
-        let cause = if ec==0{"Instruccion privilegiada / acceso a I/O en modo usuario"}
-                    else if is_idt{"Excepcion dentro de handler (IDT corrompida)"}
-                    else if index==0{"Selector NULL como destino de far call/jump"}
-                    else{"Descriptor invalido o sin permisos suficientes"};
-        section_title(&mut c,"CAUSA PROBABLE",tx,idx_y+18,pal::GP_PINK.dim(180));
-        c.write_at(cause,tx,idx_y+34,pal::LIGHT);
-    }
+    c.fill_rect(ix+8, iy+18, 7, 10, pal::GP_VIOLET);
+    c.fill_rect(ix+10, iy+18, 3, 12, Color::new(0x18,0,0x30));
 
-    section_title(&mut c,"CONTEXTO DE CPU",col2_x,col_y,pal::GP_VIOLET.dim(180));
-    let cpu_regs: &[(&str,u64)] = &[
-        ("RIP ",f.rip),("RSP ",f.rsp),("RFLG",f.rflags),("CR3 ",f.cr3),
+    let tx=78usize; let ty=36usize;
+    write_glow_tall(&mut c, "#GP GENERAL PROTECTION FAULT", tx, ty, pal::GP_VIOLET, pal::GP_DIM);
+    badge(&mut c, "EXCEPCION DE PROTECCION GENERAL", tx, ty+30, pal::WHITE, pal::GP_DIM);
+    diamond_sep(&mut c, ty+52, pal::GP_VIOLET);
+
+    let d_y=ty+60;
+    section_title(&mut c, "CAUSAS COMUNES", tx, d_y, pal::GP_VIOLET.dim(200));
+    c.write_at("►  Acceso a memoria con alineacion incorrecta (SSE: movaps, movdqa)", tx, d_y+16, pal::GP_PINK.dim(180));
+    c.write_at("►  Segmento de codigo/datos con permisos insuficientes",            tx, d_y+28, pal::GP_PINK.dim(180));
+    c.write_at("►  MSR invalido: escritura WRMSR a MSR reservado",                tx, d_y+40, pal::GP_PINK.dim(180));
+    c.write_at("►  Instruccion privilegiada ejecutada en ring 3 (CPL>0)",          tx, d_y+52, pal::GP_PINK.dim(180));
+
+    let err_y=d_y+68;
+    section_title(&mut c, "ERROR CODE", tx, err_y, pal::GP_VIOLET.dim(200));
+    { let mut buf=[0u8;18]; c.write_at(fmt_hex(ec, &mut buf), tx+110, err_y, pal::GP_YELLOW); }
+
+    let reg_y=err_y+28;
+    section_title(&mut c, "CONTEXTO DE CPU", tx, reg_y, pal::MID);
+    let regs: &[(&str,u64)] = &[
+        ("EC  ",ec),("RIP ",f.rip),("RSP ",f.rsp),("RFLG",f.rflags),
         ("RAX ",f.rax),("RBX ",f.rbx),("RCX ",f.rcx),("RDX ",f.rdx),
-        ("RSI ",f.rsi),("RDI ",f.rdi),
     ];
-    let cw2 = (w.saturating_sub(col2_x+20))/2;
-    reg_grid_ncol(&mut c,cpu_regs,col2_x,col_y+16,2,cw2.saturating_sub(4),16,pal::GP_MAGENTA.dim(110));
+    reg_grid_ncol(&mut c, regs, tx, reg_y+16, 2, 200, 16, pal::GP_VIOLET.dim(130));
 
-    draw_bottom_bar(&mut c,pal::GP_VIOLET,pal::GP_MAGENTA,"#GP GENERAL PROTECTION FAULT  |  SISTEMA DETENIDO");
+    draw_bottom_bar(&mut c, pal::GP_VIOLET, pal::GP_MAGENTA,
+                   "#GP GENERAL PROTECTION FAULT  |  SISTEMA DETENIDO");
     c.present(); halt_loop()
 }
 

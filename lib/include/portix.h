@@ -1,0 +1,142 @@
+#ifndef _PORTIX_H
+#define _PORTIX_H
+
+typedef unsigned long long u64;
+typedef unsigned int       u32;
+typedef unsigned short     u16;
+typedef unsigned char      u8;
+typedef long long          i64;
+typedef int                i32;
+typedef short              i16;
+typedef signed char        i8;
+
+typedef u64 size_t;
+typedef i64 ssize_t;
+
+#define NULL ((void*)0)
+#define EOF (-1)
+
+typedef __builtin_va_list va_list;
+#define va_start(v,l) __builtin_va_start(v,l)
+#define va_end(v)     __builtin_va_end(v)
+#define va_arg(v,t)   __builtin_va_arg(v,t)
+#define va_copy(d,s)  __builtin_va_copy(d,s)
+
+#define SYS_EXIT   0
+#define SYS_WRITE  1
+#define SYS_GETPID 2
+#define SYS_YIELD  3
+#define SYS_SLEEP  4
+#define SYS_READ   5
+#define SYS_OPEN   6
+#define SYS_CLOSE  7
+#define SYS_BRK    8
+#define SYS_MMAP   9
+
+#define O_RDONLY 0
+#define O_WRONLY 1
+#define O_RDWR   2
+
+#define PROT_READ  1
+#define PROT_WRITE 2
+#define PROT_EXEC  4
+
+#define MAP_PRIVATE   2
+#define MAP_ANONYMOUS 32
+
+#define STDIN_FILENO  0
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
+
+static inline u64 syscall(u64 num, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    u64 ret;
+    register u64 r10 asm("r10") = a4;
+    register u64 r8  asm("r8")  = a5;
+    asm volatile("int $0x80"
+        : "=a"(ret)
+        : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline u64 syscall0(u64 num) {
+    return syscall(num, 0, 0, 0, 0, 0);
+}
+
+static inline u64 syscall1(u64 num, u64 a1) {
+    return syscall(num, a1, 0, 0, 0, 0);
+}
+
+static inline u64 syscall4(u64 num, u64 a1, u64 a2, u64 a3, u64 a4) {
+    return syscall(num, a1, a2, a3, a4, 0);
+}
+
+static inline u64 syscall2(u64 num, u64 a1, u64 a2) {
+    return syscall(num, a1, a2, 0, 0, 0);
+}
+
+static inline u64 syscall3(u64 num, u64 a1, u64 a2, u64 a3) {
+    return syscall(num, a1, a2, a3, 0, 0);
+}
+
+static inline void exit(int code) {
+    syscall1(SYS_EXIT, code);
+    __builtin_unreachable();
+}
+
+static inline ssize_t write(int fd, const void *buf, size_t count) {
+    return (ssize_t)syscall3(SYS_WRITE, fd, (u64)buf, count);
+}
+
+static inline ssize_t read(int fd, void *buf, size_t count) {
+    return (ssize_t)syscall3(SYS_READ, fd, (u64)buf, count);
+}
+
+static inline int open(const char *path, int flags) {
+    return (int)syscall2(SYS_OPEN, (u64)path, flags);
+}
+
+static inline int close(int fd) {
+    return (int)syscall1(SYS_CLOSE, fd);
+}
+
+static inline int getpid(void) {
+    return (int)syscall0(SYS_GETPID);
+}
+
+static inline void yield(void) {
+    syscall0(SYS_YIELD);
+}
+
+static inline void sleep(u64 ticks) {
+    syscall1(SYS_SLEEP, ticks);
+}
+
+static inline void *brk(void *addr) {
+    return (void*)syscall1(SYS_BRK, (u64)addr);
+}
+
+static inline void *mmap(void *addr, size_t len, int prot, int flags) {
+    return (void*)syscall4(SYS_MMAP, (u64)addr, len, prot, flags);
+}
+
+int putchar(int c);
+int puts(const char *s);
+int printf(const char *fmt, ...);
+
+void *malloc(size_t size);
+void free(void *ptr);
+void *calloc(size_t nmemb, size_t size);
+void *realloc(void *ptr, size_t size);
+
+void *memcpy(void *dest, const void *src, size_t n);
+void *memset(void *s, int c, size_t n);
+void *memmove(void *dest, const void *src, size_t n);
+int memcmp(const void *s1, const void *s2, size_t n);
+size_t strlen(const char *s);
+int strcmp(const char *s1, const char *s2);
+char *strcpy(char *dest, const char *src);
+char *strncpy(char *dest, const char *src, size_t n);
+char *strcat(char *dest, const char *src);
+
+#endif

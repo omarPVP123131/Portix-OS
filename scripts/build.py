@@ -779,6 +779,23 @@ def run_qemu():
 # summary
 # ─────────────────────────────────────────────────────────────────────────────
 
+LIB_DIR = ROOT / "lib"
+LIB_BUILD = LIB_DIR / "build"
+LIB_A = LIB_BUILD / "libportix.a"
+LIB_CC = find_tool("x86_64-elf-gcc")
+LIB_OK = LIB_A.exists()
+
+def build_libportix():
+    step("COMPILANDO libportix (Fase 7)")
+    if not LIB_CC:
+        log("  [SKIP] x86_64-elf-gcc no encontrado")
+        log("  Para construir: bash scripts/ring3-toolchain.sh")
+        return
+    if LIB_OK:
+        log(f"[OK]    libportix.a — {human(LIB_A)}")
+        return
+    run(["make","-C",str(LIB_DIR)])
+
 def summary():
     el = time.monotonic() - _t0
     W  = 78
@@ -824,7 +841,9 @@ def summary():
             info = "(no generado)"
         print(row(f"  {st} {lbl} {info}"))
     print(sep())
+    lib_st = "OK" if LIB_OK else "NO (sin x86_64-elf-gcc)"
     print(row(f"  ISO: {iso_desc}"))
+    print(row(f"  libportix: {lib_st}"))
     print(row(f"  OVMF: {ovmf_s}"))
     print(row(f"  Build: {el:.1f}s"))
     print(sep())
@@ -860,6 +879,8 @@ def main():
     assemble_stage2(ks)
     ks = build_kernel()
     create_raw(ks)
+
+    build_libportix()
 
     build_efi_loader()
     create_uefi_image(UEFI_IMG)

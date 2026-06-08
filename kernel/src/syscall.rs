@@ -5,6 +5,8 @@ use crate::drivers::storage::registry;
 use crate::drivers::storage::vfs;
 use crate::mem::paging::{self, PAGE_SIZE};
 use crate::process::{self, FdEntry, FdType, OpenFileInfo};
+use crate::drivers::input::keyboard::{KeyboardState, Key};
+use crate::arch::isr_handlers::{pop_scancode, set_stdin_blocked, clear_stdin_blocked};
 
 fn alloc_page() -> Option<usize> {
     let layout = core::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).ok()?;
@@ -41,7 +43,10 @@ extern "C" fn syscall_dispatch(
         SYS_GETPID => SyscallResult(sys_getpid(), 0),
         SYS_YIELD => SyscallResult(0, sys_yield_switch(current_rsp)),
         SYS_SLEEP => SyscallResult(0, sys_sleep_switch(a1, current_rsp)),
-        SYS_READ => SyscallResult(sys_read(a1 as i32, a2 as usize, a3 as usize) as u64, 0),
+        SYS_READ => {
+            let (res, sw) = sys_read(a1 as i32, a2 as usize, a3 as usize, current_rsp);
+            SyscallResult(res as u64, sw)
+        }
         SYS_OPEN => SyscallResult(sys_open(a1 as usize, a2 as u32) as u64, 0),
         SYS_CLOSE => SyscallResult(sys_close(a1 as i32) as u64, 0),
         SYS_BRK => SyscallResult(sys_brk(a1 as usize) as u64, 0),
@@ -95,7 +100,6 @@ fn saved_cs_from_rsp(current_rsp: u64) -> u64 {
 }
 
 fn sys_yield_switch(current_rsp: u64) -> u64 {
-    serial::write_str("[R3] SYS_YIELD\n");
     unsafe {
         let cur = process::current_raw();
         if !cur.is_null() {
@@ -127,35 +131,35 @@ fn sys_sleep_switch(ticks: u64, current_rsp: u64) -> u64 {
 
 // ── SYS_READ ─────────────────────────────────────────────────────────────
 
-fn sys_read(fd: i32, buf: usize, count: usize) -> i64 {
+fn sys_read(fd: i32, buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
     if fd < 0 || fd as usize >= process::MAX_FDS {
-        return -1;
+        return (-1, 0);
     }
     let proc = match process::current_process() {
         Some(p) => p,
-        None => return -1,
+        None => return (-1, 0),
     };
     let entry = match process::fd_get(&proc, fd as usize) {
         Some(e) => e.clone(),
-        None => return -1,
+        None => return (-1, 0),
     };
-    // proc borrow ends here (entry is a clone)
 
     match &entry.fd_type {
         FdType::Stdin => {
-            // No keyboard buffer for ring-3 yet — return 0 (non-blocking)
-            serial::write_str("[SYS] READ stdin → 0 (no data)\n");
-            Ok(0)
+            sys_read_stdin(buf, count, current_rsp)
         }
         FdType::Stdout | FdType::Stderr => {
             serial::write_str("[SYS] READ: fd not readable\n");
-            Err(())
+            (-1, 0)
         }
         FdType::File(info) => {
             let info_clone = info.clone();
-            sys_read_file(fd, buf, count, info_clone)
+            match sys_read_file(fd, buf, count, info_clone) {
+                Ok(n) => (n, 0),
+                Err(_) => (-1, 0),
+            }
         }
-    }.unwrap_or(-1)
+    }
 }
 
 fn sys_read_file(fd: i32, buf: usize, count: usize, info: OpenFileInfo) -> Result<i64, ()> {
@@ -215,6 +219,75 @@ fn sys_read_file(fd: i32, buf: usize, count: usize, info: OpenFileInfo) -> Resul
     serial::write_str("\n");
 
     Ok(n as i64)
+}
+
+fn sys_read_stdin(buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
+    if count == 0 { return (0, 0); }
+
+    static mut KBD: KeyboardState = KeyboardState::new();
+    static mut CHAR_BUF: [u8; 64] = [0u8; 64];
+    static mut CHAR_HEAD: usize = 0;
+    static mut CHAR_TAIL: usize = 0;
+
+    unsafe {
+        // Try to pump scancodes into chars
+        while CHAR_HEAD == CHAR_TAIL {
+            match pop_scancode() {
+                Some(sc) => {
+                    if let Some(key) = KBD.feed_byte(sc) {
+                        let ch = match key {
+                            Key::Char(c) => c,
+                            Key::Enter => b'\n',
+                            Key::Backspace => 0x08,
+                            Key::Tab => b'\t',
+                            _ => continue,
+                        };
+                        let next = (CHAR_HEAD + 1) % CHAR_BUF.len();
+                        if next != CHAR_TAIL {
+                            CHAR_BUF[CHAR_HEAD] = ch;
+                            CHAR_HEAD = next;
+                        }
+                    }
+                }
+                None => {
+                    let cur = process::current_raw();
+                    if !cur.is_null() {
+                        let pid = (*cur).pid;
+                        set_stdin_blocked(pid);
+                        (*cur).state = process::ProcessState::Blocked;
+                        (*cur).sleep_until = 0;
+                        (*cur).ticks_used = process::TIME_SLICE;
+                    }
+                    let cs = saved_cs_from_rsp(current_rsp);
+                    let new_rsp = process::schedule_tick(current_rsp, cs);
+                    if new_rsp == 0 && !cur.is_null() {
+                        (*cur).state = process::ProcessState::Running;
+                        (*cur).sleep_until = 0;
+                        clear_stdin_blocked();
+                    }
+                    return (0, new_rsp);
+                }
+            }
+        }
+
+        // Copy available chars to user
+        let mut copied = 0usize;
+        while CHAR_TAIL != CHAR_HEAD && copied < count.min(CHAR_BUF.len()) {
+            let ch = CHAR_BUF[CHAR_TAIL];
+            CHAR_TAIL = (CHAR_TAIL + 1) % CHAR_BUF.len();
+            let user_buf = buf + copied;
+            if paging::copy_to_user(user_buf, &[ch]).is_err() {
+                break;
+            }
+            copied += 1;
+        }
+
+        serial::write_str("[SYS] READ stdin chars=");
+        serial::write_usize(copied);
+        serial::write_str("\n");
+
+        (copied as i64, 0)
+    }
 }
 
 // ── SYS_OPEN ─────────────────────────────────────────────────────────────

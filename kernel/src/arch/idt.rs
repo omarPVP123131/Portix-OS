@@ -109,6 +109,7 @@ extern "C" {
     fn isr_16(); fn isr_17(); fn isr_18(); fn isr_19();
     pub fn reload_segments();
     fn irq0_handler();
+    fn irq1_handler();
     fn irq_stub_master();
     fn irq_stub_slave();
     fn syscall_entry();
@@ -184,7 +185,8 @@ pub unsafe fn init_idt() {
     let irq_m = core::mem::transmute::<unsafe extern "C" fn(), u64>(irq_stub_master);
     let irq_s = core::mem::transmute::<unsafe extern "C" fn(), u64>(irq_stub_slave);
     IDT[0x20].set_handler(irq0);
-    for i in 0x21..=0x27_usize { IDT[i].set_handler(irq_m); }
+    IDT[0x21].set_handler(core::mem::transmute::<unsafe extern "C" fn(), u64>(irq1_handler));
+    for i in 0x22..=0x27_usize { IDT[i].set_handler(irq_m); }
     for i in 0x28..=0x2F_usize { IDT[i].set_handler(irq_s); }
 
     // 9. IDT[0x80] — int 0x80 syscall gate (DPL=3, trap gate so IF stays on)

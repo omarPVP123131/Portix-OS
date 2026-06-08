@@ -356,17 +356,9 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
     c.present_full();
     drivers::serial::log("FB", "present done");
 
-    // ── Ring 3 demo — ELF64 from embedded binary ─────────────────────────
+    // ── Ring 3 — persistent shell ───────────────────────────────────────
     let hello_elf = include_bytes!("../../build/hello.elf");
-    if let Some(pid1) = elf::elf_load_and_create_process(hello_elf, "hello1") {
-        // Create a second process with the same ELF for scheduler testing
-        if let Some(pid2) = elf::elf_load_and_create_process(hello_elf, "hello2") {
-            // Pre-arm kernel stack for the scheduler-managed process
-            if let Some(p2) = process::process_by_pid(pid2) {
-                process::setup_kernel_stack(p2);
-            }
-            drivers::serial::log("SCHED", "Two processes ready, starting hello1");
-        }
+    if let Some(pid1) = elf::elf_load_and_create_process(hello_elf, "shell") {
         process::set_current(pid1);
         unsafe { arch::ring3::enter_ring3_asm(); }
         drivers::serial::log("R3", "Returned to ring 0 OK - main loop running");
@@ -377,29 +369,30 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
     loop {
         let now = time::pit::ticks();
 
-        // ── Drenado unificado PS/2 ────────────────────────────────────────
+        // ── Drenado IRQ1 teclado ─────────────────────────────────────────
+        // IRQ1 handler now buffers scancodes; we consume them here.
+        // Mouse still polled directly (IRQ12 is stub).
         let mut kbd_buf = [0u8; 32];
         let mut kbd_n = 0usize;
         let mut ms_buf = [0u8; 32];
         let mut ms_n = 0usize;
+        // Drain IRQ1 scancode buffer
+        while kbd_n < 32 {
+            match crate::arch::isr_handlers::pop_scancode() {
+                Some(sc) => { kbd_buf[kbd_n] = sc; kbd_n += 1; }
+                None => break,
+            }
+        }
+        // Poll PS/2 for mouse bytes (keyboard bytes already consumed by IRQ1)
         unsafe {
             loop {
                 let st = ps2_inb(PS2_STATUS);
-                if st & 0x01 == 0 {
-                    break;
-                }
+                if st & 0x01 == 0 { break; }
                 let byte = ps2_inb(PS2_DATA);
                 if st & 0x20 != 0 {
-                    if ms_n < 32 {
-                        ms_buf[ms_n] = byte;
-                        ms_n += 1;
-                    }
-                } else {
-                    if kbd_n < 32 {
-                        kbd_buf[kbd_n] = byte;
-                        kbd_n += 1;
-                    }
+                    if ms_n < 32 { ms_buf[ms_n] = byte; ms_n += 1; }
                 }
+                // Keyboard bytes handled by IRQ1 — ignore here
             }
         }
 

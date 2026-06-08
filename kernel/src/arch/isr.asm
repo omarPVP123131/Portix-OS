@@ -63,6 +63,7 @@ extern crash_frame
 extern exception_cs
 
 global irq0_handler
+global irq1_handler
 global irq_stub_master
 global irq_stub_slave
 global reload_segments
@@ -194,6 +195,22 @@ irq0_handler:
     POP_REGS
     iretq
 
+; ─── IRQ1 (keyboard) handler ─────────────────────────────────────────────
+; Reads scancode from PS/2 data port, calls Rust irq1_handler_rust, sends EOI.
+extern irq1_handler_rust
+irq1_handler:
+    push    rax
+    push    rdx
+    xor     eax, eax
+    in      al, 0x60                ; read scancode
+    mov     edi, eax                ; arg0 = scancode
+    call    irq1_handler_rust
+    mov     al, 0x20
+    out     0x20, al                ; EOI master PIC
+    pop     rdx
+    pop     rax
+    iretq
+
 ; ─── IRQ 0x21-0x27: generic master PIC stub ─────────────────────────────────
 irq_stub_master:
     push    rax
@@ -309,8 +326,8 @@ int80_handler:
     call    syscall_dispatch
     add     rsp, 16                 ; clean up: sub(8) + push(8) = 16, RSP back to PUSH_REGS level
     ; RAX = result, RDX = new_rsp (0 = continue, non-zero = switch)
-    ; Saved RAX is at [rsp + 112] (14th of 15 PUSH_REGS = 14×8 = 112)
-    mov     [rsp + 112], rax        ; store result in saved RAX on stack
+    ; Saved RAX is at [rsp + 0] (pushed last, closest to RSP)
+    mov     [rsp], rax              ; store result in saved RAX on stack
     test    rdx, rdx
     jz      .cont
     mov     rsp, rdx                ; switch to new process kernel stack

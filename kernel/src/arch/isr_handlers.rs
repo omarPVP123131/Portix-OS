@@ -1078,6 +1078,65 @@ pub unsafe extern "C" fn memset(s: *mut u8, cv: i32, n: usize) -> *mut u8 {
 pub unsafe extern "C" fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
     for i in 0..n { core::ptr::write_volatile(d.add(i), core::ptr::read_volatile(s.add(i))); } d
 }
+
+// ── Keyboard IRQ1 buffer ─────────────────────────────────────────────────
+use core::sync::atomic::{AtomicU32, Ordering};
+
+pub const SCANCODE_BUF_SIZE: usize = 256;
+static mut SCANCODE_BUF: [u8; SCANCODE_BUF_SIZE] = [0u8; SCANCODE_BUF_SIZE];
+static SCANCODE_HEAD: AtomicU32 = AtomicU32::new(0);
+static SCANCODE_TAIL: AtomicU32 = AtomicU32::new(0);
+
+pub fn push_scancode(sc: u8) {
+    let head = SCANCODE_HEAD.load(Ordering::Relaxed);
+    let tail = SCANCODE_TAIL.load(Ordering::Relaxed);
+    let next = (head + 1) % SCANCODE_BUF_SIZE as u32;
+    if next == tail {
+        // Buffer full — drop oldest byte
+        SCANCODE_TAIL.store((tail + 1) % SCANCODE_BUF_SIZE as u32, Ordering::Relaxed);
+    }
+    unsafe { SCANCODE_BUF[head as usize] = sc; }
+    SCANCODE_HEAD.store(next, Ordering::Relaxed);
+}
+
+pub fn pop_scancode() -> Option<u8> {
+    let head = SCANCODE_HEAD.load(Ordering::Relaxed);
+    let tail = SCANCODE_TAIL.load(Ordering::Relaxed);
+    if head == tail { return None; }
+    let sc = unsafe { SCANCODE_BUF[tail as usize] };
+    SCANCODE_TAIL.store((tail + 1) % SCANCODE_BUF_SIZE as u32, Ordering::Relaxed);
+    Some(sc)
+}
+
+// Process blocked on stdin
+static mut BLOCKED_STDIN_PID: u64 = 0;
+
+pub fn set_stdin_blocked(pid: u64) {
+    unsafe { BLOCKED_STDIN_PID = pid; }
+}
+
+pub fn clear_stdin_blocked() {
+    unsafe { BLOCKED_STDIN_PID = 0; }
+}
+
+pub fn wake_stdin_blocked() {
+    let pid = unsafe { BLOCKED_STDIN_PID };
+    if pid == 0 { return; }
+    if let Some(proc) = crate::process::process_by_pid(pid) {
+        if proc.state == crate::process::ProcessState::Blocked {
+            proc.state = crate::process::ProcessState::Ready;
+            proc.sleep_until = 0;
+            clear_stdin_blocked();
+        }
+    }
+}
+
+#[no_mangle]
+extern "C" fn irq1_handler_rust(scancode: u8) {
+    push_scancode(scancode);
+    wake_stdin_blocked();
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn memmove(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
     if (d as usize) <= (s as usize) { memcpy(d, s, n) }

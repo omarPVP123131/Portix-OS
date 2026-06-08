@@ -349,10 +349,25 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
 
     c.clear(Color::PORTIX_BG);
 
+    // Draw initial UI before ring-3 demo
+    draw_chrome(&mut c, &lay, &hw, Tab::System, 0, 0);
+    draw_system_tab(&mut c, &lay, &hw, boot_lines);
+    drivers::serial::log("FB", "presenting initial UI...");
+    c.present_full();
+    drivers::serial::log("FB", "present done");
+
     // ── Ring 3 demo — ELF64 from embedded binary ─────────────────────────
     let hello_elf = include_bytes!("../../build/hello.elf");
-    if let Some(pid) = elf::elf_load_and_create_process(hello_elf, "hello") {
-        process::set_current(pid);
+    if let Some(pid1) = elf::elf_load_and_create_process(hello_elf, "hello1") {
+        // Create a second process with the same ELF for scheduler testing
+        if let Some(pid2) = elf::elf_load_and_create_process(hello_elf, "hello2") {
+            // Pre-arm kernel stack for the scheduler-managed process
+            if let Some(p2) = process::process_by_pid(pid2) {
+                process::setup_kernel_stack(p2);
+            }
+            drivers::serial::log("SCHED", "Two processes ready, starting hello1");
+        }
+        process::set_current(pid1);
         unsafe { arch::ring3::enter_ring3_asm(); }
         drivers::serial::log("R3", "Returned to ring 0 OK - main loop running");
     } else {

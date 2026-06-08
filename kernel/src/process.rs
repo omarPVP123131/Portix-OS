@@ -6,6 +6,35 @@ pub const MAX_PROCS: usize = 64;
 pub const KERNEL_STACK_SIZE: usize = 16384;
 pub const USER_STACK_SIZE: usize = 65536;
 pub const USER_STACK_TOP: usize = 0x7F00_0000_0000;
+pub const TIME_SLICE: u64 = 10; // 10 ticks = 100ms at 100Hz
+
+// ── FD table ─────────────────────────────────────────────────────────────
+pub const MAX_FDS: usize = 32;
+pub const PROGRAM_BREAK_BASE: usize = 0x2000_0000_0000;
+pub const PAGE_SIZE_USIZE: usize = 4096;
+
+#[derive(Copy, Clone)]
+pub struct OpenFileInfo {
+    pub dir_cluster: u32,
+    pub cluster: u32,
+    pub size: u32,
+    pub pos: u32,
+    pub name: [u8; 256],
+    pub name_len: usize,
+}
+
+#[derive(Copy, Clone)]
+pub enum FdType {
+    Stdin,
+    Stdout,
+    Stderr,
+    File(OpenFileInfo),
+}
+
+#[derive(Copy, Clone)]
+pub struct FdEntry {
+    pub fd_type: FdType,
+}
 
 #[derive(Copy, Clone, PartialEq)]
 #[repr(u8)]
@@ -32,6 +61,13 @@ pub struct Process {
     pub kernel_stack_top: usize,
     pub user_stack_phys: usize,
     pub exit_code: i32,
+    pub ticks_used: u64,
+    pub sleep_until: u64,
+    pub ring3_ret_rsp: u64,
+    pub ring3_ret_addr: u64,
+    pub fds: [Option<FdEntry>; MAX_FDS],
+    pub program_break: usize,
+    pub program_break_end: usize,
 }
 
 impl Process {
@@ -147,6 +183,17 @@ pub fn process_create_into(cr3: u64, entry: u64, name: &str) -> Option<u64> {
     proc.user_rsp = user_rsp_va as u64;
     proc.user_rip = entry;
     proc.exit_code = 0;
+    proc.ticks_used = 0;
+    proc.sleep_until = 0;
+    proc.ring3_ret_rsp = 0;
+    proc.ring3_ret_addr = 0;
+    const NONE: Option<FdEntry> = None;
+    proc.fds = [NONE; MAX_FDS];
+    proc.fds[0] = Some(FdEntry { fd_type: FdType::Stdin });
+    proc.fds[1] = Some(FdEntry { fd_type: FdType::Stdout });
+    proc.fds[2] = Some(FdEntry { fd_type: FdType::Stderr });
+    proc.program_break = PROGRAM_BREAK_BASE;
+    proc.program_break_end = PROGRAM_BREAK_BASE;
 
     serial::write_str("PROC: create PID=");
     serial::write_usize(pid as usize);
@@ -224,8 +271,275 @@ pub fn process_exit(pid: u64, code: i32) {
     proc.user_stack_phys = 0;
 }
 
+// ── FD helpers ───────────────────────────────────────────────────────────
+
+pub fn fd_alloc(proc: &mut Process, entry: FdEntry) -> Option<usize> {
+    for i in 0..MAX_FDS {
+        if proc.fds[i].is_none() {
+            proc.fds[i] = Some(entry);
+            return Some(i);
+        }
+    }
+    None
+}
+
+pub fn fd_get(proc: &Process, fd: usize) -> Option<&FdEntry> {
+    if fd >= MAX_FDS { return None; }
+    proc.fds[fd].as_ref()
+}
+
+pub fn fd_get_mut(proc: &mut Process, fd: usize) -> Option<&mut FdEntry> {
+    if fd >= MAX_FDS { return None; }
+    proc.fds[fd].as_mut()
+}
+
+pub fn fd_close(proc: &mut Process, fd: usize) {
+    if fd < MAX_FDS {
+        proc.fds[fd] = None;
+    }
+}
+
 pub fn init() {
     serial::write_str("PROC: init process table (max ");
     serial::write_usize(MAX_PROCS);
     serial::write_str(" slots)\n");
+}
+
+// ── Scheduler ───────────────────────────────────────────────────────────
+
+/// Pre-arma el kernel stack con un frame PUSH_REGS + IRET sintético,
+/// para que el scheduler pueda saltar directamente al proceso vía
+/// POP_REGS + IRETQ.
+pub fn setup_kernel_stack(proc: &mut Process) {
+    unsafe {
+        let top = proc.kernel_stack_top as *mut u64;
+        let mut sp = top;
+
+        // IRET frame (pushed first = highest addresses, CPU pops in reverse)
+        sp = sp.sub(1); *sp = 0x1Bu64;              // SS = USER_DS | 3
+        sp = sp.sub(1); *sp = proc.user_rsp;         // RSP (user)
+        sp = sp.sub(1); *sp = 0x202u64;              // RFLAGS (IF=1)
+        sp = sp.sub(1); *sp = 0x23u64;               // CS = USER_CS | 3
+        sp = sp.sub(1); *sp = proc.user_rip;         // RIP
+
+        // PUSH_REGS (15 registers, r15 first = highest, rax last = lowest)
+        sp = sp.sub(1); *sp = 0; // r15
+        sp = sp.sub(1); *sp = 0; // r14
+        sp = sp.sub(1); *sp = 0; // r13
+        sp = sp.sub(1); *sp = 0; // r12
+        sp = sp.sub(1); *sp = 0; // rbp
+        sp = sp.sub(1); *sp = 0; // rbx
+        sp = sp.sub(1); *sp = 0; // r11
+        sp = sp.sub(1); *sp = 0; // r10
+        sp = sp.sub(1); *sp = 0; // r9
+        sp = sp.sub(1); *sp = 0; // r8
+        sp = sp.sub(1); *sp = 0; // rdi
+        sp = sp.sub(1); *sp = 0; // rsi
+        sp = sp.sub(1); *sp = 0; // rdx
+        sp = sp.sub(1); *sp = 0; // rcx
+        sp = sp.sub(1); *sp = 0; // rax
+
+        proc.kernel_rsp = sp as u64;
+
+        serial::write_str("SCHED: setup_kernel_stack PID=");
+        serial::write_usize(proc.pid as usize);
+        serial::write_str(" rsp=");
+        serial::write_hex(sp as usize);
+        serial::write_str("\n");
+    }
+}
+
+pub unsafe fn current_raw() -> *mut Process {
+    for p in &mut PROCESSES {
+        let ptr = p.as_mut_ptr();
+        if (*ptr).state == ProcessState::Running {
+            return ptr;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+pub unsafe fn pick_next_ready() -> *mut Process {
+    let current_pid = {
+        let cur = current_raw();
+        if cur.is_null() { 0 } else { (*cur).pid }
+    };
+    let mut start = 0;
+    for (i, p) in PROCESSES.iter().enumerate() {
+        if (*p.as_ptr()).pid == current_pid {
+            start = (i + 1) % MAX_PROCS;
+            break;
+        }
+    }
+    for _ in 0..MAX_PROCS {
+        let ptr = PROCESSES[start].as_mut_ptr();
+        if (*ptr).state == ProcessState::Ready && (*ptr).pid != current_pid {
+            return ptr;
+        }
+        start = (start + 1) % MAX_PROCS;
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn wake_blocked() {
+    let now = crate::time::pit::ticks();
+    for p in &mut PROCESSES {
+        let ptr = p.as_mut_ptr();
+        if (*ptr).state == ProcessState::Blocked && (*ptr).sleep_until > 0 {
+            if now >= (*ptr).sleep_until || (*ptr).sleep_until.wrapping_sub(now) > 1000 {
+                // woke up: timeout expired or wraparound
+                (*ptr).state = ProcessState::Ready;
+                (*ptr).sleep_until = 0;
+                serial::write_str("SCHED: wake PID ");
+                serial::write_usize((*ptr).pid as usize);
+                serial::write_str("\n");
+            }
+        }
+    }
+}
+
+/// Called from IRQ0 handler assembly.
+/// `current_rsp`: RSP after PUSH_REGS (points to saved r11).
+/// `saved_cs`: CS value from IRET frame (for CPL detection).
+/// Returns new RSP to load (0 = no switch).
+#[no_mangle]
+pub extern "C" fn schedule_tick(current_rsp: u64, saved_cs: u64) -> u64 {
+    let user_cs = (crate::arch::idt::USER_CS as u64) | 3;
+    if saved_cs != user_cs {
+        return 0; // Skip if not from user mode
+    }
+    unsafe {
+        let cur = current_raw();
+        if cur.is_null() {
+            return 0;
+        }
+        (*cur).kernel_rsp = current_rsp;
+        (*cur).ticks_used += 1;
+
+        wake_blocked();
+
+        if (*cur).ticks_used < TIME_SLICE {
+            return 0;
+        }
+
+        (*cur).ticks_used = 0;
+
+        let next = pick_next_ready();
+        if next.is_null() || next == cur {
+            return 0;
+        }
+
+        // Check if current was blocked by SYS_SLEEP
+        if (*cur).state == ProcessState::Running {
+            (*cur).state = ProcessState::Ready;
+        }
+
+        (*next).state = ProcessState::Running;
+        (*next).ticks_used = 0;
+        set_tss_rsp0((*next).kernel_stack_top as u64);
+
+        let current_cr3 = paging::read_cr3();
+        if (*next).cr3 != current_cr3 {
+            paging::write_cr3((*next).cr3);
+        }
+
+        serial::write_str("SCHED: PID ");
+        serial::write_usize((*cur).pid as usize);
+        serial::write_str(" → ");
+        serial::write_usize((*next).pid as usize);
+        serial::write_str("\n");
+
+        (*next).kernel_rsp
+    }
+}
+
+/// Called from `enter_ring3_asm` to save the return address for ring-3 exit.
+#[no_mangle]
+pub extern "C" fn process_save_ring3_ret_addr(ret_addr: u64) {
+    unsafe {
+        let cur = current_raw();
+        if !cur.is_null() {
+            (*cur).ring3_ret_addr = ret_addr;
+        }
+    }
+}
+
+/// Called from `ring3_exit_trampoline`.
+/// Returns the saved ring3_ret_addr, or 0 if not set.
+#[no_mangle]
+pub extern "C" fn process_get_ring3_ret_addr() -> u64 {
+    unsafe {
+        let cur = current_raw();
+        if cur.is_null() { 0 } else { (*cur).ring3_ret_addr }
+    }
+}
+
+/// Trampoline for ring-3 process exit.
+/// Cleans up the current process, then either:
+///   - if ring3_ret_addr is set (enter_ring3_asm path): jumps to it on kernel's main stack
+///   - if ring3_ret_addr is 0 (scheduler path): picks next process and switches to it
+#[no_mangle]
+pub extern "C" fn process_exit_trampoline() -> ! {
+    unsafe {
+        let ret_addr = process_get_ring3_ret_addr();
+
+        // Clean up current process
+        let cur = current_raw();
+        if !cur.is_null() {
+            let pid = (*cur).pid;
+            process_exit(pid, 0);
+        }
+
+        let stack_top = core::ptr::addr_of!(crate::__stack_top) as u64;
+
+        if ret_addr != 0 {
+            // Process entered via enter_ring3_asm — return to kernel main loop
+            core::arch::asm!("
+                mov rsp, {0}
+                xor rbp, rbp
+                jmp {1}
+            ", in(reg) stack_top, in(reg) ret_addr, options(noreturn));
+        } else {
+            // Scheduler-managed process — pick next and switch
+            let next = pick_next_ready();
+            if !next.is_null() {
+                (*next).state = ProcessState::Running;
+                set_tss_rsp0((*next).kernel_stack_top as u64);
+                let current_cr3 = paging::read_cr3();
+                if (*next).cr3 != current_cr3 {
+                    paging::write_cr3((*next).cr3);
+                }
+                serial::write_str("SCHED: exit switch to PID ");
+                serial::write_usize((*next).pid as usize);
+                serial::write_str("\n");
+                core::arch::asm!("
+                    mov rsp, {0}
+                    pop r11
+                    pop r10
+                    pop r9
+                    pop r8
+                    pop rdi
+                    pop rsi
+                    pop rdx
+                    pop rcx
+                    pop rax
+                    iretq
+                ", in(reg) (*next).kernel_rsp, options(noreturn));
+            }
+            serial::write_str("SCHED: all processes exited, halting\n");
+            loop { core::arch::asm!("hlt"); }
+        }
+    }
+}
+
+/// SYS_YIELD: give up the remainder of the current quantum.
+pub fn yield_cpu() {
+    unsafe {
+        let cur = current_raw();
+        if !cur.is_null() {
+            (*cur).ticks_used = TIME_SLICE; // Force reschedule on next IRQ0
+        }
+    }
+    // Enable interrupts to allow IRQ0 to fire
+    unsafe { core::arch::asm!("sti"); }
 }

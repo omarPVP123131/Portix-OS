@@ -44,7 +44,12 @@
 use core::panic::PanicInfo;
 use crate::graphics::driver::framebuffer::{Color, Console};
 use crate::arch::halt::halt_loop;
+use crate::process::ProcessState;
 use crate::util::fmt::{fmt_u32, fmt_hex};
+
+// Saved CS from the most recent exception. Updated by ISR macros in isr.asm.
+#[no_mangle]
+pub static mut exception_cs: u64 = 0;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  CRASH FRAME
@@ -539,19 +544,109 @@ if f.valid == 0 {
     halt_loop()
 }
 
+// ── Helpers para ring-3 exception recovery ───────────────────────────────
+
+/// Check if the most recent exception came from ring 3.
+/// The value is set by the ISR macros in isr.asm before calling the Rust handler.
+fn is_from_ring3() -> bool {
+    unsafe {
+        let user_cs = (crate::arch::idt::USER_CS as u64) | 3;
+        exception_cs == user_cs
+    }
+}
+
+/// Kill the current running process due to an exception from ring 3.
+/// Never returns — either switches to the next process or halts.
+fn kill_current_process(reason: &str, ec: u64) -> ! {
+    let pid = crate::process::current_process()
+        .map(|p| p.pid)
+        .unwrap_or(0);
+
+    crate::drivers::serial::write_str("[R3-KILL] PID=");
+    crate::drivers::serial::write_usize(pid as usize);
+    crate::drivers::serial::write_str(" reason=");
+    crate::drivers::serial::write_str(reason);
+    crate::drivers::serial::write_str(" EC=");
+    crate::drivers::serial::write_hex(ec as usize);
+    crate::drivers::serial::write_str("\n");
+
+    crate::process::process_exit(pid, -1);
+
+    unsafe {
+        let next = crate::process::pick_next_ready();
+        if !next.is_null() {
+            (*next).state = ProcessState::Running;
+            crate::process::set_tss_rsp0((*next).kernel_stack_top as u64);
+            let current_cr3 = crate::mem::paging::read_cr3();
+            if (*next).cr3 != current_cr3 {
+                crate::mem::paging::write_cr3((*next).cr3);
+            }
+            core::arch::asm!("mov rsp, {0}; POP_REGS; iretq", in(reg) (*next).kernel_rsp, options(noreturn));
+        }
+    }
+    unsafe { loop { core::arch::asm!("hlt"); } }
+}
+
+/// Attempt to recover from a ring-3 exception. Returns the new RSP if a
+/// process switch happened, or 0 if the exception was not from ring 3.
+fn try_recover_ring3(reason: &str, ec: u64) -> u64 {
+    if !is_from_ring3() {
+        return 0;
+    }
+    let f = frame();
+
+    // Print diagnostic and kill the process
+    crate::drivers::serial::write_str("[R3-EXC] ");
+    crate::drivers::serial::write_str(reason);
+    if let Some(proc) = crate::process::current_process() {
+        crate::drivers::serial::write_str(" PID=");
+        crate::drivers::serial::write_usize(proc.pid as usize);
+        crate::drivers::serial::write_str(" '");
+        crate::drivers::serial::write_str(proc.name_str());
+        crate::drivers::serial::write_str("' RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        crate::drivers::serial::write_str(" EC=");
+        crate::drivers::serial::write_hex(ec as usize);
+        crate::drivers::serial::write_str("\n");
+        let pid = proc.pid;
+        crate::process::process_exit(pid, -1);
+    }
+
+    // Pick next ready process
+    unsafe {
+        let next = crate::process::pick_next_ready();
+        if !next.is_null() {
+            (*next).state = ProcessState::Running;
+            crate::process::set_tss_rsp0((*next).kernel_stack_top as u64);
+            let current_cr3 = crate::mem::paging::read_cr3();
+            if (*next).cr3 != current_cr3 {
+                crate::mem::paging::write_cr3((*next).cr3);
+            }
+            return (*next).kernel_rsp;
+        }
+    }
+    halt_loop()
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PAGE FAULT  #PF
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[no_mangle]
-extern "C" fn isr_page_fault(ec: u64) {
+extern "C" fn isr_page_fault(ec: u64) -> u64 {
     let cr2: u64;
     unsafe { core::arch::asm!("mov {r}, cr2", r = out(reg) cr2, options(nostack, preserves_flags)); }
 
     if crate::mem::paging::is_expecting_user_fault() {
         crate::mem::paging::clear_expect_user_fault();
         crate::drivers::serial::write_str("#PF recovered (expected user fault)\n");
-        return;
+        return 0;
+    }
+
+    // Try ring-3 recovery first
+    let recovered = try_recover_ring3("page_fault", ec);
+    if recovered != 0 {
+        return recovered;
     }
 
     let f = frame();
@@ -648,7 +743,12 @@ extern "C" fn isr_page_fault(ec: u64) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[no_mangle]
-extern "C" fn isr_gp_handler(ec: u64) {
+extern "C" fn isr_gp_handler(ec: u64) -> u64 {
+    let recovered = try_recover_ring3("general_protection", ec);
+    if recovered != 0 {
+        return recovered;
+    }
+
     let f = frame();
 
     if f.valid == 0 {
@@ -785,7 +885,12 @@ extern "C" fn isr_double_fault(_ec: u64) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[no_mangle]
-extern "C" fn isr_divide_by_zero() {
+extern "C" fn isr_divide_by_zero() -> u64 {
+    let recovered = try_recover_ring3("divide_by_zero", 0);
+    if recovered != 0 {
+        return recovered;
+    }
+
     let f = frame();
 
     // [FIX-GP-DF] Misma guardia: sin valid no accedemos al framebuffer.
@@ -835,7 +940,12 @@ extern "C" fn isr_divide_by_zero() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[no_mangle]
-extern "C" fn isr_bound_range() {
+extern "C" fn isr_bound_range() -> u64 {
+    let recovered = try_recover_ring3("bound_range", 0);
+    if recovered != 0 {
+        return recovered;
+    }
+
     let f = frame();
     if f.valid == 0 {
         unsafe { vga_error(b"  PORTIX-OS  #BR BOUND RANGE  |  Sistema detenido            ",
@@ -870,7 +980,12 @@ extern "C" fn isr_bound_range() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[no_mangle]
-extern "C" fn isr_ud_handler() {
+extern "C" fn isr_ud_handler() -> u64 {
+    let recovered = try_recover_ring3("invalid_opcode", 0);
+    if recovered != 0 {
+        return recovered;
+    }
+
     let f = frame();
     if f.valid == 0 {
         unsafe { vga_error(b"  PORTIX-OS  #UD INVALID OPCODE  |  Sistema detenido         ",
@@ -911,7 +1026,12 @@ extern "C" fn isr_ud_handler() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[no_mangle]
-extern "C" fn isr_generic_handler() {
+extern "C" fn isr_generic_handler() -> u64 {
+    let recovered = try_recover_ring3("generic_exception", 0);
+    if recovered != 0 {
+        return recovered;
+    }
+
     let f = frame();
     if f.valid == 0 {
         unsafe { vga_error(b"  PORTIX-OS  CPU EXCEPTION  |  Sistema detenido              ",

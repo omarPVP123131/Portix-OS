@@ -126,7 +126,7 @@ impl Color {
     pub const GREEN:        Color = Color(0x00CC44);
     pub const BLUE:         Color = Color(0x0055FF);
     pub const YELLOW:       Color = Color(0xFFFF00);
-    pub const PORTIX_BG:    Color = Color(0x01080F);
+    pub const PORTIX_BG:    Color = Color(0x0F1E30);
     pub const PORTIX_PANEL: Color = Color(0x030C18);
     pub const PORTIX_GOLD:  Color = Color(0xFFD700);
     pub const PORTIX_AMBER: Color = Color(0xFFAA00);

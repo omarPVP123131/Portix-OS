@@ -68,7 +68,7 @@ KERNEL_PHYS_ADDR equ 0x200000
 VESA_BUF         equ 0x6000
 BASE_LBA_ADDR    equ 0x7E00
 STACK_TOP        equ 0x7C00
-CANARY_ADDR      equ 0x7BF0
+CANARY_ADDR      equ 0x7800
 CANARY_VAL       equ 0xDEAD
 
 ; ──────────────────────────────────────────────────────────────────────────────
@@ -624,17 +624,24 @@ setup_paging:
     mov  dword [PDPT_ADDR + eax],     PD_LFB_ADDR | 0x03
     mov  dword [PDPT_ADDR + eax + 4], 0
 
-    mov  edi, PD_LFB_ADDR
+    ; Map LFB in PD_LFB table at correct PD index
     mov  eax, ebx
-    and  eax, 0xC0000000
-    or   eax, 0x83
-    mov  ecx, 512
-.fill_lfb:
+    and  eax, 0xFFE00000              ; 2MB-aligned physical base
+    or   eax, 0x83                     ; PRESENT | WRITABLE | HUGE
+    mov  edi, ebx
+    shr  edi, 21
+    and  edi, 0x1FF                    ; PD index for LFB virtual address
+    shl  edi, 3
+    add  edi, PD_LFB_ADDR             ; PDE address in PD_LFB table
+    mov  ecx, 8                        ; map 16MB (8 × 2MB huge pages)
+.fill_lfb_high:
+    cmp  edi, PD_LFB_ADDR + 512*8
+    jae  .done
     mov  [edi],         eax
     mov  dword [edi+4], 0
     add  eax, 0x200000
     add  edi, 8
-    loop .fill_lfb
+    loop .fill_lfb_high
     jmp  .done
 
 .map_lfb_low:

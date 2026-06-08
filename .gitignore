@@ -52,8 +52,9 @@ Cargo.lock
 
 *.ll
 *.bc
-*.s
 *.lst
+# ASM sources in lib/src/ are hand-written, not generated
+!lib/src/*.s
 
 #######################################################
 # 🐍 PYTHON

@@ -412,6 +412,13 @@ impl AtaDrive {
             c.delay400ns();
             c.wait_drq()?;
             Self::pio_read_sector(c, buf, s * 512);
+            let st = c.inb(reg::STATUS);
+            if st & status::ERR != 0 {
+                return Err(AtaError::DeviceError(c.inb(reg::ERROR)));
+            }
+            if st & status::DF != 0 {
+                return Err(AtaError::DriveFault);
+            }
         }
         Ok(())
     }
@@ -440,7 +447,7 @@ impl AtaDrive {
         let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
             let cur = lba + s as u64;
-            c.select_drive(0x40 | slave_bit)?;
+            c.select_drive(0xE0 | slave_bit)?;
             c.outb(reg::FEATURES,    0);
             c.outb(reg::SECTOR_CNT,  0);
             c.outb(reg::LBA_LO,     (cur >> 24) as u8);
@@ -455,6 +462,13 @@ impl AtaDrive {
             c.delay400ns();
             c.wait_drq()?;
             Self::pio_read_sector(c, buf, s * 512);
+            let st = c.inb(reg::STATUS);
+            if st & status::ERR != 0 {
+                return Err(AtaError::DeviceError(c.inb(reg::ERROR)));
+            }
+            if st & status::DF != 0 {
+                return Err(AtaError::DriveFault);
+            }
         }
         Ok(())
     }
@@ -464,7 +478,7 @@ impl AtaDrive {
         let slave_bit = if self.is_slave { 0x10u8 } else { 0x00u8 };
         for s in 0..count {
             let cur = lba + s as u64;
-            c.select_drive(0x40 | slave_bit)?;
+            c.select_drive(0xE0 | slave_bit)?;
             c.outb(reg::FEATURES,    0);
             c.outb(reg::SECTOR_CNT,  0);
             c.outb(reg::LBA_LO,     (cur >> 24) as u8);

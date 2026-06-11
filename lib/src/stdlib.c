@@ -1,6 +1,6 @@
 #include <portix.h>
 
-#define HEAP_START ((void*)0x2000_0000_0000)
+#define HEAP_START ((void*)0x200000000000ULL)
 #define HEAP_SIZE  (1024 * 1024)  /* 1 MB initial heap */
 
 typedef struct Block {
@@ -72,6 +72,11 @@ void *calloc(size_t nmemb, size_t size) {
     void *ptr = malloc(total);
     if (ptr) memset(ptr, 0, total);
     return ptr;
+}
+
+void _exit(int code) {
+    syscall(SYS_EXIT, code, 0, 0, 0, 0);
+    __builtin_unreachable();
 }
 
 void *realloc(void *ptr, size_t size) {

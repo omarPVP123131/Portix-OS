@@ -986,14 +986,25 @@ extern "C" fn isr_ud_handler() -> u64 {
         return recovered;
     }
 
+    // Si viene de ring 0, es un bug del kernel — no podemos continuar.
+    // Avanzar RIP no es seguro sin saber el tamaño de la instrucción.
+    // Mostrar pantalla y halt.
     let f = frame();
     if f.valid == 0 {
-        unsafe { vga_error(b"  PORTIX-OS  #UD INVALID OPCODE  |  Sistema detenido         ",
-                           b"  (crash_frame.valid=0)                                       "); }
-        halt_loop()
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #UD INVALID OPCODE  |  Sistema detenido         ",
+                b"  (crash_frame.valid=0)                                       ",
+            );
+        }
+        halt_loop()  // ← nunca retorna, correcto
     }
+
+
+    // Mostrar pantalla de error y detener — igual que antes pero
+    // asegurándonos que halt_loop() se llama SIEMPRE al final
     let mut c = Console::new();
-    let (w, h) = (c.width(), c.height());
+        let (w, h) = (c.width(), c.height());
 
     grad_v(&mut c,Color::new(7,0,0x12),Color::new(3,0,0x0A));
     dot_grid(&mut c,0,0,w,h,20,Color::new(0x12,0,0x20));
@@ -1018,8 +1029,9 @@ extern "C" fn isr_ud_handler() -> u64 {
     reg_grid_ncol(&mut c,regs,tx,reg_y+16,2,200,16,pal::GP_VIOLET.dim(130));
 
     draw_bottom_bar(&mut c,pal::GP_VIOLET,pal::GP_MAGENTA,"#UD INVALID OPCODE  |  SISTEMA DETENIDO");
-    c.present(); halt_loop()
-}
+    c.present();
+    halt_loop()  // ← asegúrate que está aquí y no falta
+    }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  HANDLER GENÉRICO
@@ -1079,33 +1091,71 @@ pub unsafe extern "C" fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
     for i in 0..n { core::ptr::write_volatile(d.add(i), core::ptr::read_volatile(s.add(i))); } d
 }
 
-// ── Keyboard IRQ1 buffer ─────────────────────────────────────────────────
+// ── Input ring buffers ─────────────────────────────────────────────────────
+// SCANCODE_BUF  → kernel UI (main loop)
+// RING3_SCANCODE_BUF → ring-3 stdin (syscall)
+// MOUSE_BUF     → mouse bytes via IRQ12
 use core::sync::atomic::{AtomicU32, Ordering};
 
-pub const SCANCODE_BUF_SIZE: usize = 256;
+pub const SCANCODE_BUF_SIZE: usize = 1024;
+pub const RING3_BUF_SIZE: usize = 256;
+pub const MOUSE_BUF_SIZE: usize = 128;
+
 static mut SCANCODE_BUF: [u8; SCANCODE_BUF_SIZE] = [0u8; SCANCODE_BUF_SIZE];
 static SCANCODE_HEAD: AtomicU32 = AtomicU32::new(0);
 static SCANCODE_TAIL: AtomicU32 = AtomicU32::new(0);
 
-pub fn push_scancode(sc: u8) {
-    let head = SCANCODE_HEAD.load(Ordering::Relaxed);
-    let tail = SCANCODE_TAIL.load(Ordering::Relaxed);
-    let next = (head + 1) % SCANCODE_BUF_SIZE as u32;
-    if next == tail {
-        // Buffer full — drop oldest byte
-        SCANCODE_TAIL.store((tail + 1) % SCANCODE_BUF_SIZE as u32, Ordering::Relaxed);
+static mut RING3_SCANCODE_BUF: [u8; RING3_BUF_SIZE] = [0u8; RING3_BUF_SIZE];
+static RING3_HEAD: AtomicU32 = AtomicU32::new(0);
+static RING3_TAIL: AtomicU32 = AtomicU32::new(0);
+
+static mut MOUSE_BUF: [u8; MOUSE_BUF_SIZE] = [0u8; MOUSE_BUF_SIZE];
+static MOUSE_HEAD: AtomicU32 = AtomicU32::new(0);
+static MOUSE_TAIL: AtomicU32 = AtomicU32::new(0);
+
+fn push_ring(buf: &mut [u8], head: &AtomicU32, tail: &AtomicU32, size: u32, byte: u8) {
+    let h = head.load(Ordering::Relaxed);
+    let t = tail.load(Ordering::Relaxed);
+    let next = (h + 1) % size;
+    if next == t {
+        tail.store((t + 1) % size, Ordering::Relaxed);
     }
-    unsafe { SCANCODE_BUF[head as usize] = sc; }
-    SCANCODE_HEAD.store(next, Ordering::Relaxed);
+    buf[h as usize] = byte;
+    head.store(next, Ordering::Relaxed);
+}
+
+fn pop_ring(head: &AtomicU32, tail: &AtomicU32, buf: &[u8], size: u32) -> Option<u8> {
+    let h = head.load(Ordering::Relaxed);
+    let t = tail.load(Ordering::Relaxed);
+    if h == t { return None; }
+    let byte = unsafe { *buf.as_ptr().add(t as usize) };
+    tail.store((t + 1) % size, Ordering::Relaxed);
+    Some(byte)
+}
+
+pub fn push_scancode(sc: u8) {
+    unsafe {
+        push_ring(&mut SCANCODE_BUF, &SCANCODE_HEAD, &SCANCODE_TAIL, SCANCODE_BUF_SIZE as u32, sc);
+        push_ring(&mut RING3_SCANCODE_BUF, &RING3_HEAD, &RING3_TAIL, RING3_BUF_SIZE as u32, sc);
+    }
 }
 
 pub fn pop_scancode() -> Option<u8> {
-    let head = SCANCODE_HEAD.load(Ordering::Relaxed);
-    let tail = SCANCODE_TAIL.load(Ordering::Relaxed);
-    if head == tail { return None; }
-    let sc = unsafe { SCANCODE_BUF[tail as usize] };
-    SCANCODE_TAIL.store((tail + 1) % SCANCODE_BUF_SIZE as u32, Ordering::Relaxed);
-    Some(sc)
+    pop_ring(&SCANCODE_HEAD, &SCANCODE_TAIL, unsafe { &SCANCODE_BUF }, SCANCODE_BUF_SIZE as u32)
+}
+
+pub fn pop_ring3_scancode() -> Option<u8> {
+    pop_ring(&RING3_HEAD, &RING3_TAIL, unsafe { &RING3_SCANCODE_BUF }, RING3_BUF_SIZE as u32)
+}
+
+pub fn push_mouse_byte(byte: u8) {
+    unsafe {
+        push_ring(&mut MOUSE_BUF, &MOUSE_HEAD, &MOUSE_TAIL, MOUSE_BUF_SIZE as u32, byte);
+    }
+}
+
+pub fn pop_mouse_byte() -> Option<u8> {
+    pop_ring(&MOUSE_HEAD, &MOUSE_TAIL, unsafe { &MOUSE_BUF }, MOUSE_BUF_SIZE as u32)
 }
 
 // Process blocked on stdin
@@ -1135,6 +1185,20 @@ pub fn wake_stdin_blocked() {
 extern "C" fn irq1_handler_rust(scancode: u8) {
     push_scancode(scancode);
     wake_stdin_blocked();
+}
+
+use core::sync::atomic::AtomicU64;
+static IRQ12_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Tick when IRQ12 last fired (for polling timeout in main loop).
+static IRQ12_LAST_TICK: AtomicU64 = AtomicU64::new(0);
+pub fn mouse_irq_count() -> u64 { IRQ12_COUNT.load(core::sync::atomic::Ordering::Relaxed) }
+pub fn mouse_last_irq_tick() -> u64 { IRQ12_LAST_TICK.load(core::sync::atomic::Ordering::Relaxed) }
+
+#[no_mangle]
+extern "C" fn irq12_handler_rust(byte: u8) {
+    IRQ12_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    IRQ12_LAST_TICK.store(crate::time::pit::ticks(), core::sync::atomic::Ordering::Relaxed);
+    push_mouse_byte(byte);
 }
 
 #[no_mangle]

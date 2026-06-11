@@ -110,6 +110,7 @@ extern "C" {
     pub fn reload_segments();
     fn irq0_handler();
     fn irq1_handler();
+    fn irq12_handler();
     fn irq_stub_master();
     fn irq_stub_slave();
     fn syscall_entry();
@@ -188,6 +189,8 @@ pub unsafe fn init_idt() {
     IDT[0x21].set_handler(core::mem::transmute::<unsafe extern "C" fn(), u64>(irq1_handler));
     for i in 0x22..=0x27_usize { IDT[i].set_handler(irq_m); }
     for i in 0x28..=0x2F_usize { IDT[i].set_handler(irq_s); }
+    // IRQ12 (mouse) gets its own handler — overrides the generic slave stub
+    IDT[0x2C].set_handler(core::mem::transmute::<unsafe extern "C" fn(), u64>(irq12_handler));
 
     // 9. IDT[0x80] — int 0x80 syscall gate (DPL=3, trap gate so IF stays on)
     IDT[0x80].set(h!(int80_handler), 0, 0xEF);
@@ -213,16 +216,13 @@ pub unsafe fn init_idt() {
     core::arch::asm!("out 0x21, al", in("al") 0x01u8, options(nostack, nomem));
     core::arch::asm!("out 0xA1, al", in("al") 0x01u8, options(nostack, nomem));
     core::arch::asm!("out 0x80, al", in("al") 0x00u8, options(nostack, nomem));
-    core::arch::asm!("out 0x21, al", in("al") 0xFEu8, options(nostack, nomem));
-    core::arch::asm!("out 0xA1, al", in("al") 0xFFu8, options(nostack, nomem));
+    core::arch::asm!("out 0x21, al", in("al") 0xF8u8, options(nostack, nomem));  // Unmask IRQ0 + IRQ1 + IRQ2 (cascade)
+    core::arch::asm!("out 0xA1, al", in("al") 0xEFu8, options(nostack, nomem)); // Unmask IRQ12 (slave bit 4)
 
     // 13. MSR setup for syscall/sysret
-    // STAR[47:32] = KERNEL_DS(0x10) → SYSCALL CS, SYSRET CS base
-    // STAR[63:48] = KERNEL_DS(0x10) → SYSCALL SS base, SYSRET SS base
-    // SYSCALL: CS ignored (fake), SS = 0x10+8 = 0x18 (USER_DATA, fake)
-    // SYSRET:  CS = (0x10+16)|3 = 0x23 → USER_CODE(0x20) ✓
-    //          SS = (0x10+8)|3  = 0x1B → USER_DATA(0x18)  ✓
-    let star = (KERNEL_CS as u64) << 16 | (KERNEL_DS as u64) << 32
+    // STAR[47:32] = KERNEL_CS(0x08) → SYSCALL loads CS=0x08, SS=0x08+8=0x10 ✓
+    // STAR[63:48] = KERNEL_DS(0x10) → SYSRET loads CS=(0x10+16)|3=0x23, SS=(0x10+8)|3=0x1B ✓
+    let star = (KERNEL_CS as u64) << 16 | (KERNEL_CS as u64) << 32
              | (KERNEL_DS as u64) << 48;
     // DEBUG: print star before wrmsr
     crate::drivers::serial::write_str("star=");

@@ -195,6 +195,8 @@ pub fn process_create_into(cr3: u64, entry: u64, name: &str) -> Option<u64> {
     proc.program_break = PROGRAM_BREAK_BASE;
     proc.program_break_end = PROGRAM_BREAK_BASE;
 
+    setup_kernel_stack(proc);
+
     serial::write_str("PROC: create PID=");
     serial::write_usize(pid as usize);
     serial::write_str(" name='");

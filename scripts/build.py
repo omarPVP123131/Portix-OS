@@ -91,16 +91,28 @@ assert KERNEL_LBA_START % 4 == 0
 VENTOY_SIM_OFFSET_SECTORS = 2048
 VENTOY_SIM_DISK_MB        = 64
 
+DATA_PART_MB      = 64
+DATA_PART_IMG     = BUILD / "portix-data-part.img"
+HELLO_ELF         = BUILD / "hello.elf"
+
 TARGET_JSON_NAME = "x86_64-portix"
 TARGET_JSON_PATH = KERNEL_DIR / f"{TARGET_JSON_NAME}.json"
 TARGET_JSON_CONTENT = """{
-  "llvm-target": "x86_64-unknown-none-elf",
-  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128",
-  "arch": "x86_64","target-endian": "little","target-pointer-width": 64,
-  "target-c-int-width": 32,"os": "none","executables": true,
-  "linker-flavor": "ld.lld","linker": "rust-lld","panic-strategy": "abort",
-  "disable-redzone": true,"features": "-mmx,-sse,+soft-float",
-  "pre-link-args": {"ld.lld": ["-Tlinker.ld", "-n", "--gc-sections"]}
+  "llvm-target": "x86_64-unknown-none",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+  "arch": "x86_64",
+  "target-endian": "little",
+  "target-pointer-width": 64,
+  "os": "none",
+  "linker-flavor": "ld.lld",
+  "linker": "rust-lld",
+  "panic-strategy": "abort",
+  "disable-redzone": true,
+  "relocation-model": "static",
+  "code-model": "small",
+  "pre-link-args": {
+    "ld.lld": ["-Tlinker.ld"]
+  }
 }"""
 
 _OBJCOPY    = "objcopy"
@@ -432,30 +444,202 @@ def assemble_stage2(ks):
     if sz != exp: log(f"[ERROR] stage2={sz}B (esperado {exp})"); sys.exit(1)
     log(f"[OK]    stage2.bin — {sz}B ({STAGE2_SECTORS} sectores)")
 
-def _inject_pt(img_path):
+def _find_xgcc():
+    """Busca el cross-compiler x86_64-elf-gcc en build/."""
+    gcc = BUILD / "x86_64-elf" / "bin" / "x86_64-elf-gcc.exe"
+    if not gcc.exists():
+        gcc = BUILD / "x86_64-elf" / "bin" / "x86_64-elf-gcc"
+    if gcc.exists():
+        bindir = str(gcc.parent)
+        if bindir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+        return gcc
+    return None
+
+def _build_libportix():
+    """Compila libportix.a con el cross-compiler."""
+    gcc = _find_xgcc()
+    if not gcc: return None
+    as_ = gcc.with_name("x86_64-elf-as.exe")
+    ar  = gcc.with_name("x86_64-elf-ar.exe")
+    if not as_.exists(): as_ = gcc.with_name("x86_64-elf-as")
+    if not ar.exists():  ar  = gcc.with_name("x86_64-elf-ar")
+
+    src_dir = ROOT / "lib" / "src"
+    inc_dir = ROOT / "lib" / "include"
+    lib_build = BUILD / "libportix"
+    lib_build.mkdir(parents=True, exist_ok=True)
+
+    cflags = ["-ffreestanding", "-nostdlib", "-static", "-mno-red-zone",
+              "-mno-mmx", "-mno-sse", "-I", str(inc_dir), "-O2", "-Wall", "-c"]
+
+    files = [
+        ("crt0.s", str(as_), []),
+        ("stdio.c", str(gcc), cflags),
+        ("stdlib.c", str(gcc), cflags),
+        ("string.c", str(gcc), cflags),
+        ("file.c", str(gcc), cflags),
+    ]
+
+    objs = []
+    for fname, tool, flags in files:
+        src = src_dir / fname
+        obj = lib_build / fname.replace(".c", ".o").replace(".s", ".o")
+        cmd = [tool] + flags + ["-o", str(obj), str(src)]
+        subprocess.run(cmd, check=True, capture_output=True)
+        objs.append(str(obj))
+
+    liba = lib_build / "libportix.a"
+    subprocess.run([str(ar), "rcs", str(liba)] + objs, check=True, capture_output=True)
+    log(f"  libportix.a -> {liba} ({liba.stat().st_size} bytes)")
+    return lib_build
+
+def _compile_c_examples(lib_build, fs):
+    """Compila ejemplos C y los copia a FAT32."""
+    if not lib_build: return
+    gcc = _find_xgcc()
+    ld  = gcc.with_name("x86_64-elf-ld.exe")
+    if not ld.exists(): ld = gcc.with_name("x86_64-elf-ld")
+
+    inc_dir = ROOT / "lib" / "include"
+    examples_dir = ROOT / "lib" / "examples"
+    lds = BUILD / "linker.ld"
+    cflags = ["-ffreestanding", "-nostdlib", "-static", "-mno-red-zone",
+              "-mno-mmx", "-mno-sse", "-I", str(inc_dir), "-O2", "-Wall", "-c"]
+
+    crt0 = lib_build / "crt0.o"
+    liba = lib_build / "libportix.a"
+
+    for src in sorted(examples_dir.glob("*.c")):
+        name = src.stem
+        obj = lib_build / f"{name}.o"
+        out = lib_build / f"{name}.elf"
+        log(f"  Compiling C: {src.name}")
+        subprocess.run([str(gcc)] + cflags + ["-o", str(obj), str(src)],
+                       check=True, capture_output=True)
+        link = [str(ld), "-T", str(lds), "-o", str(out), str(obj),
+                str(crt0), "-L", str(lib_build), "-lportix",
+                "-z", "max-page-size=0x1", "-N"]
+        subprocess.run(link, check=True, capture_output=True)
+        sz = out.stat().st_size
+        log(f"    -> {out.name} ({sz} bytes)")
+        obj.unlink()
+
+        # Determinar destino FAT32
+        if name == "sh":
+            dst = "/bin/sh"
+        elif name == "hello":
+            dst = "/bin/hello"
+        else:
+            dst = f"/bin/{name}"
+        with fs.openbin(dst, "w") as f:
+            f.write(out.read_bytes())
+        log(f"    FAT copy {out.name} -> {dst}")
+
+def _build_data_part(ks):
+    """
+    Crea una particion FAT32 con directorios /bin/, /etc/, /home/, /tmp/
+    y copia hello.elf como /bin/sh y /bin/hello.
+    Si el cross-compiler esta disponible, compila ejemplos C en su lugar.
+    Retorna el numero de sectores de la particion.
+    """
+    PyFat, PyFatFS = _check_pyfatfs()
+    part_size = DATA_PART_MB * 1024 * 1024
+    with open(DATA_PART_IMG, "wb") as f:
+        f.truncate(part_size)
+    fat = PyFat()
+    fat.mkfs(str(DATA_PART_IMG), fat_type=PyFat.FAT_TYPE_FAT32,
+             size=part_size, label="PORTIX_DATA")
+    fat.close()
+
+    fs = PyFatFS(str(DATA_PART_IMG), encoding="utf-8")
+    try:
+        for d in ["/bin", "/etc", "/home", "/home/user", "/tmp", "/usr", "/var"]:
+            if not fs.isdir(d):
+                fs.makedir(d, recreate=True)
+                log(f"  FAT mkdir {d}")
+
+        # Compilar ejemplos C si el cross-compiler existe
+        lib_build = _build_libportix()
+        if lib_build:
+            _compile_c_examples(lib_build, fs)
+        elif HELLO_ELF.exists():
+            for dst in ["/bin/sh", "/bin/hello", "/bin/echo", "/bin/ls"]:
+                with fs.openbin(dst, "w") as f:
+                    f.write(HELLO_ELF.read_bytes())
+                log(f"  FAT copy hello.elf -> {dst}")
+    finally:
+        fs.close()
+
+    part_sectors = DATA_PART_IMG.stat().st_size // 512
+    log(f"[OK]    Particion FAT32: {DATA_PART_MB} MB ({part_sectors} sectores)")
+    return part_sectors
+
+def _inject_pt(img_path, data_lba_start, data_sectors):
     data = bytearray(img_path.read_bytes())
-    ts = len(data)//512
-    part = bytearray(16)
-    part[0]=0x80; part[2]=0x02; part[4]=0x0B
-    el=ts-1; part[5]=(el//63)%255; part[6]=((el%63)+1)&0x3F; part[7]=(el//(63*255))&0xFF
-    struct.pack_into('<I',part,8,1); struct.pack_into('<I',part,12,ts-1)
-    data[0x1BE:0x1BE+16]=part; img_path.write_bytes(bytes(data))
-    log(f"  Tabla de particiones inyectada")
+    # Partition 1: boot area (LBA 1 to just before data partition, type 0x83 Linux)
+    part1 = bytearray(16)
+    part1[0] = 0x00           # not bootable
+    part1[4] = 0x83           # Linux native (skipped by FAT32 mount)
+    struct.pack_into('<I', part1, 8, 1)
+    struct.pack_into('<I', part1, 12, data_lba_start - 1)
+    data[0x1BE:0x1BE+16] = part1
+
+    # Partition 2: FAT32 data partition
+    data_end = data_lba_start + data_sectors
+    ts = len(data) // 512
+    part2 = bytearray(16)
+    part2[0] = 0x00
+    part2[4] = 0x0C           # FAT32 LBA
+    ss = data_lba_start
+    el = min(ts - 1, data_lba_start + data_sectors - 1)
+    if ss <= el:
+        struct.pack_into('<I', part2, 8, ss)
+        struct.pack_into('<I', part2, 12, el - ss + 1)
+    data[0x1CE:0x1CE+16] = part2
+
+    img_path.write_bytes(bytes(data))
+    log(f"  Tabla de particiones: P1@1-{data_lba_start-1} (boot) P2@{data_lba_start}+{data_sectors}s (FAT32)")
 
 def create_raw(ks):
-    step("CREANDO IMAGEN RAW")
-    total = KERNEL_LBA_START+ks+KERNEL_MARGIN
-    mb = max(math.ceil(total*512/1048576), DISK_MIN_MB)
+    step("CREANDO IMAGEN RAW + FAT32")
+    total = KERNEL_LBA_START + ks + KERNEL_MARGIN
+    # Align kernel end to 1 MB boundary
+    kernel_end_lba = (total + 2047) // 2048 * 2048  # round up to 1 MB
+    data_image_size = DATA_PART_MB * 1048576
+    # Build FAT32 data partition first to get exact size
+    part_sectors = _build_data_part(ks)
+    total_mb = max(math.ceil((kernel_end_lba * 512 + data_image_size) / 1048576), DISK_MIN_MB + DATA_PART_MB)
+
     log(f"  Layout: Boot@0 Stage2@1-{KERNEL_LBA_START-1} "
-        f"Kernel@{KERNEL_LBA_START} -> phys 0x{KERNEL_PHYS_ADDR:08X} {mb}MB")
-    with open(DISK_IMG,"wb") as f: f.truncate(mb*1048576)
-    def wa(src,lba):
-        d=src.read_bytes()
-        with open(DISK_IMG,"r+b") as f: f.seek(lba*512); f.write(d)
+        f"Kernel@{KERNEL_LBA_START}-{KERNEL_LBA_START+ks-1} "
+        f"gap@{kernel_end_lba}+ (FAT32 {DATA_PART_MB} MB)")
+
+    with open(DISK_IMG, "wb") as f:
+        f.truncate(total_mb * 1048576)
+
+    def wa(src, lba):
+        d = src.read_bytes()
+        with open(DISK_IMG, "r+b") as f:
+            f.seek(lba * 512)
+            f.write(d)
         log(f"  {src.name} -> LBA {lba}")
-    wa(BOOTBIN,0); wa(STAGE2BIN,1); wa(KERNELBIN,KERNEL_LBA_START)
-    _inject_pt(DISK_IMG); shutil.copy2(DISK_IMG,RAW_COPY)
-    log(f"[OK]    portix.img — {human(DISK_IMG)}")
+
+    wa(BOOTBIN, 0)
+    wa(STAGE2BIN, 1)
+    wa(KERNELBIN, KERNEL_LBA_START)
+
+    # Build FAT32 data partition and append it
+    part_sectors = _build_data_part(ks)
+    part_data = DATA_PART_IMG.read_bytes()
+    with open(DISK_IMG, "r+b") as f:
+        f.seek(kernel_end_lba * 512)
+        f.write(part_data)
+
+    _inject_pt(DISK_IMG, kernel_end_lba, part_sectors)
+    shutil.copy2(DISK_IMG, RAW_COPY)
+    total_mb = len(part_data) // 1048576
+    log(f"[OK]    portix.img — {human(DISK_IMG)} (boot + kernel + FAT32 {total_mb} MB)")
 
 def create_ventoy_sim():
     step("CREANDO DISCO VENTOY-SIM")
@@ -694,8 +878,22 @@ def run_qemu():
     mode = arg_val("--mode") or "raw"
     step(f"EJECUTANDO QEMU (modo: {mode})")
     vga_type = arg_val("--vga") or "std"
-    base = ["-cpu","max","-m","256M","-vga",vga_type,"-serial","stdio",
-            "-no-reboot","-d","int,guest_errors","-D",str(DEBUG_LOG)]
+    display_mode = arg_val("--display")
+    if display_mode is None:
+        display_mode = "sdl"  # interactive by default
+
+    if display_mode == "none" or display_mode == "headless":
+        base = ["-cpu","max","-m","256M","-vga",vga_type,"-serial","stdio",
+                "-no-reboot","-d","int,guest_errors","-D",str(DEBUG_LOG)]
+        serial_log = "stdio"
+    else:
+        base = ["-cpu","max","-m","256M","-vga",vga_type,
+                "-display", display_mode,
+                "-serial","file:serial.log",
+                "-no-reboot","-d","int,guest_errors","-D",str(DEBUG_LOG)]
+        serial_log = str(Path.cwd() / "serial.log")
+        log(f"  Display: {display_mode}")
+        log(f"  Serial:  {serial_log}")
 
     persist_drive = []
     if arg_val("--persistence") is not None and PERSISTENT_DISK.exists():
@@ -787,6 +985,8 @@ LIB_OK = LIB_A.exists()
 
 def build_libportix():
     step("COMPILANDO libportix (Fase 7)")
+    LIB_CC = find_tool("x86_64-elf-gcc")
+    LIB_OK = LIB_A.exists()
     if not LIB_CC:
         log("  [SKIP] x86_64-elf-gcc no encontrado")
         log("  Para construir: bash scripts/ring3-toolchain.sh")

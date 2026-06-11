@@ -1,4 +1,4 @@
-// kernel/src/main.rs — PORTIX Kernel v0.7.4
+// kernel/src/main.rs — PORTIX Kernel v0.14.0
 //
 // FIXES:
 //   - ctrl leído desde kbd.ctrl() en lugar de hardcoded false
@@ -95,15 +95,6 @@ static ALLOCATOR: BuddyAllocator = BuddyAllocator::new();
 
 const RENDER_HZ: u64 = 30;
 const RENDER_INTERVAL: u64 = 100 / RENDER_HZ;
-const PS2_STATUS: u16 = 0x64;
-const PS2_DATA: u16 = 0x60;
-
-#[inline(always)]
-unsafe fn ps2_inb(p: u16) -> u8 {
-    let v: u8;
-    core::arch::asm!("in al, dx", out("al") v, in("dx") p, options(nostack, nomem));
-    v
-}
 
 unsafe fn init_cpu_features() {
     let mut cr0: u64;
@@ -117,6 +108,7 @@ unsafe fn init_cpu_features() {
     cr4 |= (1 << 9) | (1 << 10); // OSFXSR + OSXMMEXCPT
     core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, nomem));
 }
+
 
 // ── Statics BSS ──────────────────────────────────────────────────────────────
 
@@ -216,6 +208,19 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
     unsafe { bootinfo::init(boot_info); }
     unsafe { init_cpu_features(); }
 
+    // Verificar que SSE está habilitado correctamente
+unsafe {
+    let cr4: u64;
+    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, nomem));
+    drivers::serial::write_str("[CPU] CR4=");
+    drivers::serial::write_hex(cr4 as usize);
+    drivers::serial::write_str("\n");
+    // Debe tener bits 9 y 10 (OSFXSR=0x200, OSXMMEXCPT=0x400)
+    if cr4 & 0x600 != 0x600 {
+        drivers::serial::write_str("[CPU] WARN: SSE no habilitado correctamente\n");
+    }
+}
+
     drivers::serial::init();  // serial antes que nada para debug
 
     // IDT primero — sin esto cualquier excepción = triple fault opaco
@@ -246,6 +251,59 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
     let lay = Layout::new(c.width(), c.height());
     ms.init(lay.fw.max(1), lay.fh.max(1));
 
+    // ── Drenar FIFO PS/2 ──────────────────────────────────────────────
+    // Los bytes basura en el FIFO del 8042 (p.ej. BAT completion del
+    // teclado durante el boot) bloquean la generacion de nuevas IRQs: el
+    // 8042 solo genera IRQ1/IRQ12 en la transicion vacio→no-vacio.
+    // Si el FIFO contiene bytes viejos, las IRQs nunca se disparan.
+    unsafe {
+        let mut drained = 0u32;
+        for _ in 0..256 {
+            let st: u8;
+            core::arch::asm!("in al, dx", out("al") st, in("dx") 0x64u16, options(nostack));
+            if st & 0x01 == 0 { break; }
+            let _byte: u8;
+            core::arch::asm!("in al, dx", out("al") _byte, in("dx") 0x60u16, options(nostack));
+            drained += 1;
+        }
+        if drained > 0 {
+            crate::drivers::serial::write_str("[PS2] drained ");
+            crate::drivers::serial::write_usize(drained as usize);
+            crate::drivers::serial::write_str(" stale bytes\n");
+        }
+
+        // Segunda fase: habilitar reloj del teclado (bit4=0) + traduccion (bit6=1)
+        // La primera fase en mouse.rs deshabilito el reloj para evitar interferencia.
+        loop {
+            let st: u8;
+            core::arch::asm!("in al, dx", out("al") st, in("dx") 0x64u16, options(nostack));
+            if st & 0x02 == 0 { break; }
+            core::arch::asm!("out 0x80, al", in("al") 0u8, options(nostack, nomem));
+        }
+        core::arch::asm!("out dx, al", in("dx") 0x64u16, in("al") 0x60u8, options(nostack));
+        core::arch::asm!("out 0x80, al", in("al") 0u8, options(nostack, nomem));
+        loop {
+            let st: u8;
+            core::arch::asm!("in al, dx", out("al") st, in("dx") 0x64u16, options(nostack));
+            if st & 0x02 == 0 { break; }
+            core::arch::asm!("out 0x80, al", in("al") 0u8, options(nostack, nomem));
+        }
+        // 0x43 = IRQ1+IRQ12+translation ON, keyboard+mouse clock enabled
+        core::arch::asm!("out dx, al", in("dx") 0x60u16, in("al") 0x43u8, options(nostack));
+        crate::drivers::serial::log("PS2", "config 0x43 (kbd clock + translation ON)");
+
+        // Habilitar scanning del teclado (0xF4)
+        // El ACK (0xFA) llega via IRQ1 → SCANCODE_BUF (se ignora)
+        loop {
+            let st: u8;
+            core::arch::asm!("in al, dx", out("al") st, in("dx") 0x64u16, options(nostack));
+            if st & 0x02 == 0 { break; }
+            core::arch::asm!("out 0x80, al", in("al") 0u8, options(nostack, nomem));
+        }
+        core::arch::asm!("out dx, al", in("dx") 0x60u16, in("al") 0xF4u8, options(nostack, nomem));
+        crate::drivers::serial::log("KBD", "enable cmd sent (0xF4)");
+    }
+
     let mut term = console::terminal::Terminal::new();
     term.write_line("PORTIX v0.7.4  Kernel Bare-Metal", LineColor::Header);
     term.write_line("Escribe 'ayuda' para comandos.", LineColor::Info);
@@ -258,7 +316,10 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
             .write(core::mem::MaybeUninit::new(ExplorerState::new(2)));
     }
 
-  {
+    let mut mount_ok = false;
+    let mut root_cluster = 2u32;
+
+    {
         let bus = ata::AtaBus::scan();
         ata::log_drives(&bus);
 
@@ -278,9 +339,6 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
         }
 
         // Montar FAT32 o formatear si no existe (usa device 0 = Primary0)
-        let mut root_cluster = 2u32; // fallback
-        let mut mount_ok = false;
-
         let dev0_kind = registry::get_device(0).map(|d| d.device_info().kind);
 
         // Si device 0 es ATAPI (CD-ROM), mostrar guía en vez de montar/formatear
@@ -289,25 +347,62 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
                 "Boot desde CD-ROM detectado. Ejecuta 'install' para instalar PORTIX en disco duro.");
         }
 
+        serial::write_str("[FS] dev0_kind=");
+        serial::write_usize(match dev0_kind { Some(DriveType::Ata) => 1, Some(DriveType::Atapi) => 2, None => 0 });
+        serial::write_str("\n");
         if let Some(DriveType::Ata) = dev0_kind {
+            serial::write_str("[FS] Attempting FAT32 mount...\n");
             if let Some(drive) = registry::get_device(0) {
+                serial::write_str("[FS] Got drive, mounting...\n");
+                let mut mbr = [0u8; 512];
+                if drive.read_sectors(0, 1, &mut mbr).is_ok() {
+                    serial::write_str("[FS] MBR read OK, sig=");
+                    serial::write_hex(mbr[510] as usize);
+                    serial::write_hex(mbr[511] as usize);
+                    serial::write_str("\n");
+                    serial::write_str("[FS] P1 type=");
+                    serial::write_hex(mbr[0x1BE+4] as usize);
+                    serial::write_str(" P2 type=");
+                    serial::write_hex(mbr[0x1CE+4] as usize);
+                    serial::write_str("\n");
+                }
                 if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
                     root_cluster = vol.root_cluster();
                     mount_ok = true;
+                    serial::log("FS", "FAT32 montado correctamente");
+                } else {
+                    serial::log("FS", "FAT32 no encontrado en particion");
                 }
             }
+            serial::write_str("[FS] mount_ok=");
+            serial::write_usize(mount_ok as usize);
+            serial::write_str("\n");
+        }
+        serial::write_str("[FS] After mount block, mount_ok=");
+        serial::write_usize(mount_ok as usize);
+        serial::write_str("\n");
 
-            // Solo formatear si NO se pudo montar (evita formatear en cada reboot)
-            if !mount_ok {
-                if let Some(drive) = registry::get_device(0) {
-                    let total_secs = drive.total_sectors();
-                    if mkfs::auto_format(drive, total_secs).is_some() {
-                        if let Some(drive) = registry::get_device(0) {
-                            if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
-                                root_cluster = vol.root_cluster();
-                            }
+        if !mount_ok {
+            if let Some(drive) = registry::get_device(0) {
+                let total_secs = drive.total_sectors();
+                if mkfs::auto_format(drive, total_secs).is_some() {
+                    if let Some(drive) = registry::get_device(0) {
+                        if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
+                            root_cluster = vol.root_cluster();
                         }
                     }
+                }
+            }
+        }
+
+        // Quick FAT32 test: list directories
+        if mount_ok {
+            if let Some(drive) = registry::get_device(0) {
+                if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
+                    serial::write_str("[FS] mount_ok, testing list...\n");
+                    fat32_list_dir(&mut vol, "bin");
+                    fat32_list_dir(&mut vol, "home");
+                    fat32_list_dir(&mut vol, "etc");
                 }
             }
         }
@@ -317,6 +412,61 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
                 .write(core::mem::MaybeUninit::new(ExplorerState::new(root_cluster)));
         }
     }
+
+fn fat32_list_dir(vol: &mut fat32::Fat32Volume, dir_name: &str) {
+    let root = vol.root_cluster();
+    if let Ok(entry) = vol.find_entry(root, dir_name) {
+        if entry.is_dir {
+            serial::write_str("[FS] /");
+            serial::write_str(dir_name);
+            serial::write_str("/ contents:\n");
+            let _ = vol.list_dir(entry.cluster, |e| {
+                serial::write_str("      ");
+                if e.is_dir { serial::write_str("[DIR] "); }
+                else { serial::write_str("[FILE] "); }
+                serial::write_str(e.name_str());
+                serial::write_str("  (");
+                serial::write_usize(e.size as usize);
+                serial::write_str(" bytes)\n");
+            });
+        }
+    }
+}
+
+fn load_shell_from_fat32(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
+    let bin_entry = match vol.find_entry(root, "bin") {
+        Ok(e) if e.is_dir => e,
+        _ => { serial::log("FS", "/bin not found"); return false; }
+    };
+    let sh_entry = match vol.find_entry(bin_entry.cluster, "sh") {
+        Ok(e) if !e.is_dir => e,
+        _ => { serial::log("FS", "/bin/sh not found"); return false; }
+    };
+    let size = sh_entry.size as usize;
+    let mut buf = alloc::vec![0u8; size];
+    if vol.read_file(&sh_entry, &mut buf).is_err() {
+        serial::log("FS", "read /bin/sh failed");
+        return false;
+    }
+    serial::write_str("[FS] /bin/sh loaded (");
+    serial::write_usize(size);
+    serial::write_str(" bytes)\n");
+    if let Some(pid1) = elf::elf_load_and_create_process(&buf, "shell") {
+        // Process created — scheduler will manage execution
+        // Mark as Ready so it enters the scheduler pool
+        if let Some(proc) = process::process_by_pid(pid1) {
+            proc.state = process::ProcessState::Ready;
+        }
+        // Restore TSS RSP0 to kernel stack (set_current changed it)
+        let stack_top = core::ptr::addr_of!(__stack_top) as u64;
+        process::set_tss_rsp0(stack_top);
+        serial::log("R3", "Shell process PID=1 ready (awaiting scheduler)");
+        true
+    } else {
+        serial::log("FS", "elf_load_and_create_process failed");
+        false
+    }
+}
 
     // Referencias limpias para el loop principal
     let ide: &mut IdeState = unsafe { (*core::ptr::addr_of_mut!(IDE_STORAGE)).assume_init_mut() };
@@ -356,22 +506,37 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
     c.present_full();
     drivers::serial::log("FB", "present done");
 
-    // ── Ring 3 — persistent shell ───────────────────────────────────────
-    let hello_elf = include_bytes!("../../build/hello.elf");
-    if let Some(pid1) = elf::elf_load_and_create_process(hello_elf, "shell") {
-        process::set_current(pid1);
-        unsafe { arch::ring3::enter_ring3_asm(); }
-        drivers::serial::log("R3", "Returned to ring 0 OK - main loop running");
+    // ── Ring 3 — init process (scheduler-managed) ────────────────────────
+    // Create PID 1 in Ready state. Process is NOT auto-executed — it enters
+    // the scheduler's ready pool for preemptive multitasking (future).
+    // The kernel boots directly into the main loop UI.
+    if mount_ok {
+        if let Some(drive) = registry::get_device(0) {
+            if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
+                let root = vol.root_cluster();
+                let _ = load_shell_from_fat32(&mut vol, root);
+            }
+        }
     } else {
-        drivers::serial::log("R3", "ERROR: failed to load ELF or create process");
+        let hello_elf = include_bytes!("../../build/hello.elf");
+        if let Some(pid1) = elf::elf_load_and_create_process(hello_elf, "shell") {
+            if let Some(proc) = process::process_by_pid(pid1) {
+                proc.state = process::ProcessState::Ready;
+            }
+            let stack_top = core::ptr::addr_of!(__stack_top) as u64;
+            process::set_tss_rsp0(stack_top);
+            drivers::serial::log("R3", "Hello process PID=1 ready (awaiting scheduler)");
+        } else {
+            drivers::serial::log("R3", "ERROR: failed to load ELF or create process");
+        }
     }
 
     loop {
         let now = time::pit::ticks();
 
         // ── Drenado IRQ1 teclado ─────────────────────────────────────────
-        // IRQ1 handler now buffers scancodes; we consume them here.
-        // Mouse still polled directly (IRQ12 is stub).
+        // IRQ1 handler buffers scancodes into SCANCODE_BUF.
+        // IRQ12 (mouse) buffers mouse bytes into MOUSE_BUF.
         let mut kbd_buf = [0u8; 32];
         let mut kbd_n = 0usize;
         let mut ms_buf = [0u8; 32];
@@ -383,16 +548,34 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
                 None => break,
             }
         }
-        // Poll PS/2 for mouse bytes (keyboard bytes already consumed by IRQ1)
-        unsafe {
-            loop {
-                let st = ps2_inb(PS2_STATUS);
-                if st & 0x01 == 0 { break; }
-                let byte = ps2_inb(PS2_DATA);
-                if st & 0x20 != 0 {
-                    if ms_n < 32 { ms_buf[ms_n] = byte; ms_n += 1; }
+        // Drain IRQ12 mouse buffer
+        while ms_n < 32 {
+            match crate::arch::isr_handlers::pop_mouse_byte() {
+                Some(byte) => { ms_buf[ms_n] = byte; ms_n += 1; }
+                None => break,
+            }
+        }
+
+
+
+
+
+        // ── Poll mouse directly (fallback if IRQ12 doesn't fire) ──────────
+        // IRQ1 handler now skips AUXB=1 bytes, so mouse data stays in the
+        // controller buffer until consumed here or by IRQ12.
+        while ms_n < 32 {
+            match unsafe { drivers::input::mouse::poll_aux() } {
+                Some(byte) => {
+                    if drivers::input::mouse::init_done() < 3 {
+                        crate::drivers::serial::write_str("[MS] byte[");
+                        crate::drivers::serial::write_usize(drivers::input::mouse::init_done() as usize);
+                        crate::drivers::serial::write_str("]=0x");
+                        crate::drivers::serial::write_hex(byte as usize);
+                        crate::drivers::serial::write_str("\n");
+                    }
+                    ms_buf[ms_n] = byte; ms_n += 1;
                 }
-                // Keyboard bytes handled by IRQ1 — ignore here
+                None => break,
             }
         }
 
@@ -523,6 +706,17 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
             }
             if ms.error_count >= 25 {
                 ms.intelligent_reset();
+            }
+            if changed || ms.error_count > 0 {
+                crate::drivers::serial::write_str("[MS] feed ");
+                crate::drivers::serial::write_usize(ms_n);
+                crate::drivers::serial::write_str("B xy=0x");
+                crate::drivers::serial::write_hex(ms.x as usize);
+                crate::drivers::serial::write_str(",0x");
+                crate::drivers::serial::write_hex(ms.y as usize);
+                crate::drivers::serial::write_str(" err=");
+                crate::drivers::serial::write_usize(ms.error_count as usize);
+                crate::drivers::serial::write_str("\n");
             }
             changed
         } else {
@@ -714,10 +908,10 @@ extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
                 Tab::Explorer => draw_explorer_tab(&mut c, &lay, explorer),
             }
 
-            if ms.present {
-                c.draw_cursor(ms.x, ms.y);
-            }
-            needs_draw = false;
+// v0.7.4 (correcto):
+if ms.present {
+    c.draw_cursor(ms.x, ms.y);
+}            needs_draw = false;
             needs_present = true;
         }
 

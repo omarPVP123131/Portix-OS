@@ -61,7 +61,7 @@ fn validate_elf(data: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) -> Result<(), &'static str> {
+pub(crate) fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) -> Result<(), &'static str> {
     let hdr: &Elf64Header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
     let phdr_slice = unsafe {
         let ptr = data.as_ptr().add(hdr.e_phoff as usize);
@@ -123,7 +123,7 @@ fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) -> Result<(),
     Ok(())
 }
 
-fn alloc_kernel_page() -> Option<usize> {
+pub(crate) fn alloc_kernel_page() -> Option<usize> {
     let layout = core::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).ok()?;
     let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
     if ptr.is_null() { return None; }
@@ -181,7 +181,7 @@ pub fn elf_load(path: &str) -> Result<ElfLoader, &'static str> {
     elf_load_raw(&file_data)
 }
 
-fn resolve_path<'p>(
+pub(crate) fn resolve_path<'p>(
     vol: &mut Fat32Volume,
     root_cluster: u32,
     path: &'p str,

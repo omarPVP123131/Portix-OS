@@ -30,8 +30,10 @@ typedef __builtin_va_list va_list;
 #define SYS_READ   5
 #define SYS_OPEN   6
 #define SYS_CLOSE  7
-#define SYS_BRK    8
-#define SYS_MMAP   9
+#define SYS_BRK      8
+#define SYS_MMAP     9
+#define SYS_GETDIRENTS 10
+#define SYS_EXECVE   11
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -120,9 +122,41 @@ static inline void *mmap(void *addr, size_t len, int prot, int flags) {
     return (void*)syscall4(SYS_MMAP, (u64)addr, len, prot, flags);
 }
 
+// ── Dirent (SYS_GETDIRENTS) ───────────────────────────────────────────
+#define DT_UNKNOWN 0
+#define DT_FILE    1
+#define DT_DIR     2
+
+struct __attribute__((packed)) portix_dirent {
+    unsigned long long d_ino;      // 8 bytes
+    unsigned long long d_off;      // 8 bytes
+    unsigned short     d_reclen;   // 2 bytes (total entry size)
+    unsigned char      d_type;     // 1 byte (DT_UNKNOWN/DT_FILE/DT_DIR)
+    char               d_name[];   // variable, null-terminated
+};
+
+#define DIRENT_HEADER_SIZE 19
+
+static inline int getdents(const char *path, void *buf, unsigned long count) {
+    return (int)syscall3(SYS_GETDIRENTS, (u64)path, (u64)buf, count);
+}
+
+static inline int execve(const char *path, char *const argv[], char *const envp[]) {
+    return (int)syscall3(SYS_EXECVE, (u64)path, (u64)argv, (u64)envp);
+}
+
 int putchar(int c);
 int puts(const char *s);
 int printf(const char *fmt, ...);
+int sprintf(char *buf, const char *fmt, ...);
+int snprintf(char *buf, size_t n, const char *fmt, ...);
+int fputs(const char *s, int fd);
+char *fgets(char *buf, int n, int fd);
+
+int fopen(const char *path, const char *mode);
+ssize_t fread(void *buf, size_t size, size_t count, int fd);
+ssize_t fwrite(const void *buf, size_t size, size_t count, int fd);
+int fclose(int fd);
 
 void *malloc(size_t size);
 void free(void *ptr);

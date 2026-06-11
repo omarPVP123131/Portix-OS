@@ -1,35 +1,25 @@
-; lib/src/crt0.s — Ring-3 _start entry point for PORTIX
-;
-; Called by the kernel's IRETQ to ring 3.
-; Sets up stack, calls _init, then main(), then exit().
-; The kernel passes no arguments for now (no argv/envp).
+# lib/src/crt0.s — Ring-3 _start entry point for PORTIX (GAS syntax)
+#
+# Called by the kernel's IRETQ to ring 3.
+# Sets up stack, calls _init, then main(), then exit().
+# The kernel passes no arguments for now (no argv/envp).
 
-BITS 64
-
-extern main
-extern exit
-extern _init
-
-global _start
-
-section .text
+.text
+.globl _start
+.type _start, @function
 
 _start:
-    ; Clear frame pointer (no stack trace needed)
-    xor     rbp, rbp
+    xor %rbp, %rbp          # clear frame pointer
+    call _init               # global constructors
+    mov (%rsp), %rdi        # argc = [rsp]
+    lea 8(%rsp), %rsi       # argv = rsp + 8
+    lea 16(%rsp,%rdi,8), %rdx  # envp = rsp + 8 + (argc+1)*8
+    call main
+    mov %eax, %edi           # exit(code)
+    call _exit
+    hlt                      # should never reach here
 
-    ; Call global constructors (if any)
-    call    _init
-
-    ; main(argc, argv, envp) — all zero for now
-    xor     edi, edi        ; argc = 0
-    xor     esi, esi        ; argv = NULL
-    xor     edx, edx        ; envp = NULL
-    call    main
-
-    ; exit(code)
-    mov     edi, eax
-    call    exit
-
-    ; Should never reach here
-    hlt
+.globl _init
+.type _init, @function
+_init:
+    ret

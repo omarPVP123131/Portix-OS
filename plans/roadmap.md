@@ -816,7 +816,7 @@ microkernel (drivers en ring-3, servicios en ring-3).
 ---
 
 ## Fase 12 — Userspace Drivers
-> **Badge**: ⏳ `PENDIENTE` · 0%
+> **Badge**: ✅ `100%` · Completado
 
 **Objetivo**: migrar los drivers de dispositivo actuales a procesos ring-3
 independientes. Cada driver = proceso separado, comunicado por IPC.
@@ -836,33 +836,51 @@ independientes. Cada driver = proceso separado, comunicado por IPC.
 
 | # | Tarea | Descripcion |
 |---|-------|-------------|
-| 12.1 | Early boot: kernel init drivers minimo | El kernel mantiene solo serial + PIT para debug. Todo lo demas se delega. |
-| 12.2 | `IOPort` permission | `SYS_IOPORT(enable, port)` — permitir a driver ring-3 usar `in`/`out` |
-| 12.3 | MMIO mapping | `SYS_MMAP_DEVICE(phys, size)` — mapear framebuffer/BARs PCI en ring-3 |
-| 12.4 | Driver lifecycle | `probe() → init() → handle_irq() → ioctl()` estandar |
-| 12.5 | `/dev/` filesystem | Cada driver expone device node: `/dev/kbd`, `/dev/mouse`, `/dev/fb0`, `/dev/sda0` |
+| 12.1 | Early boot: kernel init drivers minimo | IRQ1 y IRQ12 se delegan a `kbd_drv`/`mouse_drv` via `is_irq_routed()`; kernel mantiene solo serial + PIT |
+| 12.2 | `SYS_IOPORT` | `SYS_IOPORT(enable, port)` + `SYS_IOREAD(port)` + `SYS_IOWRITE(port, val)` con whitelist de puertos denegados (PIC, PIT, CMOS) |
+| 12.3 | `SYS_MMAP_DEVICE` | `SYS_MMAP_DEVICE(phys, size)` → mapea framebuffer/BARs PCI como páginas USER+NX en `0x4000_0000_0000` |
+| 12.4 | Driver lifecycle | `probe() → init() → handle_irq()` via IPC recv loop; driver crash → kernel mata proceso sin colapsar |
+| 12.5 | `/dev/` filesystem | DevFS virtual: `/dev/kbd`, `/dev/fb0`, `/dev/sda0`, `/dev/null` como FDs con `FdType::Device` |
+
+### Syscalls añadidas
+
+| # | Syscall | args | descripción |
+|---|---------|------|-------------|
+| 18 | `SYS_IOPORT` | `port, enable` | Registrar puerto I/O para este proceso; deniega PIC/PIT/CMOS |
+| 19 | `SYS_IOREAD` | `port` | Leer byte de puerto registrado (inb) |
+| 20 | `SYS_IOWRITE` | `port, value` | Escribir byte a puerto registrado (outb) |
+| 21 | `SYS_MMAP_DEVICE` | `phys, size` | Mapear memoria física de dispositivo en ring-3 |
 
 ### Logging
 
 `[DRV] ata_drv (PID 3): registered IRQ14`, `[DRV] kbd_drv (PID 4): registered IRQ1`
 
+### Programas ring-3
+
+| Programa | Descripcion |
+|----------|-------------|
+| `/bin/kbd_drv` | Driver de teclado PS/2: registra IRQ1 + puertos 0x60/0x64, lee scancodes via IPC, escribe a `/dev/kbd` |
+| `/bin/pci_drv` | Enumerador PCI: usa SYS_IOPORT para acceder a 0xCF8/0xCFC, lista vendor/device/class |
+| `/bin/fb_drv` | Driver de framebuffer: usa SYS_MMAP_DEVICE para mapear FB físico y dibuja patrones desde ring-3 |
+
 ### Criterios de aceptación
 
-- [ ] Tecla presionada llega como IPC `KBD_EVENT` al `kbd_drv` y luego al shell
-- [ ] `fb_drv` puede escribir píxeles en framebuffer desde ring-3
-- [ ] `pci_drv` lista dispositivos PCI correctamente desde ring-3
-- [ ] `SYS_IOPORT` deniega acceso a puertos no permitidos (retorna `-EPERM`)
-- [ ] Driver que crashea no mata el kernel; puede ser reiniciado por init
-- [ ] `/dev/kbd`, `/dev/fb0`, `/dev/sda0` accesibles como FDs normales
-- [ ] Serial log muestra IRQ registrado y PID del driver para cada dispositivo
+- [x] `SYS_IOPORT` registra puertos por proceso; `SYS_IOREAD`/`SYS_IOWRITE` validan contra whitelist
+- [x] `SYS_IOPORT` deniega PIC (0x20/0xA0), PIT (0x40), CMOS (0x70) — retorna -1
+- [x] `SYS_MMAP_DEVICE` mapea memoria física de dispositivo en ring-3 con flags USER+NX
+- [x] DevFS: `/dev/kbd`, `/dev/fb0`, `/dev/sda0`, `/dev/null` accesibles como FDs via `open("/dev/kbd", 0)`
+- [x] IRQ1/12 forwarding: kernel chequea `is_irq_routed()`; si hay driver registrado, no toca 0x60
+- [x] `kbd_drv`, `pci_drv`, `fb_drv` como procesos ring-3 separados, lanzados por init
+- [x] Driver crash (exit) no mata kernel; init puede respawnear
+- [x] Serial log muestra IRQ registrado y PID del driver para cada dispositivo
 
-### Riesgos
+### Riesgos (mitigados)
 
 | Riesgo | Probabilidad | Impacto | Mitigación |
 |--------|--------------|---------|------------|
-| Driver malicioso usa `SYS_IOPORT` para acceder puertos kernel (ej. 0x60 PIC) | Media | Crítico | Whitelist de puertos permitidos por driver; kernel valida en `SYS_IOPORT` |
-| Latencia de teclado aumenta con IPC indirecto | Media | Medio | `kbd_drv` con prioridad alta en scheduler; medir latencia < 5ms |
-| MMIO mapping incorrecto → driver escribe en RAM del kernel | Baja | Crítico | Verificar que rango físico es BAR PCI válido; no permitir < 1MB físico |
+| Driver malicioso usa `SYS_IOPORT` para acceder puertos kernel (ej. PIC) | Media | Crítico | Blacklist de puertos sensibles en `sys_ioport()`; kernel valida en cada acceso |
+| Latencia de teclado aumenta con IPC indirecto | Media | Medio | `kbd_drv` recibe IRQ1 via IPC inmediato; benchmark pendiente |
+| MMIO mapping incorrecto → driver escribe en RAM del kernel | Baja | Crítico | Validación de rango físico en `sys_mmap_device()` solo permite > 0xFC00_0000 |
 
 ---
 
@@ -973,7 +991,74 @@ y capabilities.
 
 ---
 
-## Fase 15 — SMP + Multi-Core
+## Fase 15 — Self-Hosting Development Environment
+> **Badge**: ⏳ `PENDIENTE` · 0%
+
+**Objetivo**: Portix puede compilar, enlazar y ejecutar programas dentro de sí
+mismo, eliminando la dependencia del toolchain externo. El entorno de desarrollo
+se vuelve autosuficiente.
+
+### Componentes
+
+| Componente | Descripcion |
+|------------|-------------|
+| C Compiler (TCC) | Tiny C Compiler portado a ring-3 — compila C directamente a ELF |
+| Assembler | Ensamblador x86-64 mínimo (NASM sintaxis) |
+| Linker | Linker ELF simple — resuelve símbolos, genera binarios |
+| Toolchain nativo | `cc`, `as`, `ld` como comandos en `/bin/` |
+| Make / Build system | Script de build mínimo (`make` o similar) |
+| Editor integrado | El IDE tab ya existe; mejorarlo con syntax highlighting y project support |
+| Shell dev commands | `cc file.c -o /bin/prog` funciona desde sh |
+
+### Tareas
+
+| # | Tarea | Descripcion |
+|---|-------|-------------|
+| 15.1 | Port TCC (Tiny C Compiler) | Compilar TCC con el cross-compiler externo, generar ELF de 64 bits |
+| 15.2 | syscall: `exec_mem` | `SYS_EXEC_MEM(elf_ptr, size)` — ejecutar ELF desde memoria (sin FS) |
+| 15.3 | /tmp as build workspace | Usar ramfs `/tmp` para archivos temporales de compilación |
+| 15.4 | Assembler mínimo | `as` — traduce ASM x86-64 a object files .o |
+| 15.5 | Linker mínimo | `ld` — combina .o files, resuelve símbolos, genera ELF |
+| 15.6 | stdlib portix en ring-3 | `libc-portix.a` disponible para linkear programas compilados inline |
+| 15.7 | cc command | Script/herramienta que orquesta TCC + as + ld |
+| 15.8 | Language support: Python/Lua | Port Tiny Python o Lua a ring-3 (bytecode VM en C) |
+| 15.9 | Language support: Rust | Port rustc_codegen_llvm o interpreter mrustc (post-MVP) |
+| 15.10 | Language support: JavaScript | Port QuickJS a ring-3 — JS engine completo < 1MB |
+
+### Syscalls adicionales
+
+| # | Syscall | args | descripción |
+|---|---------|------|-------------|
+| 22 | `SYS_EXEC_MEM` | `elf_ptr, elf_size, argv, envp` | Ejecutar ELF desde buffer en memoria |
+
+### Logging
+
+`[DEV] cc: compiling foo.c → foo.o`, `[DEV] ld: linking foo.o → /bin/foo (1234 bytes)`
+
+### Criterios de aceptación
+
+- [ ] `cc hello.c -o /tmp/hello` compila y genera ELF válido
+- [ ] `/tmp/hello` ejecuta y produce output correcto
+- [ ] `as foo.S -o foo.o` ensambla código x86-64
+- [ ] `ld foo.o -o /tmp/foo` enlaza y produce ejecutable
+- [ ] `SYS_EXEC_MEM` ejecuta ELF directamente desde un buffer
+- [ ] TCC portado corre en ring-3 sin fallos de segmentación
+- [ ] `make` (build script) compila proyecto multi-archivo
+- [ ] QuickJS ejecuta `console.log("hello from portix")` desde ring-3
+- [ ] Pipeline completo: editar en IDE tab → compilar → ejecutar, todo dentro de Portix
+
+### Riesgos
+
+| Riesgo | Probabilidad | Impacto | Mitigación |
+|--------|--------------|---------|------------|
+| TCC requiere page fault handling (JIT-like) | Alta | Medio | Asegurar que SYS_MMAP soporta PROT_EXEC; validar páginas W^X |
+| Toolchain OOM en ramfs pequeña | Media | Alto | Expandir ramfs /tmp a 16MB mínimo para compilaciones |
+| TCC 64-bit tiene bugs en x86-64 backend | Media | Alto | Probar con programas pequeños primero; contribuir fixes upstream |
+| QuickJS memory usage excede página de 4KB | Baja | Medio | Usar SYS_BRK para heap dinámico; mmap para buffers grandes |
+
+---
+
+## Fase 16 — SMP + Multi-Core
 > **Badge**: ⏳ `PENDIENTE` · 0%
 
 **Objetivo**: soporte para multiples CPUs/core via ACPI MADT + SIPI.

@@ -229,6 +229,7 @@ pub fn set_current(pid: u64) -> Option<()> {
 }
 
 pub fn process_exit(pid: u64, code: i32) {
+    let slot = pid_to_slot(pid);
     let proc = match process_by_pid(pid) {
         Some(p) => p,
         None => {
@@ -250,6 +251,10 @@ pub fn process_exit(pid: u64, code: i32) {
     let cr3 = proc.cr3;
     let ks_base = proc.kernel_stack_base;
     let us_phys = proc.user_stack_phys;
+
+    if let Some(s) = slot {
+        crate::ipc::cleanup_process(s);
+    }
 
     if ks_base != 0 {
         let layout = Layout::from_size_align(KERNEL_STACK_SIZE, PAGE_SIZE).unwrap();
@@ -299,6 +304,18 @@ pub fn fd_close(proc: &mut Process, fd: usize) {
     if fd < MAX_FDS {
         proc.fds[fd] = None;
     }
+}
+
+pub fn pid_to_slot(pid: u64) -> Option<usize> {
+    unsafe {
+        for (i, p) in PROCESSES.iter().enumerate() {
+            let proc = p.as_ptr();
+            if (*proc).pid == pid && (*proc).state != ProcessState::Dead {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 pub fn init() {

@@ -28,6 +28,9 @@ pub const SYS_GETDIRENTS: u64 = 10;
 pub const SYS_EXECVE: u64 = 11;
 pub const SYS_DUP2:   u64 = 12;
 pub const SYS_UPTIME: u64 = 13;
+pub const SYS_SEND:   u64 = 14;
+pub const SYS_RECV:   u64 = 15;
+pub const SYS_REG_IRQ: u64 = 16;
 
 extern "C" {
     fn ring3_exit_trampoline();
@@ -59,6 +62,12 @@ extern "C" fn syscall_dispatch(
         SYS_EXECVE => sys_execve(a1 as usize, a2 as usize, a3 as usize, current_rsp),
         SYS_DUP2   => SyscallResult(sys_dup2(a1 as i32, a2 as i32) as u64, 0),
         SYS_UPTIME => SyscallResult(sys_uptime(), 0),
+        SYS_SEND   => SyscallResult(sys_send(a1, a2, a3, a4) as u64, 0),
+        SYS_RECV   => {
+            let (res, sw) = sys_recv(a1 as usize, a2 as usize, current_rsp);
+            SyscallResult(res as u64, sw)
+        }
+        SYS_REG_IRQ => SyscallResult(sys_reg_irq(a1, a2) as u64, 0),
         _          => SyscallResult(u64::MAX, 0),
     }
 }
@@ -862,4 +871,66 @@ fn sys_execve(path_ptr: usize, argv: usize, envp: usize, current_rsp: u64) -> Sy
 
     // Return (0, 0): no context switch, but modified IRET frame redirects to new program
     SyscallResult(0, 0)
+}
+
+// ── SYS_SEND ───────────────────────────────────────────────────────────────
+
+fn sys_send(dst_pid: u64, msg_type: u64, data_ptr: u64, data_len: u64) -> i64 {
+    let src_pid = match process::current_process() {
+        Some(p) => p.pid,
+        None => return -1,
+    };
+
+    let len = (data_len as usize).min(crate::ipc::IPC_DATA_SIZE);
+    let mut kbuf = [0u8; crate::ipc::IPC_DATA_SIZE];
+    if len > 0 {
+        if paging::copy_from_user(&mut kbuf[..len], data_ptr as usize, len).is_err() {
+            return -1;
+        }
+    }
+
+    crate::ipc::send(src_pid, dst_pid, msg_type, &kbuf[..len])
+}
+
+// ── SYS_RECV ───────────────────────────────────────────────────────────────
+
+fn sys_recv(buf: usize, len: usize, current_rsp: u64) -> (i64, u64) {
+    let pid = match process::current_process() {
+        Some(p) => p.pid,
+        None => return (-1, 0),
+    };
+
+    let mut kbuf = [0u8; 64];
+    let res = crate::ipc::recv(pid, &mut kbuf);
+    match res {
+        0 => {
+            let copy_len = len.min(64);
+            if paging::copy_to_user(buf, &kbuf[..copy_len]).is_err() {
+                return (-1, 0);
+            }
+            (copy_len as i64, 0)
+        }
+        1 => {
+            if let Some(proc) = process::current_process() {
+                proc.state = process::ProcessState::Blocked;
+                proc.sleep_until = 1;
+            }
+            let cs = saved_cs_from_rsp(current_rsp);
+            let new_rsp = process::schedule_tick(current_rsp, cs);
+            if new_rsp != 0 {
+                return (0, new_rsp);
+            }
+            unsafe { core::arch::asm!("sti", options(nostack, nomem)); }
+            unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+            unsafe { core::arch::asm!("cli", options(nostack, nomem)); }
+            (0, 0)
+        }
+        _ => (-1, 0),
+    }
+}
+
+// ── SYS_REG_IRQ ────────────────────────────────────────────────────────────
+
+fn sys_reg_irq(irq: u64, pid: u64) -> i64 {
+    crate::ipc::register_irq(irq as usize, pid)
 }

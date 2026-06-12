@@ -217,6 +217,14 @@ pub fn map_page(cr3: u64, vaddr: usize, paddr: usize, flags: u64) -> Result<(), 
         flush_tlb_page(vaddr);
     }
 
+    crate::drivers::serial::write_str("[PAGING] map_page vaddr=");
+    crate::drivers::serial::write_hex(vaddr);
+    crate::drivers::serial::write_str(" paddr=");
+    crate::drivers::serial::write_hex(paddr);
+    crate::drivers::serial::write_str(" flags=");
+    crate::drivers::serial::write_hex(flags as usize);
+    crate::drivers::serial::write_str("\n");
+
     Ok(())
 }
 
@@ -243,6 +251,13 @@ pub fn unmap_page(cr3: u64, vaddr: usize) -> Result<(), &'static str> {
     if cr3 == read_cr3() {
         flush_tlb_page(vaddr);
     }
+
+    crate::drivers::serial::write_str("[PAGING] unmap_page vaddr=");
+    crate::drivers::serial::write_hex(vaddr);
+    crate::drivers::serial::write_str(" cr3=");
+    crate::drivers::serial::write_hex(cr3 as usize);
+    crate::drivers::serial::write_str("\n");
+
     Ok(())
 }
 
@@ -399,21 +414,57 @@ pub fn is_user_range_safe(vaddr: usize, count: usize) -> bool {
 pub fn copy_from_user(dst: &mut [u8], src: usize, count: usize) -> Result<usize, ()> {
     if count == 0 { return Ok(0); }
     if dst.len() < count { return Err(()); }
-    if !is_user_range_safe(src, count) { return Err(()); }
-    unsafe {
-        core::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), count);
+    let saved_flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) saved_flags, options(nostack)); }
+    unsafe { core::arch::asm!("cli", options(nostack)); }
+    let ok = is_user_range_safe(src, count);
+    if ok {
+        unsafe {
+            core::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), count);
+        }
     }
-    Ok(count)
+    if saved_flags & 0x200 != 0 {
+        unsafe { core::arch::asm!("sti", options(nostack)); }
+    }
+    crate::drivers::serial::write_str("[PAGING] copy_from_user src=");
+    crate::drivers::serial::write_hex(src);
+    crate::drivers::serial::write_str(" count=");
+    crate::drivers::serial::write_usize(count);
+    if ok {
+        crate::drivers::serial::write_str(" OK\n");
+        Ok(count)
+    } else {
+        crate::drivers::serial::write_str(" FAIL\n");
+        Err(())
+    }
 }
 
 pub fn copy_to_user(dst: usize, src: &[u8]) -> Result<usize, ()> {
     let count = src.len();
     if count == 0 { return Ok(0); }
-    if !is_user_range_safe(dst, count) { return Err(()); }
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, count);
+    let saved_flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) saved_flags, options(nostack)); }
+    unsafe { core::arch::asm!("cli", options(nostack)); }
+    let ok = is_user_range_safe(dst, count);
+    if ok {
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, count);
+        }
     }
-    Ok(count)
+    if saved_flags & 0x200 != 0 {
+        unsafe { core::arch::asm!("sti", options(nostack)); }
+    }
+    crate::drivers::serial::write_str("[PAGING] copy_to_user dst=");
+    crate::drivers::serial::write_hex(dst);
+    crate::drivers::serial::write_str(" count=");
+    crate::drivers::serial::write_usize(count);
+    if ok {
+        crate::drivers::serial::write_str(" OK\n");
+        Ok(count)
+    } else {
+        crate::drivers::serial::write_str(" FAIL\n");
+        Err(())
+    }
 }
 
 static mut EXPECT_USER_FAULT: bool = false;

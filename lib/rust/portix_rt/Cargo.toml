@@ -1,0 +1,10 @@
+[package]
+name = "portix_rt"
+version = "0.1.0"
+edition = "2021"
+description = "PORTIX ring-3 Rust runtime (no_std)"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]

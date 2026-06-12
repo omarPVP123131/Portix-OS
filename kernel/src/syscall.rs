@@ -26,6 +26,8 @@ pub const SYS_BRK:    u64 = 8;
 pub const SYS_MMAP:   u64 = 9;
 pub const SYS_GETDIRENTS: u64 = 10;
 pub const SYS_EXECVE: u64 = 11;
+pub const SYS_DUP2:   u64 = 12;
+pub const SYS_UPTIME: u64 = 13;
 
 extern "C" {
     fn ring3_exit_trampoline();
@@ -55,6 +57,8 @@ extern "C" fn syscall_dispatch(
         SYS_MMAP   => SyscallResult(sys_mmap(a1 as usize, a2 as usize, a3 as u32, a4 as u32) as u64, 0),
         SYS_GETDIRENTS => SyscallResult(sys_getdents(a1 as usize, a2 as usize, a3 as usize) as u64, 0),
         SYS_EXECVE => sys_execve(a1 as usize, a2 as usize, a3 as usize, current_rsp),
+        SYS_DUP2   => SyscallResult(sys_dup2(a1 as i32, a2 as i32) as u64, 0),
+        SYS_UPTIME => SyscallResult(sys_uptime(), 0),
         _          => SyscallResult(u64::MAX, 0),
     }
 }
@@ -405,6 +409,44 @@ fn sys_close(fd: i32) -> i64 {
     } else {
         -1
     }
+}
+
+// ── SYS_DUP2 ─────────────────────────────────────────────────────────────
+
+fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
+    let proc = match process::current_process() {
+        Some(p) => p,
+        None => return -1,
+    };
+    if oldfd < 0 || oldfd as usize >= process::MAX_FDS { return -1; }
+    if newfd < 0 || newfd as usize >= process::MAX_FDS { return -1; }
+    if oldfd == newfd { return newfd as i64; }
+
+    let src = match process::fd_get(proc, oldfd as usize) {
+        Some(e) => e.clone(),
+        None => return -1,
+    };
+
+    process::fd_close(proc, newfd as usize);
+    process::fd_alloc(proc, src);
+
+    serial::write_str("[SYS] DUP2 oldfd=");
+    serial::write_usize(oldfd as usize);
+    serial::write_str(" newfd=");
+    serial::write_usize(newfd as usize);
+    serial::write_str("\n");
+
+    newfd as i64
+}
+
+// ── SYS_UPTIME ───────────────────────────────────────────────────────────
+
+fn sys_uptime() -> u64 {
+    let ticks = crate::time::pit::ticks();
+    serial::write_str("[SYS] UPTIME ticks=");
+    serial::write_usize(ticks as usize);
+    serial::write_str("\n");
+    ticks
 }
 
 // ── SYS_BRK ──────────────────────────────────────────────────────────────

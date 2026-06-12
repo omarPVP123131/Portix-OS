@@ -433,39 +433,52 @@ fn fat32_list_dir(vol: &mut fat32::Fat32Volume, dir_name: &str) {
     }
 }
 
-fn load_shell_from_fat32(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
+fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
     let bin_entry = match vol.find_entry(root, "bin") {
         Ok(e) if e.is_dir => e,
         _ => { serial::log("FS", "/bin not found"); return false; }
     };
-    let sh_entry = match vol.find_entry(bin_entry.cluster, "sh") {
-        Ok(e) if !e.is_dir => e,
-        _ => { serial::log("FS", "/bin/sh not found"); return false; }
-    };
-    let size = sh_entry.size as usize;
-    let mut buf = alloc::vec![0u8; size];
-    if vol.read_file(&sh_entry, &mut buf).is_err() {
-        serial::log("FS", "read /bin/sh failed");
-        return false;
-    }
-    serial::write_str("[FS] /bin/sh loaded (");
-    serial::write_usize(size);
-    serial::write_str(" bytes)\n");
-    if let Some(pid1) = elf::elf_load_and_create_process(&buf, "shell") {
-        // Process created — scheduler will manage execution
-        // Mark as Ready so it enters the scheduler pool
-        if let Some(proc) = process::process_by_pid(pid1) {
-            proc.state = process::ProcessState::Ready;
+
+    let candidates = ["init", "sh"];
+    let mut loaded = false;
+
+    for name in &candidates {
+        let entry = match vol.find_entry(bin_entry.cluster, name) {
+            Ok(e) if !e.is_dir => e,
+            _ => { continue; }
+        };
+        let size = entry.size as usize;
+        let mut buf = alloc::vec![0u8; size];
+        if vol.read_file(&entry, &mut buf).is_err() {
+            serial::log("FS", "read /bin/");
+            serial::write_str(name);
+            serial::write_str(" failed\n");
+            continue;
         }
-        // Restore TSS RSP0 to kernel stack (set_current changed it)
-        let stack_top = core::ptr::addr_of!(__stack_top) as u64;
-        process::set_tss_rsp0(stack_top);
-        serial::log("R3", "Shell process PID=1 ready (awaiting scheduler)");
-        true
-    } else {
-        serial::log("FS", "elf_load_and_create_process failed");
-        false
+        serial::write_str("[FS] /bin/");
+        serial::write_str(name);
+        serial::write_str(" loaded (");
+        serial::write_usize(size);
+        serial::write_str(" bytes)\n");
+        if let Some(pid1) = elf::elf_load_and_create_process(&buf, name) {
+            if let Some(proc) = process::process_by_pid(pid1) {
+                proc.state = process::ProcessState::Ready;
+            }
+            let stack_top = core::ptr::addr_of!(__stack_top) as u64;
+            process::set_tss_rsp0(stack_top);
+            serial::write_str("[R3] ");
+            serial::write_str(name);
+            serial::write_str(" process PID=1 ready (awaiting scheduler)\n");
+            loaded = true;
+            break;
+        } else {
+            serial::log("FS", "elf_load_and_create_process failed for /bin/");
+            serial::write_str(name);
+            serial::write_str("\n");
+        }
     }
+
+    loaded
 }
 
     // Referencias limpias para el loop principal
@@ -514,7 +527,7 @@ fn load_shell_from_fat32(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
         if let Some(drive) = registry::get_device(0) {
             if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
                 let root = vol.root_cluster();
-                let _ = load_shell_from_fat32(&mut vol, root);
+                let _ = load_ring3_init(&mut vol, root);
             }
         }
     } else {

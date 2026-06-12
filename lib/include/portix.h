@@ -38,7 +38,8 @@ typedef __builtin_va_list va_list;
 #define SYS_UPTIME   13
 #define SYS_SEND     14
 #define SYS_RECV     15
-#define SYS_REG_IRQ  16
+#define SYS_REG_IRQ     16
+#define SYS_BLOCK_READ  17
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -180,6 +181,14 @@ static inline int ipc_recv(void *buf, unsigned long long len) {
 
 static inline int ipc_register_irq(unsigned long long irq, unsigned long long pid) {
     return (int)syscall2(SYS_REG_IRQ, irq, pid);
+}
+
+// ── Block device (SYS_BLOCK_READ) ────────────────────────────────────────
+
+static inline long long block_read(int dev_id, unsigned long long lba,
+                                   unsigned long long count, void *buf) {
+    return (long long)syscall4(SYS_BLOCK_READ, (unsigned long long)dev_id,
+                               lba, count, (unsigned long long)buf);
 }
 
 int putchar(int c);

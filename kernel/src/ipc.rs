@@ -177,5 +177,15 @@ pub fn notify_irq(irq: usize) {
         None => return,
     };
     let data = [irq as u8; IPC_DATA_SIZE];
+    serial::write_str("[IPC] IRQ");
+    serial::write_usize(irq);
+    serial::write_str(" -> PID ");
+    serial::write_usize(dst_pid as usize);
+    serial::write_str("\n");
     let _ = send(0, dst_pid, 0xFF, &data);
+}
+
+#[no_mangle]
+pub extern "C" fn ipc_notify_irq_handler(irq: u64) {
+    notify_irq(irq as usize);
 }

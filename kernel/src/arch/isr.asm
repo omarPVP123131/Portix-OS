@@ -73,6 +73,7 @@ extern process_exit_trampoline
 extern crash_frame
 extern exception_cs
 extern __stack_top
+extern ipc_notify_irq_handler
 
 ; -- Globales para Rust / linker -----------------------------------------------
 global irq0_handler
@@ -405,6 +406,32 @@ irq_stub_slave:
     out     0xA0, al                ; EOI slave PIC
     out     0x20, al                ; EOI master PIC (cascade)
     pop     rax
+    iretq
+
+; =============================================================================
+; IRQ14 -- ATA Primary Channel
+; =============================================================================
+irq14_handler:
+    PUSH_REGS
+    mov     edi, 14
+    call    ipc_notify_irq_handler
+    mov     al, 0x20
+    out     0xA0, al                ; EOI slave
+    out     0x20, al                ; EOI master (cascade)
+    POP_REGS
+    iretq
+
+; =============================================================================
+; IRQ15 -- ATA Secondary Channel
+; =============================================================================
+irq15_handler:
+    PUSH_REGS
+    mov     edi, 15
+    call    ipc_notify_irq_handler
+    mov     al, 0x20
+    out     0xA0, al                ; EOI slave
+    out     0x20, al                ; EOI master (cascade)
+    POP_REGS
     iretq
 
 ; =============================================================================

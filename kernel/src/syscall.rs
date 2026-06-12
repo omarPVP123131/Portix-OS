@@ -30,7 +30,8 @@ pub const SYS_DUP2:   u64 = 12;
 pub const SYS_UPTIME: u64 = 13;
 pub const SYS_SEND:   u64 = 14;
 pub const SYS_RECV:   u64 = 15;
-pub const SYS_REG_IRQ: u64 = 16;
+pub const SYS_REG_IRQ:  u64 = 16;
+pub const SYS_BLOCK_READ: u64 = 17;
 
 extern "C" {
     fn ring3_exit_trampoline();
@@ -68,6 +69,7 @@ extern "C" fn syscall_dispatch(
             SyscallResult(res as u64, sw)
         }
         SYS_REG_IRQ => SyscallResult(sys_reg_irq(a1, a2) as u64, 0),
+        SYS_BLOCK_READ => SyscallResult(sys_block_read(a1 as i32, a2, a3, a4) as u64, 0),
         _          => SyscallResult(u64::MAX, 0),
     }
 }
@@ -933,4 +935,46 @@ fn sys_recv(buf: usize, len: usize, current_rsp: u64) -> (i64, u64) {
 
 fn sys_reg_irq(irq: u64, pid: u64) -> i64 {
     crate::ipc::register_irq(irq as usize, pid)
+}
+
+// ── SYS_BLOCK_READ ──────────────────────────────────────────────────────────
+
+fn sys_block_read(dev_id: i32, lba: u64, count: u64, buf: u64) -> i64 {
+    if buf == 0 || count == 0 { return -1; }
+    let total_bytes = (count as usize) * 512;
+    if total_bytes > 65536 { return -1; }
+
+    let mut kbuf = alloc::vec![0u8; total_bytes];
+    let drive = match crate::drivers::storage::registry::get_device(dev_id as usize) {
+        Some(d) => d,
+        None => {
+            serial::write_str("[BLK] dev not found\n");
+            return -1;
+        }
+    };
+
+    let n = (count as usize).min(drive.total_sectors() as usize);
+    let actual_bytes = n * 512;
+    kbuf.resize(actual_bytes, 0);
+
+    if drive.read_sectors(lba, n, &mut kbuf).is_err() {
+        serial::write_str("[BLK] read error\n");
+        return -1;
+    }
+
+    if paging::copy_to_user(buf as usize, &kbuf[..actual_bytes]).is_err() {
+        return -1;
+    }
+
+    serial::write_str("[BLK] ata");
+    serial::write_usize(dev_id as usize);
+    serial::write_str(": read LBA=");
+    serial::write_usize(lba as usize);
+    serial::write_str(" count=");
+    serial::write_usize(n);
+    serial::write_str(" -> ");
+    serial::write_usize(actual_bytes);
+    serial::write_str(" bytes\n");
+
+    actual_bytes as i64
 }

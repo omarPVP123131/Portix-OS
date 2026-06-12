@@ -166,6 +166,9 @@ fn sys_read(fd: i32, buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
                 Err(_) => (-1, 0),
             }
         }
+        FdType::RamFile(ref info) => {
+            sys_read_ramfile(fd, buf, count, info)
+        }
     }
 }
 
@@ -341,6 +344,11 @@ fn sys_open(path_ptr: usize, _flags: u32) -> i64 {
     let actual_len = path_buf.iter().position(|&b| b == 0).unwrap_or(path_len);
     let path = core::str::from_utf8(&path_buf[..actual_len]).unwrap_or("");
 
+    // VFS routing: check if path belongs to a mounted ramfs (/tmp)
+    if crate::drivers::storage::vfs::is_ramfs_path(path) {
+        return sys_open_ramfs(path, &path_buf, actual_len);
+    }
+
     serial::write_str("[SYS] OPEN path='");
     serial::write_str(path);
     serial::write_str("'\n");
@@ -405,6 +413,115 @@ fn sys_open(path_ptr: usize, _flags: u32) -> i64 {
         }
     }
     -1
+}
+
+// ── RamFS helpers (Phase 10) ──────────────────────────────────────────
+
+fn sys_open_ramfs(path: &str, path_buf: &[u8; 256], actual_len: usize) -> i64 {
+    use crate::drivers::storage::vfs;
+    let exists = vfs::with_ramfs(|ram| {
+        if ram.is_dir(path) { return false; }
+        ram.file_size(path).is_some()
+    });
+    if !exists {
+        vfs::with_ramfs(|ram| ram.create(path));
+    }
+    let size = vfs::with_ramfs(|ram| ram.file_size(path).unwrap_or(0)) as u32;
+    let mut rpath = [0u8; 256];
+    rpath[..actual_len].copy_from_slice(&path_buf[..actual_len]);
+    let info = process::RamFileInfo {
+        path: rpath,
+        path_len: actual_len,
+        size,
+        pos: 0,
+    };
+    let fd_entry = process::FdEntry { fd_type: process::FdType::RamFile(info) };
+    if let Some(proc) = process::current_process() {
+        match process::fd_alloc(proc, fd_entry) {
+            Some(fd) => {
+                serial::write_str("[RAMFS] OPEN -> fd=");
+                serial::write_usize(fd);
+                serial::write_str(" path='");
+                serial::write_str(path);
+                serial::write_str("'\n");
+                return fd as i64;
+            }
+            None => { serial::write_str("[RAMFS] OPEN: no free fd\n"); return -1; }
+        }
+    }
+    -1
+}
+
+fn sys_read_ramfile(fd: i32, buf: usize, count: usize, info: &process::RamFileInfo) -> (i64, u64) {
+    if info.pos >= info.size { return (0, 0); }
+    let to_read = (count as u32).min(info.size - info.pos) as usize;
+    if to_read == 0 { return (0, 0); }
+
+    let path_str = core::str::from_utf8(&info.path[..info.path_len]).unwrap_or("/tmp/f");
+    let mut kbuf = alloc::vec![0u8; to_read];
+
+    let n = crate::drivers::storage::vfs::with_ramfs(|ram| {
+        match ram.read(path_str, &mut kbuf, info.pos as u64) {
+            Ok(n) => n,
+            Err(_) => 0,
+        }
+    });
+
+    if n == 0 { return (0, 0); }
+    if paging::copy_to_user(buf, &kbuf[..n]).is_err() { return (-1, 0); }
+
+    if let Some(proc) = process::current_process() {
+        if let Some(fd_entry) = process::fd_get_mut(proc, fd as usize) {
+            if let process::FdType::RamFile(ref mut fi) = fd_entry.fd_type {
+                fi.pos += n as u32;
+            }
+        }
+    }
+
+    serial::write_str("[RAMFS] READ fd=");
+    serial::write_usize(fd as usize);
+    serial::write_str(" bytes=");
+    serial::write_usize(n);
+    serial::write_str("\n");
+
+    (n as i64, 0)
+}
+
+fn sys_getdents_ramfs(path: &str, buf: usize, count: usize) -> i64 {
+    let mut entries: alloc::vec::Vec<([u8; 64], usize, bool)> = alloc::vec::Vec::new();
+    crate::drivers::storage::vfs::with_ramfs(|ram| {
+        let _ = ram.list_dir(path, &mut |name, is_dir| {
+            let mut nb = [0u8; 64];
+            let nl = name.len().min(63);
+            nb[..nl].copy_from_slice(&name.as_bytes()[..nl]);
+            entries.push((nb, nl, is_dir));
+        });
+    });
+
+    let mut total = 0usize;
+    for (name_bytes, name_len, is_dir) in &entries {
+        let d_reclen = 19 + name_len + 1;
+        if total + d_reclen > count { break; }
+        let mut hdr = [0u8; 512];
+        let d_type: u8 = if *is_dir { 2u8 } else { 1u8 };
+        hdr[0..8].copy_from_slice(&0u64.to_le_bytes());
+        hdr[8..16].copy_from_slice(&(total as u64).to_le_bytes());
+        hdr[16..18].copy_from_slice(&(d_reclen as u16).to_le_bytes());
+        hdr[18] = d_type;
+        hdr[19..19 + name_len].copy_from_slice(&name_bytes[..*name_len]);
+        if paging::copy_to_user(buf + total, &hdr[..d_reclen.min(512)]).is_err() { break; }
+        total += d_reclen;
+    }
+
+    serial::write_str("[RAMFS] GETDIRENTS path='");
+    serial::write_str(path);
+    serial::write_str("' entries=");
+    serial::write_usize(entries.len());
+    serial::write_str(" bytes=");
+    serial::write_usize(total);
+    serial::write_str("\n");
+
+    total as i64
 }
 
 // ── SYS_CLOSE ────────────────────────────────────────────────────────────
@@ -572,6 +689,10 @@ fn sys_getdents(path_ptr: usize, buf: usize, count: usize) -> i64 {
     };
     let actual_len = path_buf.iter().position(|&b| b == 0).unwrap_or(path_len);
     let path = core::str::from_utf8(&path_buf[..actual_len]).unwrap_or("");
+
+    if crate::drivers::storage::vfs::is_ramfs_path(path) {
+        return sys_getdents_ramfs(path, buf, count);
+    }
 
     let drive = match registry::get_device(0) {
         Some(d) => d,

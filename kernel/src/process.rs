@@ -24,11 +24,20 @@ pub struct OpenFileInfo {
 }
 
 #[derive(Copy, Clone)]
+pub struct RamFileInfo {
+    pub path: [u8; 256],
+    pub path_len: usize,
+    pub size: u32,
+    pub pos: u32,
+}
+
+#[derive(Copy, Clone)]
 pub enum FdType {
     Stdin,
     Stdout,
     Stderr,
     File(OpenFileInfo),
+    RamFile(RamFileInfo),
 }
 
 #[derive(Copy, Clone)]

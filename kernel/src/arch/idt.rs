@@ -111,6 +111,8 @@ extern "C" {
     fn irq0_handler();
     fn irq1_handler();
     fn irq12_handler();
+    fn irq14_handler();
+    fn irq15_handler();
     fn irq_stub_master();
     fn irq_stub_slave();
     fn syscall_entry();
@@ -191,6 +193,9 @@ pub unsafe fn init_idt() {
     for i in 0x28..=0x2F_usize { IDT[i].set_handler(irq_s); }
     // IRQ12 (mouse) gets its own handler — overrides the generic slave stub
     IDT[0x2C].set_handler(core::mem::transmute::<unsafe extern "C" fn(), u64>(irq12_handler));
+    // IRQ14 (ATA primary) + IRQ15 (ATA secondary) for Phase 9 userspace drivers
+    IDT[0x2E].set_handler(core::mem::transmute::<unsafe extern "C" fn(), u64>(irq14_handler));
+    IDT[0x2F].set_handler(core::mem::transmute::<unsafe extern "C" fn(), u64>(irq15_handler));
 
     // 9. IDT[0x80] — int 0x80 syscall gate (DPL=3, trap gate so IF stays on)
     IDT[0x80].set(h!(int80_handler), 0, 0xEF);
@@ -217,7 +222,7 @@ pub unsafe fn init_idt() {
     core::arch::asm!("out 0xA1, al", in("al") 0x01u8, options(nostack, nomem));
     core::arch::asm!("out 0x80, al", in("al") 0x00u8, options(nostack, nomem));
     core::arch::asm!("out 0x21, al", in("al") 0xF8u8, options(nostack, nomem));  // Unmask IRQ0 + IRQ1 + IRQ2 (cascade)
-    core::arch::asm!("out 0xA1, al", in("al") 0xEFu8, options(nostack, nomem)); // Unmask IRQ12 (slave bit 4)
+    core::arch::asm!("out 0xA1, al", in("al") 0x2Fu8, options(nostack, nomem)); // Unmask IRQ12 (bit4), IRQ14 (bit6), IRQ15 (bit7)
 
     // 13. MSR setup for syscall/sysret
     // STAR[47:32] = KERNEL_CS(0x08) → SYSCALL loads CS=0x08, SS=0x08+8=0x10 ✓

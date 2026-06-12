@@ -1,24 +1,17 @@
-// drivers/storage/vfs.rs — PORTIX Virtual Filesystem v1.1
+// drivers/storage/vfs.rs — PORTIX Virtual Filesystem v2.0
 //
-// CAPA: drivers/storage  (no ui/)
+// CAPA: drivers/storage
 //
-// El VFS gestiona paths del sistema y su resolución a clusters FAT32.
-// Es responsabilidad del subsistema de almacenamiento, igual que fat32.rs.
-// La UI lo consume; nunca debe contener lógica de paths.
-//
-// Árbol del sistema:
-//   /             Raíz FAT32
-//   ├── bin/      Ejecutables del kernel
-//   ├── etc/      Configuración
-//   ├── home/user Archivos del usuario
-//   ├── tmp/      Temporal
-//   ├── usr/      Herramientas
-//   └── var/      Logs y datos
+// VFS abstraction: mount points, path routing, filesystem dispatch.
+// Supports FAT32 (default) and ramfs (/tmp).
 
 #![allow(dead_code)]
 
+use crate::drivers::serial;
+use crate::drivers::storage::ramfs::RamFs;
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Árbol VFS predefinido
+// Árbol VFS predefinido (for UI explorer)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -180,4 +173,98 @@ impl VfsMount {
 
     pub fn root_cluster(&self) -> u32 { self.resolve("/").unwrap_or(2) }
     pub fn count(&self) -> usize { self.count }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VFS Mount System — Phase 10: mount points + FS routing
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, PartialEq)]
+pub enum FsType {
+    Fat32,
+    RamFs,
+}
+
+pub struct MountEntry {
+    pub path:    [u8; 64],
+    pub path_len: usize,
+    pub fs_type: FsType,
+}
+
+const MAX_MOUNTS: usize = 8;
+
+pub static mut MOUNT_TABLE: [MountEntry; MAX_MOUNTS] = [
+    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+];
+
+pub static mut MOUNT_COUNT: usize = 0;
+
+pub static mut RAMFS: Option<RamFs> = None;
+
+pub fn mount(path: &str, fs_type: FsType) -> bool {
+    unsafe {
+        if MOUNT_COUNT >= MAX_MOUNTS { return false; }
+        let n = path.len().min(63);
+        let bytes = path.as_bytes();
+        MOUNT_TABLE[MOUNT_COUNT].path[..n].copy_from_slice(&bytes[..n]);
+        MOUNT_TABLE[MOUNT_COUNT].path[n] = 0;
+        MOUNT_TABLE[MOUNT_COUNT].path_len = n;
+        MOUNT_TABLE[MOUNT_COUNT].fs_type = fs_type;
+        MOUNT_COUNT += 1;
+
+        if fs_type == FsType::RamFs {
+            RAMFS = Some(RamFs::new());
+        }
+
+        let type_name = if fs_type == FsType::RamFs { "ramfs" } else { "fat32" };
+        serial::write_str("[VFS] mount ");
+        serial::write_str(type_name);
+        serial::write_str(" -> ");
+        serial::write_str(path);
+        serial::write_str("\n");
+    }
+    true
+}
+
+pub fn resolve_fs(path: &str) -> (FsType, usize) {
+    unsafe {
+        let path_bytes = path.as_bytes();
+        let path_len = path_bytes.len();
+        for i in (0..MOUNT_COUNT).rev() {
+            let mp_len = MOUNT_TABLE[i].path_len;
+            if mp_len == 0 { continue; }
+            if path_len >= mp_len && &MOUNT_TABLE[i].path[..mp_len] == &path_bytes[..mp_len] {
+                let mt = MOUNT_TABLE[i].fs_type;
+                if mt == FsType::RamFs && path_len > mp_len && path_bytes[mp_len] == b'/' {
+                    return (mt, mp_len);
+                }
+                if mt == FsType::RamFs && (path_len == mp_len) {
+                    return (mt, mp_len);
+                }
+            }
+        }
+    }
+    (FsType::Fat32, 0)
+}
+
+pub fn is_ramfs_path(path: &str) -> bool {
+    resolve_fs(path).0 == FsType::RamFs
+}
+
+pub fn with_ramfs<F, R>(f: F) -> R
+where F: FnOnce(&mut RamFs) -> R
+{
+    unsafe {
+        match &mut RAMFS {
+            Some(ref mut ram) => f(ram),
+            None => panic!("RAMFS not mounted"),
+        }
+    }
 }

@@ -4,6 +4,7 @@ pub mod fat32;
 pub mod file_handle;
 pub mod iso9660;
 pub mod mkfs;
+pub mod ramfs;
 pub mod registry;
 pub mod traits;
 pub mod vfs;

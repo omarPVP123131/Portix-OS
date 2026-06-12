@@ -318,6 +318,8 @@ unsafe {
             .write(core::mem::MaybeUninit::new(ExplorerState::new(2)));
     }
 
+    crate::drivers::storage::vfs::mount("/tmp", crate::drivers::storage::vfs::FsType::RamFs);
+
     let mut mount_ok = false;
     let mut root_cluster = 2u32;
 

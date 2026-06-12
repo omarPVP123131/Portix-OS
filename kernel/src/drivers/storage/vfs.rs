@@ -258,6 +258,38 @@ pub fn is_ramfs_path(path: &str) -> bool {
     resolve_fs(path).0 == FsType::RamFs
 }
 
+pub fn is_devfs_path(path: &str) -> bool {
+    path == "/dev" || path.starts_with("/dev/")
+}
+
+/// Known device names under /dev/
+pub const DEVFS_ENTRIES: &[&str] = &["kbd", "fb0", "sda0", "null"];
+
+/// Check if a devfs path is valid and return the device name (static)
+pub fn resolve_devfs(path: &str) -> Option<&'static str> {
+    if !is_devfs_path(path) {
+        return None;
+    }
+    if path == "/dev" || path == "/dev/" {
+        return None; // directory listing
+    }
+    let name = if path.starts_with("/dev/") {
+        &path[5..]
+    } else {
+        path
+    };
+    if name.is_empty() {
+        return None;
+    }
+    // Check against known devices; return static reference
+    for entry in DEVFS_ENTRIES {
+        if *entry == name {
+            return Some(entry);
+        }
+    }
+    None
+}
+
 pub fn with_ramfs<F, R>(f: F) -> R
 where F: FnOnce(&mut RamFs) -> R
 {

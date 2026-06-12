@@ -189,3 +189,12 @@ pub fn notify_irq(irq: usize) {
 pub extern "C" fn ipc_notify_irq_handler(irq: u64) {
     notify_irq(irq as usize);
 }
+
+#[no_mangle]
+pub extern "C" fn is_irq_routed(irq: u64) -> u8 {
+    if (irq as usize) < MAX_IRQ {
+        if unsafe { IRQ_ROUTES[irq as usize].is_some() } { 1 } else { 0 }
+    } else {
+        0
+    }
+}

@@ -31,6 +31,20 @@ pub struct RamFileInfo {
     pub pos: u32,
 }
 
+#[derive(Copy, Clone, PartialEq)]
+pub enum DeviceType {
+    Kbd,
+    Fb,
+    Sda,
+    Null,
+}
+
+#[derive(Copy, Clone)]
+pub struct DeviceInfo {
+    pub dev_type: DeviceType,
+    pub pos: u32,
+}
+
 #[derive(Copy, Clone)]
 pub enum FdType {
     Stdin,
@@ -38,6 +52,7 @@ pub enum FdType {
     Stderr,
     File(OpenFileInfo),
     RamFile(RamFileInfo),
+    Device(DeviceInfo),
 }
 
 #[derive(Copy, Clone)]
@@ -77,6 +92,8 @@ pub struct Process {
     pub fds: [Option<FdEntry>; MAX_FDS],
     pub program_break: usize,
     pub program_break_end: usize,
+    pub registered_ports: [u16; 16],
+    pub registered_port_count: usize,
 }
 
 impl Process {
@@ -203,6 +220,8 @@ pub fn process_create_into(cr3: u64, entry: u64, name: &str) -> Option<u64> {
     proc.fds[2] = Some(FdEntry { fd_type: FdType::Stderr });
     proc.program_break = PROGRAM_BREAK_BASE;
     proc.program_break_end = PROGRAM_BREAK_BASE;
+    proc.registered_ports = [0u16; 16];
+    proc.registered_port_count = 0;
 
     setup_kernel_stack(proc);
 

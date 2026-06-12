@@ -10,6 +10,7 @@
 /build/
 /bin/
 /dist/
+/docker/
 
 # Binarios
 *.bin

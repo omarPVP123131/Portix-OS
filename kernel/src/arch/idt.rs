@@ -143,13 +143,79 @@ pub unsafe fn init_idt() {
         | ((base  & 0xFF00_0000) << 32);
     GDT.tss_high = (base >> 32) & 0xFFFF_FFFF;
 
-    // 3. Load GDT (7 entradas × 8 = 56 bytes, limit = 55)
+    // Ensure GDT entries 1-4 are initialized (static initializers may be lost during boot)
+    GDT.code64    = 0x00AF_9A00_0000_FFFF;
+    GDT.data64    = 0x00CF_9200_0000_FFFF;
+    GDT.user_data = 0x00CF_F200_0000_FFFF;
+    GDT.user_code = 0x00AF_FA00_0000_FFFF;
+
+    // 3. Dump GDT content to serial for debugging
+    {
+        let gdt_addr = core::ptr::addr_of!(GDT) as u64;
+        let gdt_ptr = gdt_addr as *const u64;
+        let hex = b"0123456789ABCDEF";
+        let wb = |b: u8| { crate::drivers::serial::write_byte(b); };
+        let wh = |b: u8| { wb(hex[(b>>4) as usize]); wb(hex[(b&0xF) as usize]); };
+        let wq = |v: u64| { wh(((v>>56)&0xFF) as u8); wh(((v>>48)&0xFF) as u8); wh(((v>>40)&0xFF) as u8); wh(((v>>32)&0xFF) as u8); wh(((v>>24)&0xFF) as u8); wh(((v>>16)&0xFF) as u8); wh(((v>>8)&0xFF) as u8); wh((v&0xFF) as u8); };
+        let waddr = |v: u64| { wh(((v>>60)&0xF) as u8); wh(((v>>56)&0xF) as u8); wh(((v>>52)&0xF) as u8); wh(((v>>48)&0xF) as u8); wh(((v>>44)&0xF) as u8); wh(((v>>40)&0xF) as u8); wh(((v>>36)&0xF) as u8); wh(((v>>32)&0xF) as u8); wh(((v>>28)&0xF) as u8); wh(((v>>24)&0xF) as u8); wh(((v>>20)&0xF) as u8); wh(((v>>16)&0xF) as u8); wh(((v>>12)&0xF) as u8); wh(((v>>8)&0xF) as u8); wh(((v>>4)&0xF) as u8); wh((v&0xF) as u8); };
+        // First dump first qword of kernel at 0x200000
+        let base: u64 = core::ptr::read_volatile(0x200000 as *const u64);
+        wb(b'K'); wb(b'E'); wb(b'R'); wb(b'@'); wb(b'2'); wb(b'0'); wb(b'0'); wb(b'0'); wb(b'0'); wb(b'0'); wb(b'=');
+        wq(base);
+        wb(b'\n');
+        // Dump STAGING buffer at 0x10000 to verify INT13h source
+        let stage: u64 = core::ptr::read_volatile(0x10000 as *const u64);
+        wb(b'S'); wb(b'T'); wb(b'G'); wb(b'@'); wb(b'1'); wb(b'0'); wb(b'0'); wb(b'0'); wb(b'0'); wb(b'=');
+        wq(stage);
+        wb(b'\n');
+        // Dump STAGING buffer at GDT offset (compute dynamically)
+        let stage_gdt_vma = 0x10000u64 + (gdt_addr - 0x200000u64);
+        let stage_gdt_val: u64 = core::ptr::read_volatile(stage_gdt_vma as *const u64);
+        wb(b'S'); wb(b'T'); wb(b'G'); wb(b'@'); wb(b'G'); wb(b'D'); wb(b'T'); wb(b'=');
+        wq(stage_gdt_val);
+        wb(b'\n');
+        // Then dump GDT
+        wb(b'G'); wb(b'D'); wb(b'T'); wb(b'@');
+        waddr(gdt_addr);
+        wb(b'=');
+        for i in 0..7 {
+            let val = core::ptr::read_volatile(gdt_ptr.add(i));
+            wb(b' '); wq(val);
+        }
+        wb(b'\n');
+
+        // Dump GDT_PTR before loading
+        let ptr = core::ptr::addr_of!(GDT_PTR);
+        let limit: u16 = core::ptr::read_volatile(ptr as *const u16);
+        let base: u64 = core::ptr::read_volatile((ptr as *const u8).add(2) as *const u64);
+        wb(b'P'); wb(b'T'); wb(b'R'); wb(b'=');
+        wh(((limit>>8)&0xFF) as u8); wh((limit&0xFF) as u8);
+        wb(b':');
+        wq(base);
+        wb(b'\n');
+    }
+
+    // 4. Load GDT (7 entradas × 8 = 56 bytes, limit = 55)
     GDT_PTR.limit = (core::mem::size_of::<Gdt>() - 1) as u16;
     GDT_PTR.base  = core::ptr::addr_of!(GDT) as u64;
+    {
+        let hex = b"0123456789ABCDEF";
+        let wb = |b: u8| { crate::drivers::serial::write_byte(b); };
+        let wh = |b: u8| { wb(hex[(b>>4) as usize]); wb(hex[(b&0xF) as usize]); };
+        let wq = |v: u64| { wh(((v>>56)&0xFF) as u8); wh(((v>>48)&0xFF) as u8); wh(((v>>40)&0xFF) as u8); wh(((v>>32)&0xFF) as u8); wh(((v>>24)&0xFF) as u8); wh(((v>>16)&0xFF) as u8); wh(((v>>8)&0xFF) as u8); wh((v&0xFF) as u8); };
+        let ptr = core::ptr::addr_of!(GDT_PTR);
+        let limit: u16 = core::ptr::read_volatile(ptr as *const u16);
+        let base: u64 = core::ptr::read_volatile((ptr as *const u8).add(2) as *const u64);
+        wb(b'N'); wb(b'E'); wb(b'W'); wb(b'P'); wb(b'T'); wb(b'R'); wb(b'=');
+        wh(((limit>>8)&0xFF) as u8); wh((limit&0xFF) as u8);
+        wb(b':');
+        wq(base);
+        wb(b'\n');
+    }
     asm!("lgdt [{p}]", p = in(reg) core::ptr::addr_of!(GDT_PTR),
          options(nostack, preserves_flags, readonly));
 
-    // 4. Reload CS (far return: 0x08 → CS)
+    // 5. Reload CS (far return: 0x08 → CS)
     reload_segments();
 
     // 5. Data selectors
@@ -234,9 +300,9 @@ pub unsafe fn init_idt() {
     let hex = b"0123456789ABCDEF";
     let hi = (star >> 32) as u32;
     let lo = star as u32;
-    for sh in (0..8).rev() { crate::drivers::serial::write_byte(hex[((hi >> (sh*4)) & 0xF) as usize]); }
+    for sh in (0..8).rev() { let b = ((hi >> (sh*4)) & 0xF) as usize; crate::drivers::serial::write_byte(hex[b]); }
     crate::drivers::serial::write_byte(b':');
-    for sl in (0..8).rev() { crate::drivers::serial::write_byte(hex[((lo >> (sl*4)) & 0xF) as usize]); }
+    for sl in (0..8).rev() { let b = ((lo >> (sl*4)) & 0xF) as usize; crate::drivers::serial::write_byte(hex[b]); }
     crate::drivers::serial::write_byte(b'\n');
     let lstar = core::mem::transmute::<unsafe extern "C" fn(), u64>(syscall_entry);
     let fmask = 0x43200u64; // clear IF(9) + IOPL(12-13) + AC(18) during syscall

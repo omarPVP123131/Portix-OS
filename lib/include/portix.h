@@ -40,6 +40,10 @@ typedef __builtin_va_list va_list;
 #define SYS_RECV     15
 #define SYS_REG_IRQ     16
 #define SYS_BLOCK_READ  17
+#define SYS_IOPORT      18
+#define SYS_IOREAD      19
+#define SYS_IOWRITE     20
+#define SYS_MMAP_DEVICE 21
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -189,6 +193,40 @@ static inline long long block_read(int dev_id, unsigned long long lba,
                                    unsigned long long count, void *buf) {
     return (long long)syscall4(SYS_BLOCK_READ, (unsigned long long)dev_id,
                                lba, count, (unsigned long long)buf);
+}
+
+// ── Device I/O (SYS_IOPORT, SYS_IOREAD, SYS_IOWRITE) ──────────────────────
+
+static inline int ioport_register(unsigned short port, unsigned char enable) {
+    return (int)syscall2(SYS_IOPORT, (unsigned long long)port, enable);
+}
+
+static inline unsigned char ioport_in(unsigned short port) {
+    return (unsigned char)syscall1(SYS_IOREAD, (unsigned long long)port);
+}
+
+static inline int ioport_out(unsigned short port, unsigned char value) {
+    return (int)syscall2(SYS_IOWRITE, (unsigned long long)port, value);
+}
+
+// ── MMIO device mapping (SYS_MMAP_DEVICE) ─────────────────────────────────
+
+static inline void *mmap_device(unsigned long long phys, unsigned long long size) {
+    return (void*)syscall2(SYS_MMAP_DEVICE, phys, size);
+}
+
+// ── DevFS open helper ─────────────────────────────────────────────────────
+
+static inline int open_dev(const char *devname) {
+    char path[] = "/dev/";
+    int plen = 5; // strlen("/dev/")
+    int i = 0;
+    while (devname[i] && plen + i + 1 < 64) {
+        path[plen + i] = devname[i];
+        i++;
+    }
+    path[plen + i] = 0;
+    return open(path, 0);
 }
 
 int putchar(int c);

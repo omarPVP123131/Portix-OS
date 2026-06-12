@@ -74,11 +74,14 @@ extern crash_frame
 extern exception_cs
 extern __stack_top
 extern ipc_notify_irq_handler
+extern is_irq_routed
 
 ; -- Globales para Rust / linker -----------------------------------------------
 global irq0_handler
 global irq1_handler
 global irq12_handler
+global irq14_handler
+global irq15_handler
 global irq_stub_master
 global irq_stub_slave
 global reload_segments
@@ -96,6 +99,8 @@ global isr_16, isr_17, isr_18, isr_19
 section .data
 global ring3_ret_rsp
 ring3_ret_rsp: dq 0
+
+section .text
 
 ; =============================================================================
 ; CAPTURE_FRAME  arg: byte-offset al RIP dentro del IRET frame del CPU
@@ -344,6 +349,10 @@ irq0_handler:
 ; =============================================================================
 irq1_handler:
     PUSH_REGS
+    mov     edi, 1
+    call    is_irq_routed
+    test    al, al
+    jnz     .irq1_ipc               ; driver registered: forward via IPC
     xor     eax, eax
     in      al, 0x64
     test    al, 0x01
@@ -353,6 +362,10 @@ irq1_handler:
     in      al, 0x60
     mov     edi, eax
     call    irq1_handler_rust
+    jmp     .eoi1
+.irq1_ipc:
+    mov     edi, 1
+    call    ipc_notify_irq_handler
 
 .eoi1:
     mov     al, 0x20
@@ -376,6 +389,10 @@ irq1_handler:
 ; =============================================================================
 irq12_handler:
     PUSH_REGS
+    mov     edi, 12
+    call    is_irq_routed
+    test    al, al
+    jnz     .irq12_ipc              ; driver registered: forward via IPC
     xor     eax, eax
     in      al, 0x64                ; leer status register
     test    al, 0x20                ; AUXB = bit 5
@@ -383,6 +400,10 @@ irq12_handler:
     in      al, 0x60                ; leer byte de raton
     mov     edi, eax
     call    irq12_handler_rust
+    jmp     .eoi12
+.irq12_ipc:
+    mov     edi, 12
+    call    ipc_notify_irq_handler
 .eoi12:
     mov     al, 0x20
     out     0xA0, al                ; EOI slave  PIC

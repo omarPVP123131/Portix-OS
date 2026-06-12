@@ -32,6 +32,10 @@ pub const SYS_SEND:   u64 = 14;
 pub const SYS_RECV:   u64 = 15;
 pub const SYS_REG_IRQ:  u64 = 16;
 pub const SYS_BLOCK_READ: u64 = 17;
+pub const SYS_IOPORT: u64 = 18;
+pub const SYS_IOREAD: u64 = 19;
+pub const SYS_IOWRITE: u64 = 20;
+pub const SYS_MMAP_DEVICE: u64 = 21;
 
 extern "C" {
     fn ring3_exit_trampoline();
@@ -70,6 +74,10 @@ extern "C" fn syscall_dispatch(
         }
         SYS_REG_IRQ => SyscallResult(sys_reg_irq(a1, a2) as u64, 0),
         SYS_BLOCK_READ => SyscallResult(sys_block_read(a1 as i32, a2, a3, a4) as u64, 0),
+        SYS_IOPORT     => SyscallResult(sys_ioport(a1 as u16, a2 as u8) as u64, 0),
+        SYS_IOREAD     => SyscallResult(sys_ioread(a1 as u16) as u64, 0),
+        SYS_IOWRITE    => SyscallResult(sys_iowrite(a1 as u16, a2 as u8) as u64, 0),
+        SYS_MMAP_DEVICE => SyscallResult(sys_mmap_device(a1 as usize, a2 as usize) as u64, 0),
         _          => SyscallResult(u64::MAX, 0),
     }
 }
@@ -85,6 +93,14 @@ fn sys_exit(_status: usize) -> ! {
 // ── SYS_WRITE ────────────────────────────────────────────────────────────
 
 fn sys_write(fd: i32, buf: usize, count: usize) -> i64 {
+    // Check if this is a device FD first
+    if let Some(proc) = process::current_process() {
+        if let Some(entry) = process::fd_get(proc, fd as usize) {
+            if let process::FdType::Device(ref info) = entry.fd_type {
+                return sys_write_device(fd, buf, count, info);
+            }
+        }
+    }
     if fd != 1 && fd != 2 {
         return -1;
     }
@@ -96,6 +112,72 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> i64 {
             copied as i64
         }
         Err(()) => -1,
+    }
+}
+
+// Simple ring buffer for /dev/kbd — keyboard driver writes, shell reads
+const KBD_BUF_SIZE: usize = 256;
+static mut KBD_BUF: [u8; KBD_BUF_SIZE] = [0u8; KBD_BUF_SIZE];
+static mut KBD_BUF_HEAD: usize = 0;
+static mut KBD_BUF_TAIL: usize = 0;
+
+fn kbd_buf_write(data: &[u8]) {
+    unsafe {
+        for &b in data {
+            let next = (KBD_BUF_HEAD + 1) % KBD_BUF_SIZE;
+            if next != KBD_BUF_TAIL {
+                KBD_BUF[KBD_BUF_HEAD] = b;
+                KBD_BUF_HEAD = next;
+            }
+        }
+    }
+}
+
+fn kbd_buf_read() -> Option<u8> {
+    unsafe {
+        if KBD_BUF_TAIL != KBD_BUF_HEAD {
+            let b = KBD_BUF[KBD_BUF_TAIL];
+            KBD_BUF_TAIL = (KBD_BUF_TAIL + 1) % KBD_BUF_SIZE;
+            Some(b)
+        } else {
+            None
+        }
+    }
+}
+
+fn sys_write_device(_fd: i32, buf: usize, count: usize, info: &process::DeviceInfo) -> i64 {
+    match info.dev_type {
+        process::DeviceType::Null => count as i64,
+        process::DeviceType::Kbd => {
+            // Keyboard driver writing scancodes
+            let mut kbuf = [0u8; 64];
+            let to_copy = count.min(64);
+            if paging::copy_from_user(&mut kbuf[..to_copy], buf, to_copy).is_err() {
+                return -1;
+            }
+            kbd_buf_write(&kbuf[..to_copy]);
+            serial::write_str("[DEV] /dev/kbd write ");
+            serial::write_usize(to_copy);
+            serial::write_str(" bytes\n");
+            to_copy as i64
+        }
+        process::DeviceType::Fb => {
+            // Write to framebuffer via VGA text mode (0xB8000) or direct mapping
+            let mut kbuf = alloc::vec![0u8; count.min(4096)];
+            let to_copy = count.min(4096);
+            if paging::copy_from_user(&mut kbuf[..to_copy], buf, to_copy).is_err() {
+                return -1;
+            }
+            // For now, just log it
+            serial::write_str("[DEV] /dev/fb0 write ");
+            serial::write_usize(to_copy);
+            serial::write_str(" bytes\n");
+            to_copy as i64
+        }
+        process::DeviceType::Sda => {
+            serial::write_str("[DEV] write not supported on /dev/sda0\n");
+            -1
+        }
     }
 }
 
@@ -168,6 +250,9 @@ fn sys_read(fd: i32, buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
         }
         FdType::RamFile(ref info) => {
             sys_read_ramfile(fd, buf, count, info)
+        }
+        FdType::Device(ref info) => {
+            sys_read_device(fd, buf, count, info)
         }
     }
 }
@@ -343,6 +428,11 @@ fn sys_open(path_ptr: usize, _flags: u32) -> i64 {
     };
     let actual_len = path_buf.iter().position(|&b| b == 0).unwrap_or(path_len);
     let path = core::str::from_utf8(&path_buf[..actual_len]).unwrap_or("");
+
+    // VFS routing: check if path belongs to devfs (/dev)
+    if crate::drivers::storage::vfs::is_devfs_path(path) {
+        return sys_open_devfs(path, &path_buf, actual_len);
+    }
 
     // VFS routing: check if path belongs to a mounted ramfs (/tmp)
     if crate::drivers::storage::vfs::is_ramfs_path(path) {
@@ -524,6 +614,82 @@ fn sys_getdents_ramfs(path: &str, buf: usize, count: usize) -> i64 {
     total as i64
 }
 
+fn sys_getdents_devfs(path: &str, buf: usize, count: usize) -> i64 {
+    let _ = path;
+    let devs = crate::drivers::storage::vfs::DEVFS_ENTRIES;
+    let mut total = 0usize;
+    for name in devs {
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len();
+        let d_reclen = 19 + name_len + 1;
+        if total + d_reclen > count { break; }
+        let mut hdr = [0u8; 512];
+        let d_type: u8 = 1u8; // DT_FILE
+        hdr[0..8].copy_from_slice(&0u64.to_le_bytes());
+        hdr[8..16].copy_from_slice(&(total as u64).to_le_bytes());
+        hdr[16..18].copy_from_slice(&(d_reclen as u16).to_le_bytes());
+        hdr[18] = d_type;
+        hdr[19..19 + name_len].copy_from_slice(name_bytes);
+        if paging::copy_to_user(buf + total, &hdr[..d_reclen.min(512)]).is_err() { break; }
+        total += d_reclen;
+    }
+
+    serial::write_str("[DEVFS] GETDIRENTS entries=");
+    serial::write_usize(devs.len());
+    serial::write_str(" bytes=");
+    serial::write_usize(total);
+    serial::write_str("\n");
+
+    total as i64
+}
+
+// ── DevFS helpers (Phase 12) ──────────────────────────────────────────
+
+fn sys_open_devfs(path: &str, _path_buf: &[u8; 256], _actual_len: usize) -> i64 {
+    let name = match crate::drivers::storage::vfs::resolve_devfs(path) {
+        Some(n) => n,
+        None => {
+            serial::write_str("[DEVFS] no such device: '");
+            serial::write_str(path);
+            serial::write_str("'\n");
+            return -1;
+        }
+    };
+
+    let dev_type = match name {
+        "kbd" => process::DeviceType::Kbd,
+        "fb0" => process::DeviceType::Fb,
+        "sda0" => process::DeviceType::Sda,
+        "null" => process::DeviceType::Null,
+        _ => {
+            serial::write_str("[DEVFS] unknown device: ");
+            serial::write_str(name);
+            serial::write_str("\n");
+            return -1;
+        }
+    };
+
+    let info = process::DeviceInfo { dev_type, pos: 0 };
+    let fd_entry = process::FdEntry { fd_type: process::FdType::Device(info) };
+    if let Some(proc) = process::current_process() {
+        match process::fd_alloc(proc, fd_entry) {
+            Some(fd) => {
+                serial::write_str("[DEVFS] OPEN '");
+                serial::write_str(path);
+                serial::write_str("' -> fd=");
+                serial::write_usize(fd);
+                serial::write_str("\n");
+                return fd as i64;
+            }
+            None => {
+                serial::write_str("[DEVFS] OPEN: no free fd\n");
+                return -1;
+            }
+        }
+    }
+    -1
+}
+
 // ── SYS_CLOSE ────────────────────────────────────────────────────────────
 
 fn sys_close(fd: i32) -> i64 {
@@ -692,6 +858,10 @@ fn sys_getdents(path_ptr: usize, buf: usize, count: usize) -> i64 {
 
     if crate::drivers::storage::vfs::is_ramfs_path(path) {
         return sys_getdents_ramfs(path, buf, count);
+    }
+
+    if crate::drivers::storage::vfs::is_devfs_path(path) {
+        return sys_getdents_devfs(path, buf, count);
     }
 
     let drive = match registry::get_device(0) {
@@ -1098,4 +1268,227 @@ fn sys_block_read(dev_id: i32, lba: u64, count: u64, buf: u64) -> i64 {
     serial::write_str(" bytes\n");
 
     actual_bytes as i64
+}
+
+// ── SYS_IOPORT ───────────────────────────────────────────────────────────
+
+/// Ports that DRIVERS are allowed to register (whitelist).
+/// Sensitive kernel ports (PIC 0x20/0xA0, PIT 0x40, CMOS 0x70) are DENIED.
+const DENY_PORTS: &[u16] = &[0x20, 0x21, 0xA0, 0xA1, 0x40, 0x43, 0x70, 0x71];
+
+fn sys_ioport(port: u16, enable: u8) -> i64 {
+    if DENY_PORTS.contains(&port) {
+        serial::write_str("[IOPORT] DENIED port 0x");
+        serial::write_hex(port as usize);
+        serial::write_str("\n");
+        return -1; // -EPERM
+    }
+    let proc = match process::current_process() {
+        Some(p) => p,
+        None => return -1,
+    };
+    if enable != 0 {
+        if proc.registered_port_count >= 16 {
+            return -1;
+        }
+        for i in 0..proc.registered_port_count {
+            if proc.registered_ports[i] == port {
+                return 0; // already registered
+            }
+        }
+        proc.registered_ports[proc.registered_port_count] = port;
+        proc.registered_port_count += 1;
+    } else {
+        for i in 0..proc.registered_port_count {
+            if proc.registered_ports[i] == port {
+                proc.registered_ports[i] = proc.registered_ports[proc.registered_port_count - 1];
+                proc.registered_port_count -= 1;
+                break;
+            }
+        }
+    }
+    serial::write_str("[IOPORT] PID ");
+    serial::write_usize(proc.pid as usize);
+    serial::write_str(" port 0x");
+    serial::write_hex(port as usize);
+    serial::write_str(" enable=");
+    serial::write_usize(enable as usize);
+    serial::write_str("\n");
+    0
+}
+
+fn port_is_registered(port: u16) -> bool {
+    match process::current_process() {
+        Some(proc) => {
+            for i in 0..proc.registered_port_count {
+                if proc.registered_ports[i] == port {
+                    return true;
+                }
+            }
+            false
+        }
+        None => false,
+    }
+}
+
+// ── SYS_IOREAD ───────────────────────────────────────────────────────────
+
+fn sys_ioread(port: u16) -> i64 {
+    if !port_is_registered(port) {
+        serial::write_str("[IOREAD] DENIED port 0x");
+        serial::write_hex(port as usize);
+        serial::write_str("\n");
+        return -1;
+    }
+    let val: u8;
+    unsafe {
+        core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nostack, nomem));
+    }
+    serial::write_str("[IOREAD] port 0x");
+    serial::write_hex(port as usize);
+    serial::write_str(" -> 0x");
+    serial::write_hex(val as usize);
+    serial::write_str("\n");
+    val as i64
+}
+
+// ── SYS_IOWRITE ──────────────────────────────────────────────────────────
+
+fn sys_iowrite(port: u16, value: u8) -> i64 {
+    if !port_is_registered(port) {
+        serial::write_str("[IOWRITE] DENIED port 0x");
+        serial::write_hex(port as usize);
+        serial::write_str("\n");
+        return -1;
+    }
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nostack, nomem));
+    }
+    serial::write_str("[IOWRITE] port 0x");
+    serial::write_hex(port as usize);
+    serial::write_str(" <- 0x");
+    serial::write_hex(value as usize);
+    serial::write_str("\n");
+    0
+}
+
+// ── SYS_MMAP_DEVICE ─────────────────────────────────────────────────────
+
+fn sys_mmap_device(phys: usize, size: usize) -> i64 {
+    if phys == 0 || size == 0 || size > 0x100_0000 {
+        serial::write_str("[MMAP_DEV] invalid params\n");
+        return -1;
+    }
+    // Only allow device memory regions:
+    //   - VGA: 0xA0000-0xBFFFF
+    //   - Framebuffer/PCI MMIO: >= 0xE000_0000
+    //   - Also allow framebuffer at 0xFD00_0000 (QEMU stdvga)
+    let allow = (phys >= 0xA0000 && phys < 0xC0000)
+             || (phys >= 0xE000_0000)
+             || (phys >= 0xFC00_0000 && phys < 0xFE00_0000);
+    if !allow {
+        serial::write_str("[MMAP_DEV] DENIED phys 0x");
+        serial::write_hex(phys);
+        serial::write_str(" (not device region)\n");
+        return -1;
+    }
+
+    let cr3 = match process::current_process() {
+        Some(p) => p.cr3,
+        None => return -1,
+    };
+
+    let pages = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+    let vaddr = 0x4000_0000_0000usize; // fixed device mapping region
+
+    for i in 0..pages {
+        let vaddr_i = vaddr + i * paging::PAGE_SIZE;
+        let paddr_i = (phys + i * paging::PAGE_SIZE) as u64;
+        // Map with no-execute to prevent code execution from device memory
+        if paging::map_page(cr3, vaddr_i, paddr_i as usize,
+            paging::PRESENT | paging::WRITABLE | paging::USER | paging::ACCESSED | paging::NO_EXECUTE).is_err() {
+            serial::write_str("[MMAP_DEV] map failed\n");
+            return -1;
+        }
+    }
+
+    serial::write_str("[MMAP_DEV] phys 0x");
+    serial::write_hex(phys);
+    serial::write_str(" -> vaddr 0x");
+    serial::write_hex(vaddr);
+    serial::write_str(" pages=");
+    serial::write_usize(pages);
+    serial::write_str("\n");
+
+    vaddr as i64
+}
+
+// ── Device file read (for /dev/kbd, /dev/sda0) ─────────────────────────
+
+fn sys_read_device(fd: i32, buf: usize, count: usize, info: &process::DeviceInfo) -> (i64, u64) {
+    match info.dev_type {
+        process::DeviceType::Null => (0, 0),
+        process::DeviceType::Kbd => {
+            // Read scancodes from the /dev/kbd ring buffer
+            let mut copied = 0usize;
+            let mut temp = [0u8; 64];
+            while copied < count.min(64) {
+                match kbd_buf_read() {
+                    Some(b) => {
+                        temp[copied] = b;
+                        copied += 1;
+                    }
+                    None => break,
+                }
+            }
+            if copied > 0 {
+                if paging::copy_to_user(buf, &temp[..copied]).is_err() {
+                    return (-1, 0);
+                }
+            }
+            serial::write_str("[DEV] /dev/kbd read ");
+            serial::write_usize(copied);
+            serial::write_str(" scancodes\n");
+            (copied as i64, 0)
+        }
+        process::DeviceType::Sda => {
+            // Block device read via the existing block device
+            let pos = info.pos;
+            let lba = pos / 512;
+            let count_sectors = ((count + 511) / 512).min(128);
+            let total_bytes = count_sectors * 512;
+            let mut kbuf = alloc::vec![0u8; total_bytes];
+            // Use the internal block device directly
+            if let Some(drive) = crate::drivers::storage::registry::get_device(0) {
+                if drive.read_sectors(lba as u64, count_sectors, &mut kbuf).is_err() {
+                    return (-1, 0);
+                }
+                let offset = (pos % 512) as usize;
+                let to_copy = (total_bytes - offset).min(count);
+                if paging::copy_to_user(buf, &kbuf[offset..offset + to_copy]).is_err() {
+                    return (-1, 0);
+                }
+                // Update position
+                if let Some(proc) = process::current_process() {
+                    if let Some(fde) = process::fd_get_mut(proc, fd as usize) {
+                        if let process::FdType::Device(ref mut di) = fde.fd_type {
+                            di.pos += to_copy as u32;
+                        }
+                    }
+                }
+                serial::write_str("[DEV] /dev/sda0 read LBA=");
+                serial::write_usize(lba as usize);
+                serial::write_str(" bytes=");
+                serial::write_usize(to_copy);
+                serial::write_str("\n");
+                (to_copy as i64, 0)
+            } else {
+                (-1, 0)
+            }
+        }
+        process::DeviceType::Fb => {
+            // Reading from framebuffer: return 0 bytes
+            (0, 0)
+        }
+    }
 }

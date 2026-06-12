@@ -36,6 +36,9 @@ typedef __builtin_va_list va_list;
 #define SYS_EXECVE   11
 #define SYS_DUP2     12
 #define SYS_UPTIME   13
+#define SYS_SEND     14
+#define SYS_RECV     15
+#define SYS_REG_IRQ  16
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -153,6 +156,30 @@ static inline int dup2(int oldfd, int newfd) {
 
 static inline unsigned long long uptime(void) {
     return syscall0(SYS_UPTIME);
+}
+
+// ── IPC (SYS_SEND, SYS_RECV, SYS_REG_IRQ) ─────────────────────────────
+
+#define IPC_MSG_SIZE 64
+
+struct __attribute__((packed)) ipc_msg {
+    unsigned long long src_pid;
+    unsigned long long dst_pid;
+    unsigned long long msg_type;
+    unsigned char      data[40];
+};
+
+static inline int ipc_send(unsigned long long dst_pid, unsigned long long msg_type,
+                           const void *data, unsigned long long data_len) {
+    return (int)syscall4(SYS_SEND, dst_pid, msg_type, (unsigned long long)data, data_len);
+}
+
+static inline int ipc_recv(void *buf, unsigned long long len) {
+    return (int)syscall2(SYS_RECV, (unsigned long long)buf, len);
+}
+
+static inline int ipc_register_irq(unsigned long long irq, unsigned long long pid) {
+    return (int)syscall2(SYS_REG_IRQ, irq, pid);
 }
 
 int putchar(int c);

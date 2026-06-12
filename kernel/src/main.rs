@@ -22,6 +22,7 @@ pub mod console;
 pub mod drivers;
 pub mod graphics;
 pub mod elf;
+pub mod ipc;
 pub mod mem;
 pub mod process;
 pub mod syscall;
@@ -229,6 +230,7 @@ unsafe {
     unsafe { ALLOCATOR.init(); }
     mem::paging::init();
     process::init();
+    crate::ipc::init();
     init_page_pool();
     time::pit::init();
     drivers::serial::log("PIT", "temporizador 100 Hz");

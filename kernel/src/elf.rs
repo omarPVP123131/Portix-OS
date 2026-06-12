@@ -61,6 +61,8 @@ fn validate_elf(data: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+const KERNEL_BASE: usize = 0xFFFF_8000_0000_0000;
+
 pub(crate) fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) -> Result<(), &'static str> {
     let hdr: &Elf64Header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
     let phdr_slice = unsafe {
@@ -75,6 +77,14 @@ pub(crate) fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) ->
         let memsz = phdr.p_memsz as usize;
         let filesz = phdr.p_filesz as usize;
         let offset = phdr.p_offset as usize;
+
+        if vaddr + memsz > KERNEL_BASE {
+            return Err("segment extends into kernel space");
+        }
+
+        if vaddr + memsz < vaddr {
+            return Err("segment size overflow");
+        }
 
         let vaddr_page = paging::page_align_down(vaddr);
         let end_page = paging::page_align_up(vaddr + memsz);

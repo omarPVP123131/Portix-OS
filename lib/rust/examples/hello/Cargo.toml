@@ -1,0 +1,11 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+portix_rt = { path = "../../portix_rt" }
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"

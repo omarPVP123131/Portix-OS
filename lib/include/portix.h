@@ -34,6 +34,8 @@ typedef __builtin_va_list va_list;
 #define SYS_MMAP     9
 #define SYS_GETDIRENTS 10
 #define SYS_EXECVE   11
+#define SYS_DUP2     12
+#define SYS_UPTIME   13
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -143,6 +145,14 @@ static inline int getdents(const char *path, void *buf, unsigned long count) {
 
 static inline int execve(const char *path, char *const argv[], char *const envp[]) {
     return (int)syscall3(SYS_EXECVE, (u64)path, (u64)argv, (u64)envp);
+}
+
+static inline int dup2(int oldfd, int newfd) {
+    return (int)syscall2(SYS_DUP2, (u64)oldfd, (u64)newfd);
+}
+
+static inline unsigned long long uptime(void) {
+    return syscall0(SYS_UPTIME);
 }
 
 int putchar(int c);

@@ -27,9 +27,15 @@ impl DeviceRegistry {
         id
     }
 
+    fn get(&self, id: usize) -> Option<&dyn BlockDevice> {
+        self.devices.get(id)?.as_ref().map(|b| &**b as &dyn BlockDevice)
+    }
+
     fn get_mut(&mut self, id: usize) -> Option<&mut dyn BlockDevice> {
         self.devices.get_mut(id)?.as_mut().map(|b| &mut **b as &mut dyn BlockDevice)
     }
+
+    fn len(&self) -> usize { self.count }
 }
 
 static mut REGISTRY: DeviceRegistry = DeviceRegistry::new();

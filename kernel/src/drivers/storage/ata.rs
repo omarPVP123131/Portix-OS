@@ -66,6 +66,8 @@
 #![allow(dead_code)]
 
 use core::fmt;
+use crate::arch::Spinlock;
+use crate::drivers::serial;
 use crate::drivers::storage::traits::BlockDevice;
 
 // ── Puertos ATA ────────────────────────────────────────────────────────────────
@@ -646,10 +648,10 @@ const DUMMY_INFO: DriveInfo = DriveInfo {
     serial:        [b' '; 20],
 };
 
-static mut CACHED_DRIVE: CachedDrive = CachedDrive {
+static CACHED_DRIVE: Spinlock<CachedDrive> = Spinlock::new(CachedDrive {
     info:  DUMMY_INFO,
     valid: false,
-};
+});
 
 /// Guarda el DriveInfo del Primary0 en el caché global.
 ///
@@ -665,12 +667,9 @@ static mut CACHED_DRIVE: CachedDrive = CachedDrive {
 /// }
 /// ```
 pub fn store_primary_drive_info(info: DriveInfo) {
-    // SAFETY: kernel bare-metal single-threaded.
-    // Esta función se llama exactamente una vez en boot antes del loop.
-    unsafe {
-        CACHED_DRIVE.info  = info;
-        CACHED_DRIVE.valid = true;
-    }
+    let mut guard = CACHED_DRIVE.lock();
+    guard.info  = info;
+    guard.valid = true;
 }
 
 /// Devuelve el DriveInfo cacheado del Primary0.
@@ -691,13 +690,11 @@ pub fn store_primary_drive_info(info: DriveInfo) {
 /// let vol = Fat32Volume::mount(drive)?;
 /// ```
 pub fn get_cached_drive_info() -> Option<DriveInfo> {
-    // SAFETY: ver store_primary_drive_info.
-    unsafe {
-        if CACHED_DRIVE.valid {
-            Some(CACHED_DRIVE.info)
-        } else {
-            None
-        }
+    let guard = CACHED_DRIVE.lock();
+    if guard.valid {
+        Some(guard.info)
+    } else {
+        None
     }
 }
 
@@ -747,7 +744,6 @@ fn parse_identify(words: [u16; 256], id: DriveId) -> DriveInfo {
 // ── Helpers de log ────────────────────────────────────────────────────────────
 
 pub fn log_drives(bus: &AtaBus) {
-    use crate::drivers::serial;
 
     if bus.count() == 0 {
         serial::log("ATA", "ningun drive detectado");

@@ -162,8 +162,9 @@ fn mount_vol(t: &mut Terminal) -> Option<(&'static mut Fat32Volume<'static>, &'s
             let _ = resolve_and_register(&mut vol, root, &mut mnt);
             unsafe {
                 VOL_CACHE = Some((vol, mnt));
-                let pair = VOL_CACHE.as_mut().unwrap();
-                return Some((&mut pair.0, &mut pair.1));
+                if let Some(pair) = VOL_CACHE.as_mut() {
+                    return Some((&mut pair.0, &mut pair.1));
+                }
             }
         }
     }

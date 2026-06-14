@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use crate::arch::Spinlock;
 use crate::drivers::serial;
 use crate::drivers::storage::ramfs::RamFs;
 
@@ -193,34 +194,42 @@ pub struct MountEntry {
 
 const MAX_MOUNTS: usize = 8;
 
-pub static mut MOUNT_TABLE: [MountEntry; MAX_MOUNTS] = [
-    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
-    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
-    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
-    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
-    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
-    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
-    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
-    MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
-];
+struct VfsState {
+    table: [MountEntry; MAX_MOUNTS],
+    count: usize,
+    ramfs: Option<RamFs>,
+}
 
-pub static mut MOUNT_COUNT: usize = 0;
+impl VfsState {
+    const fn new() -> Self {
+        VfsState {
+            table: [
+                MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+                MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+                MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+                MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+                MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+                MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+                MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+                MountEntry { path: [0; 64], path_len: 0, fs_type: FsType::Fat32 },
+            ],
+            count: 0,
+            ramfs: None,
+        }
+    }
 
-pub static mut RAMFS: Option<RamFs> = None;
-
-pub fn mount(path: &str, fs_type: FsType) -> bool {
-    unsafe {
-        if MOUNT_COUNT >= MAX_MOUNTS { return false; }
+    fn mount(&mut self, path: &str, fs_type: FsType) -> bool {
+        if self.count >= MAX_MOUNTS { return false; }
         let n = path.len().min(63);
         let bytes = path.as_bytes();
-        MOUNT_TABLE[MOUNT_COUNT].path[..n].copy_from_slice(&bytes[..n]);
-        MOUNT_TABLE[MOUNT_COUNT].path[n] = 0;
-        MOUNT_TABLE[MOUNT_COUNT].path_len = n;
-        MOUNT_TABLE[MOUNT_COUNT].fs_type = fs_type;
-        MOUNT_COUNT += 1;
+        self.table[self.count].path[..n].copy_from_slice(&bytes[..n]);
+        self.table[self.count].path[n] = 0;
+        self.table[self.count].path_len = n;
+        self.table[self.count].fs_type = fs_type;
+        self.count += 1;
 
         if fs_type == FsType::RamFs {
-            RAMFS = Some(RamFs::new());
+            self.ramfs = Some(RamFs::new());
         }
 
         let type_name = if fs_type == FsType::RamFs { "ramfs" } else { "fat32" };
@@ -229,29 +238,45 @@ pub fn mount(path: &str, fs_type: FsType) -> bool {
         serial::write_str(" -> ");
         serial::write_str(path);
         serial::write_str("\n");
+        true
     }
-    true
+
+    fn resolve_fs(&self, path: &str) -> (FsType, usize) {
+        let path_bytes = path.as_bytes();
+        let path_len = path_bytes.len();
+        for i in (0..self.count).rev() {
+            let mp_len = self.table[i].path_len;
+            if mp_len == 0 { continue; }
+            if path_len >= mp_len && &self.table[i].path[..mp_len] == &path_bytes[..mp_len] {
+                return (self.table[i].fs_type, i);
+            }
+        }
+        (FsType::Fat32, usize::MAX)
+    }
+
+    fn resolve_path(&self, path: &str) -> Option<([u8; 256], usize)> {
+        let (_fs_type, idx) = self.resolve_fs(path);
+        if idx == usize::MAX { return None; }
+        let mp_len = self.table[idx].path_len;
+        let path_bytes = path.as_bytes();
+        let rel_start = if mp_len > 0 && self.table[idx].path[mp_len - 1] == b'/' { mp_len - 1 } else { mp_len };
+        let rel_path = if path_bytes.len() > rel_start { &path_bytes[rel_start..] } else { b"/" };
+        let mut full = [0u8; 256];
+        let plen = rel_path.len().min(255);
+        full[..plen].copy_from_slice(&rel_path[..plen]);
+        if plen < 256 { full[plen] = 0; }
+        Some((full, plen))
+    }
+}
+
+static VFS: Spinlock<VfsState> = Spinlock::new(VfsState::new());
+
+pub fn mount(path: &str, fs_type: FsType) -> bool {
+    VFS.lock().mount(path, fs_type)
 }
 
 pub fn resolve_fs(path: &str) -> (FsType, usize) {
-    unsafe {
-        let path_bytes = path.as_bytes();
-        let path_len = path_bytes.len();
-        for i in (0..MOUNT_COUNT).rev() {
-            let mp_len = MOUNT_TABLE[i].path_len;
-            if mp_len == 0 { continue; }
-            if path_len >= mp_len && &MOUNT_TABLE[i].path[..mp_len] == &path_bytes[..mp_len] {
-                let mt = MOUNT_TABLE[i].fs_type;
-                if mt == FsType::RamFs && path_len > mp_len && path_bytes[mp_len] == b'/' {
-                    return (mt, mp_len);
-                }
-                if mt == FsType::RamFs && (path_len == mp_len) {
-                    return (mt, mp_len);
-                }
-            }
-        }
-    }
-    (FsType::Fat32, 0)
+    VFS.lock().resolve_fs(path)
 }
 
 pub fn is_ramfs_path(path: &str) -> bool {
@@ -281,7 +306,6 @@ pub fn resolve_devfs(path: &str) -> Option<&'static str> {
     if name.is_empty() {
         return None;
     }
-    // Check against known devices; return static reference
     for entry in DEVFS_ENTRIES {
         if *entry == name {
             return Some(entry);
@@ -293,15 +317,12 @@ pub fn resolve_devfs(path: &str) -> Option<&'static str> {
 pub fn with_ramfs<F, R>(f: F) -> R
 where F: FnOnce(&mut RamFs) -> R
 {
-    unsafe {
-        match &mut RAMFS {
-            Some(ref mut ram) => f(ram),
-            None => {
-                // RAMFS must be mounted before use
-                // This is a critical initialization requirement
-                serial::log("VFS", "CRITICAL: RAMFS not mounted - kernel panic\n");
-                panic!("RAMFS not mounted - this is a fatal initialization error");
-            }
+    let mut guard = VFS.lock();
+    match guard.ramfs.as_mut() {
+        Some(ram) => f(ram),
+        None => {
+            serial::log("VFS", "CRITICAL: RAMFS not mounted - kernel panic\n");
+            panic!("RAMFS not mounted - this is a fatal initialization error");
         }
     }
 }

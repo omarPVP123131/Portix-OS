@@ -211,8 +211,18 @@ start2:
     ; Debug: 'O' = E820 done
     mov  al, 'O'
     call print_char
-    ; Debug: 'P' = about to load kernel
+    ; Debug: 'P' = about to set up VESA
     mov  al, 'P'
+    call print_char
+    call setup_vesa
+    ; Debug: 'Q' = VESA done (may display 'D' if failed)
+    mov  al, 'Q'
+    call print_char
+
+    call pci_fallback_fb
+
+    ; Debug: 'R' = about to load kernel
+    mov  al, 'R'
     call print_char
     call load_kernel
     jnc  .kernel_loaded
@@ -237,12 +247,6 @@ start2:
     mov  si, msg_stack_smash
     call print
 .canary_ok:
-
-    call setup_vesa
-    ; Debug: 'Q' = VESA done (may display 'D' if failed)
-    mov  al, 'Q'
-    call print_char
-    call pci_fallback_fb
     call setup_paging
     mov  al, 'G'
     call print_char

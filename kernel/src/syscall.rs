@@ -14,6 +14,19 @@ fn alloc_page() -> Option<usize> {
     if ptr.is_null() { None } else { Some(ptr as usize) }
 }
 
+fn verify_user_buffer(buf: usize, len: usize) -> bool {
+    let end = buf.checked_add(len);
+    match end {
+        Some(e) => e < crate::process::USER_STACK_TOP,
+        None => false,
+    }
+}
+
+fn verify_user_string(ptr: usize, max_len: usize) -> bool {
+    // Verificamos el acceso al primer carácter y al último posible
+    verify_user_buffer(ptr, 1) && verify_user_buffer(ptr, max_len)
+}
+
 pub const SYS_EXIT:   u64 = 0;
 pub const SYS_WRITE:  u64 = 1;
 pub const SYS_GETPID: u64 = 2;
@@ -93,6 +106,10 @@ fn sys_exit(_status: usize) -> ! {
 // ── SYS_WRITE ────────────────────────────────────────────────────────────
 
 fn sys_write(fd: i32, buf: usize, count: usize) -> i64 {
+    if !verify_user_buffer(buf, count) {
+        serial::write_str("[SYSCALL] sys_write: invalid user buffer\n");
+        return -1;
+    }
     // Check if this is a device FD first
     if let Some(proc) = process::current_process() {
         if let Some(entry) = process::fd_get(proc, fd as usize) {
@@ -226,7 +243,10 @@ fn sys_sleep_switch(ticks: u64, current_rsp: u64) -> u64 {
 // ── SYS_READ ─────────────────────────────────────────────────────────────
 
 fn sys_read(fd: i32, buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
-    if fd < 0 || fd as usize >= process::MAX_FDS { return (-1, 0); }
+    if !verify_user_buffer(buf, count) {
+        serial::write_str("[SYSCALL] sys_read: invalid user buffer\n");
+        return (-1, 0);
+    }
     let proc = match process::current_process() {
         Some(p) => p,
         None => return (-1, 0),
@@ -421,6 +441,10 @@ fn sys_read_stdin(buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
 // ── SYS_OPEN ─────────────────────────────────────────────────────────────
 
 fn sys_open(path_ptr: usize, _flags: u32) -> i64 {
+    if !verify_user_string(path_ptr, 256) {
+        serial::write_str("[SYSCALL] sys_open: invalid user string\n");
+        return -1;
+    }
     let mut path_buf = [0u8; 256];
     let path_len = match paging::copy_from_user(&mut path_buf, path_ptr, 256) {
         Ok(n)   => n,
@@ -848,6 +872,10 @@ fn resolve_dir_cluster(path: &str, vol: &mut Fat32Volume, root: u32) -> Result<u
 }
 
 fn sys_getdents(path_ptr: usize, buf: usize, count: usize) -> i64 {
+    if !verify_user_string(path_ptr, 256) || !verify_user_buffer(buf, count) {
+        serial::write_str("[SYSCALL] sys_getdents: invalid user pointers\n");
+        return -1;
+    }
     let mut path_buf = [0u8; 256];
     let path_len = match paging::copy_from_user(&mut path_buf, path_ptr, 256) {
         Ok(n) => n,
@@ -1200,6 +1228,10 @@ fn sys_send(dst_pid: u64, msg_type: u64, data_ptr: u64, data_len: u64) -> i64 {
 // ── SYS_RECV ───────────────────────────────────────────────────────────────
 
 fn sys_recv(buf: usize, len: usize, current_rsp: u64) -> (i64, u64) {
+    if !verify_user_buffer(buf, len) {
+        serial::write_str("[SYSCALL] sys_recv: invalid user buffer\n");
+        return (-1, 0);
+    }
     let pid = match process::current_process() {
         Some(p) => p.pid,
         None => return (-1, 0),

@@ -602,14 +602,10 @@ fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
                 needs_draw = true;
 
                 // Editor de texto del terminal (modo especial)
-               if term.editor.is_some() {
-    let should_exit = {
-        let ed = term.editor.as_mut().unwrap();
-        let ctrl = kbd.ctrl();
-        ed.handle_key(key, ctrl);  // ← ctrl ahora se pasa
-        ed.exit
-    };
-                    if should_exit {
+                if let Some(ed) = term.editor.as_mut() {
+                    let ctrl = kbd.ctrl();
+                    ed.handle_key(key, ctrl);
+                    if ed.exit {
                         term.editor = None;
                         term.write_line("  Editor cerrado.", LineColor::Info);
                         tab = Tab::Terminal;

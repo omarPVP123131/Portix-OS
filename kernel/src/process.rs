@@ -1,17 +1,76 @@
 use core::alloc::Layout;
+use crate::arch::Spinlock;
 use crate::drivers::serial;
 use crate::mem::paging::{self, PAGE_SIZE};
 
-pub const MAX_PROCS: usize = 64;
+pub const MAX_PROCS: usize = 16;
 pub const KERNEL_STACK_SIZE: usize = 16384;
 pub const USER_STACK_SIZE: usize = 65536;
 pub const USER_STACK_TOP: usize = 0x7F00_0000_0000;
 pub const TIME_SLICE: u64 = 10; // 10 ticks = 100ms at 100Hz
 
 // ── FD table ─────────────────────────────────────────────────────────────
-pub const MAX_FDS: usize = 32;
+pub const MAX_FDS: usize = 8;
 pub const PROGRAM_BREAK_BASE: usize = 0x2000_0000_0000;
 pub const PAGE_SIZE_USIZE: usize = 4096;
+
+// ── Process Table protegido por Spinlock ──────────────────────────────────
+struct ProcessTable {
+    processes: [core::mem::MaybeUninit<Process>; MAX_PROCS],
+    next_pid: u64,
+}
+
+impl ProcessTable {
+    const fn new() -> Self {
+        ProcessTable {
+            processes: [core::mem::MaybeUninit::uninit(); MAX_PROCS],
+            next_pid: 1,
+        }
+    }
+
+    fn alloc_pid(&mut self) -> Option<u64> {
+        let pid = self.next_pid;
+        self.next_pid = self.next_pid.checked_add(1)?;
+        Some(pid)
+    }
+
+    fn find_slot(&self) -> Option<usize> {
+        for (i, p) in self.processes.iter().enumerate() {
+            unsafe {
+                if (*p.as_ptr()).state == ProcessState::Dead {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    fn current_process_ref(&self) -> Option<&'static mut Process> {
+        for p in &self.processes {
+            unsafe {
+                let proc = p.as_ptr() as *mut Process;
+                if (*proc).state == ProcessState::Running {
+                    return Some(&mut *proc);
+                }
+            }
+        }
+        None
+    }
+
+    fn process_by_pid_ref(&self, pid: u64) -> Option<&'static mut Process> {
+        for p in &self.processes {
+            unsafe {
+                let proc = p.as_ptr() as *mut Process;
+                if (*proc).pid == pid {
+                    return Some(&mut *proc);
+                }
+            }
+        }
+        None
+    }
+}
+
+static PROCESS_TABLE: Spinlock<ProcessTable> = Spinlock::new(ProcessTable::new());
 
 #[derive(Copy, Clone)]
 pub struct OpenFileInfo {
@@ -102,52 +161,20 @@ impl Process {
     }
 }
 
-static mut PROCESSES: [core::mem::MaybeUninit<Process>; MAX_PROCS] =
-    [core::mem::MaybeUninit::uninit(); MAX_PROCS];
-
-static mut NEXT_PID: u64 = 1;
-
 fn alloc_pid() -> Option<u64> {
-    unsafe {
-        let pid = NEXT_PID;
-        NEXT_PID += 1;
-        Some(pid)
-    }
+    PROCESS_TABLE.lock().alloc_pid()
 }
 
 fn find_slot() -> Option<usize> {
-    unsafe {
-        for (i, p) in PROCESSES.iter().enumerate() {
-            if (*p.as_ptr()).state == ProcessState::Dead {
-                return Some(i);
-            }
-        }
-    }
-    None
+    PROCESS_TABLE.lock().find_slot()
 }
 
 pub fn current_process() -> Option<&'static mut Process> {
-    unsafe {
-        for p in &mut PROCESSES {
-            let proc = p.as_mut_ptr();
-            if (*proc).state == ProcessState::Running {
-                return Some(&mut *proc);
-            }
-        }
-    }
-    None
+    PROCESS_TABLE.lock().current_process_ref()
 }
 
 pub fn process_by_pid(pid: u64) -> Option<&'static mut Process> {
-    unsafe {
-        for p in &mut PROCESSES {
-            let proc = p.as_mut_ptr();
-            if (*proc).pid == pid {
-                return Some(&mut *proc);
-            }
-        }
-    }
-    None
+    PROCESS_TABLE.lock().process_by_pid_ref(pid)
 }
 
 pub fn set_tss_rsp0(rsp0: u64) {
@@ -193,8 +220,9 @@ pub fn process_create_into(cr3: u64, entry: u64, name: &str) -> Option<u64> {
         sp -= 8; *(sp as *mut u64) = 0; // argv = NULL
         sp -= 8; *(sp as *mut u64) = 0; // argc = 0
         let rsp = us_vaddr + (sp - us_base);
-        let p = &mut *PROCESSES[slot].as_mut_ptr();
-        (rsp, p)
+        let mut guard = PROCESS_TABLE.lock();
+        let p = &mut *guard.processes[slot].as_mut_ptr();
+        (rsp, &mut *(p as *mut Process))
     };
     let name_len = name.len().min(31);
     proc.name[..name_len].copy_from_slice(&name.as_bytes()[..name_len]);
@@ -240,11 +268,14 @@ pub fn process_create_into(cr3: u64, entry: u64, name: &str) -> Option<u64> {
 
 pub fn set_current(pid: u64) -> Option<()> {
     let proc = process_by_pid(pid)?;
-    unsafe {
-        for p in &mut PROCESSES {
-            let pp = p.as_mut_ptr();
-            if (*pp).state == ProcessState::Running {
-                (*pp).state = ProcessState::Ready;
+    {
+        let guard = PROCESS_TABLE.lock();
+        for p in &guard.processes {
+            unsafe {
+                let pp = p.as_ptr() as *mut Process;
+                if (*pp).state == ProcessState::Running {
+                    (*pp).state = ProcessState::Ready;
+                }
             }
         }
     }
@@ -347,8 +378,9 @@ pub fn fd_close(proc: &mut Process, fd: usize) {
 }
 
 pub fn pid_to_slot(pid: u64) -> Option<usize> {
-    unsafe {
-        for (i, p) in PROCESSES.iter().enumerate() {
+    let guard = PROCESS_TABLE.lock();
+    for (i, p) in guard.processes.iter().enumerate() {
+        unsafe {
             let proc = p.as_ptr();
             if (*proc).pid == pid && (*proc).state != ProcessState::Dead {
                 return Some(i);
@@ -409,29 +441,35 @@ pub fn setup_kernel_stack(proc: &mut Process) {
 }
 
 pub unsafe fn current_raw() -> *mut Process {
-    for p in &mut PROCESSES {
-        let ptr = p.as_mut_ptr();
-        if (*ptr).state == ProcessState::Running {
-            return ptr;
+    if let Some(guard) = PROCESS_TABLE.try_lock() {
+        for p in &guard.processes {
+            let ptr = p.as_ptr() as *mut Process;
+            if (*ptr).state == ProcessState::Running {
+                return ptr;
+            }
         }
     }
     core::ptr::null_mut()
 }
 
 pub unsafe fn pick_next_ready() -> *mut Process {
+    let guard = match PROCESS_TABLE.try_lock() {
+        Some(g) => g,
+        None => return core::ptr::null_mut(),
+    };
     let current_pid = {
         let cur = current_raw();
         if cur.is_null() { 0 } else { (*cur).pid }
     };
     let mut start = 0;
-    for (i, p) in PROCESSES.iter().enumerate() {
+    for (i, p) in guard.processes.iter().enumerate() {
         if (*p.as_ptr()).pid == current_pid {
             start = (i + 1) % MAX_PROCS;
             break;
         }
     }
     for _ in 0..MAX_PROCS {
-        let ptr = PROCESSES[start].as_mut_ptr();
+        let ptr = guard.processes[start].as_ptr() as *mut Process;
         if (*ptr).state == ProcessState::Ready && (*ptr).pid != current_pid {
             return ptr;
         }
@@ -442,16 +480,17 @@ pub unsafe fn pick_next_ready() -> *mut Process {
 
 unsafe fn wake_blocked() {
     let now = crate::time::pit::ticks();
-    for p in &mut PROCESSES {
-        let ptr = p.as_mut_ptr();
-        if (*ptr).state == ProcessState::Blocked && (*ptr).sleep_until > 0 {
-            if now >= (*ptr).sleep_until || (*ptr).sleep_until.wrapping_sub(now) > 1000 {
-                // woke up: timeout expired or wraparound
-                (*ptr).state = ProcessState::Ready;
-                (*ptr).sleep_until = 0;
-                serial::write_str("SCHED: wake PID ");
-                serial::write_usize((*ptr).pid as usize);
-                serial::write_str("\n");
+    if let Some(guard) = PROCESS_TABLE.try_lock() {
+        for p in &guard.processes {
+            let ptr = p.as_ptr() as *mut Process;
+            if (*ptr).state == ProcessState::Blocked && (*ptr).sleep_until > 0 {
+                if now >= (*ptr).sleep_until || (*ptr).sleep_until.wrapping_sub(now) > 1000 {
+                    (*ptr).state = ProcessState::Ready;
+                    (*ptr).sleep_until = 0;
+                    serial::write_str("SCHED: wake PID ");
+                    serial::write_usize((*ptr).pid as usize);
+                    serial::write_str("\n");
+                }
             }
         }
     }

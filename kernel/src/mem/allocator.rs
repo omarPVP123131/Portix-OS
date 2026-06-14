@@ -355,7 +355,13 @@ unsafe fn buddy_alloc(inner: &mut BuddyInner, order: usize) -> *mut u8 {
         return ptr::null_mut();
     }
 
-    let ptr = inner_pop(inner, found_ord).unwrap();
+    let ptr = match inner_pop(inner, found_ord) {
+        Some(p) => p,
+        None => {
+            serial::log("ALLOCATOR", "CRITICAL: buddy allocation failed - list corruption?\n");
+            return ptr::null_mut();
+        }
+    };
     let mut cur_ord = found_ord;
 
     while cur_ord > order {

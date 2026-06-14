@@ -43,6 +43,8 @@ int strcmp(const char *s1, const char *s2) {
     return (unsigned char)*s1 - (unsigned char)*s2;
 }
 
+// DEPRECATED: Use strncpy instead
+// This function is unsafe and should never be used
 char *strcpy(char *dest, const char *src) {
     char *d = dest;
     while ((*d++ = *src++));
@@ -50,12 +52,39 @@ char *strcpy(char *dest, const char *src) {
 }
 
 char *strncpy(char *dest, const char *src, size_t n) {
+    if (!dest || !src || n == 0) return dest;
     char *d = dest;
-    while (n-- && (*d++ = *src++));
-    while (n--) *d++ = '\0';
+    size_t i = 0;
+    while (i < n && src[i]) {
+        d[i] = src[i];
+        i++;
+    }
+    // Null-terminate if there's space
+    if (i < n) {
+        d[i] = '\0';
+    }
     return dest;
 }
 
+// Safe version of strcat
+char *strncat(char *dest, const char *src, size_t n) {
+    if (!dest || !src || n == 0) return dest;
+    
+    // Find end of dest
+    size_t dest_len = strlen(dest);
+    
+    // Copy up to n chars from src
+    size_t i = 0;
+    while (i < n && src[i]) {
+        dest[dest_len + i] = src[i];
+        i++;
+    }
+    dest[dest_len + i] = '\0';
+    return dest;
+}
+
+// DEPRECATED: Use strncat instead
+// This function is unsafe and should never be used
 char *strcat(char *dest, const char *src) {
     strcpy(dest + strlen(dest), src);
     return dest;

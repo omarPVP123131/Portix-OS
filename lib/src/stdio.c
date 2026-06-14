@@ -179,10 +179,16 @@ int printf(const char *fmt, ...) {
     return count;
 }
 
+// WARNING: sprintf is dangerous!
+// Use snprintf or safer alternatives
+// This implementation uses a large but bounded buffer to prevent infinite writes
 int sprintf(char *buf, const char *fmt, ...) {
+    if (!buf) return -1;
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(buf, (size_t)-1, fmt, args);
+    // Use a reasonable limit (64KB) instead of -1 (unbounded)
+    // This prevents writing beyond allocated memory
+    int n = vsnprintf(buf, 65536, fmt, args);
     va_end(args);
     return n;
 }

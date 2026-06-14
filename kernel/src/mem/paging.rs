@@ -114,7 +114,13 @@ fn alloc_page_table() -> Option<usize> {
 
 fn free_page(paddr: usize) {
     unsafe {
-        let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
+        let layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
+            Ok(l) => l,
+            Err(_) => {
+                serial::log("PAGING", "CRITICAL: invalid layout in free_page\n");
+                return;
+            }
+        };
         alloc::alloc::dealloc(paddr as *mut u8, layout);
     }
 }

@@ -285,12 +285,24 @@ pub fn process_exit(pid: u64, code: i32) {
     }
 
     if ks_base != 0 {
-        let layout = Layout::from_size_align(KERNEL_STACK_SIZE, PAGE_SIZE).unwrap();
+        let layout = match core::alloc::Layout::from_size_align(KERNEL_STACK_SIZE, PAGE_SIZE) {
+            Ok(l) => l,
+            Err(_) => {
+                serial::write_str("[PROCESS] ERROR: invalid kernel stack layout during cleanup\n");
+                return;
+            }
+        };
         unsafe { alloc::alloc::dealloc(ks_base as *mut u8, layout); }
     }
 
     if us_phys != 0 {
-        let layout = Layout::from_size_align(USER_STACK_SIZE, PAGE_SIZE).unwrap();
+        let layout = match core::alloc::Layout::from_size_align(USER_STACK_SIZE, PAGE_SIZE) {
+            Ok(l) => l,
+            Err(_) => {
+                serial::write_str("[PROCESS] ERROR: invalid user stack layout during cleanup\n");
+                return;
+            }
+        };
         unsafe { alloc::alloc::dealloc(us_phys as *mut u8, layout); }
     }
 

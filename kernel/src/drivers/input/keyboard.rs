@@ -171,49 +171,30 @@ impl KeyboardState {
         let sh = self.shift_l || self.shift_r;
         let up = sh ^ self.caps;
 
-        // Fila de números: scancodes 0x02–0x0D
-        const NUMS_N: &[u8] = b"1234567890-=";
-        const NUMS_S: &[u8] = b"!@#$%^&*()_+";
-        if sc >= 0x02 && sc <= 0x0D {
-            let i = (sc - 0x02) as usize;
-            return if sh { NUMS_S[i] } else { NUMS_N[i] };
-        }
+        let idx = sc as usize;
+        if idx >= 88 { return 0; }
 
-        // Resto del teclado
-        // Formato: (scancode, minúscula/normal, mayúscula/shift)
-        const MAP: &[(u8, u8, u8)] = &[
-            // Fila superior (QWERTY)
-            (0x10, b'q', b'Q'), (0x11, b'w', b'W'), (0x12, b'e', b'E'),
-            (0x13, b'r', b'R'), (0x14, b't', b'T'), (0x15, b'y', b'Y'),
-            (0x16, b'u', b'U'), (0x17, b'i', b'I'), (0x18, b'o', b'O'),
-            (0x19, b'p', b'P'), (0x1A, b'[', b'{'), (0x1B, b']', b'}'),
-            // Fila media (ASDF)
-            (0x1E, b'a', b'A'), (0x1F, b's', b'S'), (0x20, b'd', b'D'),
-            (0x21, b'f', b'F'), (0x22, b'g', b'G'), (0x23, b'h', b'H'),
-            (0x24, b'j', b'J'), (0x25, b'k', b'K'), (0x26, b'l', b'L'),
-            (0x27, b';', b':'), (0x28, b'\'', b'"'),
-            // Backslash / pipe (0x2B — entre Enter y la fila de letras en US)
-            (0x2B, b'\\', b'|'),
-            // Tilde/backtick (0x29 — arriba izquierda, antes del 1)
-            (0x29, b'`', b'~'),
-            // Fila inferior (ZXCV)
-            (0x2C, b'z', b'Z'), (0x2D, b'x', b'X'), (0x2E, b'c', b'C'),
-            (0x2F, b'v', b'V'), (0x30, b'b', b'B'), (0x31, b'n', b'N'),
-            (0x32, b'm', b'M'), (0x33, b',', b'<'), (0x34, b'.', b'>'),
-            (0x35, b'/', b'?'),
-            // Espacio
-            (0x39, b' ', b' '),
+        const NORMAL: &[u8] = &[
+            0,0, b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9',b'0',b'-',b'=',0,0,
+            b'q',b'w',b'e',b'r',b't',b'y',b'u',b'i',b'o',b'p',b'[',b']',0,0,
+            b'a',b's',b'd',b'f',b'g',b'h',b'j',b'k',b'l',b';',b'\'',b'`',0,
+            b'\\',b'z',b'x',b'c',b'v',b'b',b'n',b'm',b',',b'.',b'/',0,0,0,b' ',0,
+        ];
+        const SHIFTED: &[u8] = &[
+            0,0, b'!',b'@',b'#',b'$',b'%',b'^',b'&',b'*',b'(',b')',b'_',b'+',0,0,
+            b'Q',b'W',b'E',b'R',b'T',b'Y',b'U',b'I',b'O',b'P',b'{',b'}',0,0,
+            b'A',b'S',b'D',b'F',b'G',b'H',b'J',b'K',b'L',b':',b'"',b'~',0,
+            b'|',b'Z',b'X',b'C',b'V',b'B',b'N',b'M',b'<',b'>',b'?',0,0,0,b' ',0,
         ];
 
-        for &(code, lo, hi) in MAP {
-            if sc == code {
-                return if lo.is_ascii_alphabetic() {
-                    if up { hi } else { lo }
-                } else {
-                    if sh { hi } else { lo }
-                };
-            }
+        let lo = NORMAL[idx];
+        let hi = SHIFTED[idx];
+        if lo == 0 { return 0; }
+
+        if lo.is_ascii_alphabetic() {
+            if up { hi } else { lo }
+        } else {
+            if sh { hi } else { lo }
         }
-        0
     }
 }

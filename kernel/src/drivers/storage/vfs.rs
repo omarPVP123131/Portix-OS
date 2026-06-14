@@ -296,7 +296,12 @@ where F: FnOnce(&mut RamFs) -> R
     unsafe {
         match &mut RAMFS {
             Some(ref mut ram) => f(ram),
-            None => panic!("RAMFS not mounted"),
+            None => {
+                // RAMFS must be mounted before use
+                // This is a critical initialization requirement
+                serial::log("VFS", "CRITICAL: RAMFS not mounted - kernel panic\n");
+                panic!("RAMFS not mounted - this is a fatal initialization error");
+            }
         }
     }
 }

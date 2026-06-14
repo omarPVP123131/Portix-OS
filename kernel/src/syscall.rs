@@ -1023,7 +1023,13 @@ fn sys_execve(path_ptr: usize, argv: usize, envp: usize, current_rsp: u64) -> Sy
 
     // 7. Allocate and set up new user stack
     let us_size = crate::process::USER_STACK_SIZE;
-    let us_layout = core::alloc::Layout::from_size_align(us_size, crate::mem::paging::PAGE_SIZE).unwrap();
+    let us_layout = match core::alloc::Layout::from_size_align(us_size, crate::mem::paging::PAGE_SIZE) {
+        Ok(layout) => layout,
+        Err(_) => {
+            serial::write_str("[EXEC] CRITICAL: invalid Layout for user stack\n");
+            return SyscallResult(-1i64 as u64, 0);
+        }
+    };
     let us_ptr = unsafe { alloc::alloc::alloc_zeroed(us_layout) };
     if us_ptr.is_null() {
         serial::write_str("[EXEC] OOM: user stack\n");
@@ -1125,7 +1131,13 @@ fn sys_execve(path_ptr: usize, argv: usize, envp: usize, current_rsp: u64) -> Sy
 
     // Free old resources
     if old_us_phys != 0 {
-        let old_layout = core::alloc::Layout::from_size_align(us_size, crate::mem::paging::PAGE_SIZE).unwrap();
+        let old_layout = match core::alloc::Layout::from_size_align(us_size, crate::mem::paging::PAGE_SIZE) {
+            Ok(layout) => layout,
+            Err(_) => {
+                serial::write_str("[EXEC] CRITICAL: invalid Layout for old user stack dealloc\n");
+                return SyscallResult(-1i64 as u64, 0);
+            }
+        };
         unsafe { alloc::alloc::dealloc(old_us_phys as *mut u8, old_layout); }
     }
     if old_cr3 != 0 && old_cr3 != paging::read_cr3() {

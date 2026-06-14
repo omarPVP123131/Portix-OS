@@ -6,6 +6,7 @@ use crate::drivers::storage::vfs;
 use crate::mem::paging::{self, PAGE_SIZE};
 use crate::process::{self, FdEntry, FdType, OpenFileInfo};
 use crate::drivers::input::keyboard::{KeyboardState, Key};
+use crate::arch::Spinlock;
 use crate::arch::isr_handlers::{pop_ring3_scancode, set_stdin_blocked, clear_stdin_blocked};
 
 fn alloc_page() -> Option<usize> {
@@ -134,31 +135,39 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> i64 {
 
 // Simple ring buffer for /dev/kbd — keyboard driver writes, shell reads
 const KBD_BUF_SIZE: usize = 256;
-static mut KBD_BUF: [u8; KBD_BUF_SIZE] = [0u8; KBD_BUF_SIZE];
-static mut KBD_BUF_HEAD: usize = 0;
-static mut KBD_BUF_TAIL: usize = 0;
+
+struct KbdBuffer {
+    data: [u8; KBD_BUF_SIZE],
+    head: usize,
+    tail: usize,
+}
+
+static KBD_BUFFER: Spinlock<KbdBuffer> = Spinlock::new(KbdBuffer {
+    data: [0u8; KBD_BUF_SIZE],
+    head: 0,
+    tail: 0,
+});
 
 fn kbd_buf_write(data: &[u8]) {
-    unsafe {
-        for &b in data {
-            let next = (KBD_BUF_HEAD + 1) % KBD_BUF_SIZE;
-            if next != KBD_BUF_TAIL {
-                KBD_BUF[KBD_BUF_HEAD] = b;
-                KBD_BUF_HEAD = next;
-            }
+    let mut buf = KBD_BUFFER.lock();
+    for &b in data {
+        let next = (buf.head + 1) % KBD_BUF_SIZE;
+        if next != buf.tail {
+            let h = buf.head;
+            buf.data[h] = b;
+            buf.head = next;
         }
     }
 }
 
 fn kbd_buf_read() -> Option<u8> {
-    unsafe {
-        if KBD_BUF_TAIL != KBD_BUF_HEAD {
-            let b = KBD_BUF[KBD_BUF_TAIL];
-            KBD_BUF_TAIL = (KBD_BUF_TAIL + 1) % KBD_BUF_SIZE;
-            Some(b)
-        } else {
-            None
-        }
+    let mut buf = KBD_BUFFER.lock();
+    if buf.tail != buf.head {
+        let b = buf.data[buf.tail];
+        buf.tail = (buf.tail + 1) % KBD_BUF_SIZE;
+        Some(b)
+    } else {
+        None
     }
 }
 
@@ -351,12 +360,19 @@ fn sys_read_stdin(buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
     // KBD local para decodificar scancodes del ring buffer de IRQ1.
     // No comparte estado con el KBD del kernel — correcto, son contextos
     // distintos (ring-3 stdin vs UI del kernel).
-    static mut KBD: KeyboardState = KeyboardState::new();
+    struct StdinState {
+        kbd: KeyboardState,
+        buf: [u8; 256],
+        head: usize,
+        tail: usize,
+    }
 
-    // Buffer circular de caracteres ya decodificados, pendientes de entregar.
-    static mut CHAR_BUF:  [u8; 256] = [0u8; 256];
-    static mut CHAR_HEAD: usize = 0;  // próxima posición de escritura
-    static mut CHAR_TAIL: usize = 0;  // próxima posición de lectura
+    static STDIN: Spinlock<StdinState> = Spinlock::new(StdinState {
+        kbd: KeyboardState::new(),
+        buf: [0u8; 256],
+        head: 0,
+        tail: 0,
+    });
 
     unsafe {
         // ── Fase 1: bombear scancodes → chars hasta tener al menos uno ──
@@ -365,7 +381,8 @@ fn sys_read_stdin(buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
             loop {
                 match pop_ring3_scancode() {
                     Some(sc) => {
-                        if let Some(key) = KBD.feed_byte(sc) {
+                        let mut guard = STDIN.lock();
+                        if let Some(key) = guard.kbd.feed_byte(sc) {
                             let ch: u8 = match key {
                                 Key::Char(c)  => c,
                                 Key::Enter    => b'\n',
@@ -374,10 +391,11 @@ fn sys_read_stdin(buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
                                 _             => 0,
                             };
                             if ch != 0 {
-                                let next = (CHAR_HEAD + 1) % CHAR_BUF.len();
-                                if next != CHAR_TAIL {
-                                    CHAR_BUF[CHAR_HEAD] = ch;
-                                    CHAR_HEAD = next;
+                                let h = guard.head;
+                                let next = (h + 1) % guard.buf.len();
+                                if next != guard.tail {
+                                    guard.buf[h] = ch;
+                                    guard.head = next;
                                 }
                             }
                         }
@@ -387,7 +405,10 @@ fn sys_read_stdin(buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
             }
 
             // Si hay caracteres disponibles, salir del loop de espera
-            if CHAR_HEAD != CHAR_TAIL { break; }
+            {
+                let guard = STDIN.lock();
+                if guard.head != guard.tail { break; }
+            }
 
             // Sin caracteres: bloquear el proceso y forzar reschedule.
             // IRQ1 → irq1_handler_rust → wake_stdin_blocked nos despertará
@@ -422,13 +443,15 @@ fn sys_read_stdin(buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
         }
 
         // ── Fase 2: copiar caracteres al buffer de usuario ───────────────
+        let mut guard = STDIN.lock();
         let mut copied = 0usize;
-        while CHAR_TAIL != CHAR_HEAD && copied < count {
-            let ch = CHAR_BUF[CHAR_TAIL];
-            CHAR_TAIL = (CHAR_TAIL + 1) % CHAR_BUF.len();
+        while guard.tail != guard.head && copied < count {
+            let ch = guard.buf[guard.tail];
+            guard.tail = (guard.tail + 1) % guard.buf.len();
             if paging::copy_to_user(buf + copied, &[ch]).is_err() { break; }
             copied += 1;
         }
+        drop(guard);
 
         serial::write_str("[SYS] READ stdin chars=");
         serial::write_usize(copied);

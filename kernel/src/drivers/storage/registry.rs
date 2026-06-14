@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use crate::arch::Spinlock;
 use super::ata::DriveType;
 use super::traits::BlockDevice;
 
@@ -38,28 +39,49 @@ impl DeviceRegistry {
     fn len(&self) -> usize { self.count }
 }
 
-static mut REGISTRY: DeviceRegistry = DeviceRegistry::new();
+// SAFETY: El kernel PORTIX es single-threaded. DeviceRegistry solo contiene
+// Box<dyn BlockDevice>, y BlockDevice solo se usa en contexto single-threaded.
+unsafe impl Send for DeviceRegistry {}
+
+static REGISTRY: Spinlock<DeviceRegistry> = Spinlock::new(DeviceRegistry::new());
 
 pub fn register_device(dev: Box<dyn BlockDevice>) -> usize {
-    unsafe { REGISTRY.register(dev) }
+    REGISTRY.lock().register(dev)
 }
 
 pub fn get_device(id: usize) -> Option<&'static mut dyn BlockDevice> {
-    let ptr: *mut dyn BlockDevice = match unsafe { REGISTRY.get_mut(id) } {
-        Some(d) => d as *mut dyn BlockDevice,
-        None => return None,
-    };
-    Some(unsafe { &mut *ptr })
+    let mut guard = REGISTRY.lock();
+    match guard.get_mut(id) {
+        Some(d) => {
+            // SAFETY: El registro vive en un static (nunca se mueve).
+            // El Spinlock protege el acceso concurrente.
+            // El kernel es single-threaded: no hay carreras después del unlock.
+            let extended: &'static mut dyn BlockDevice = unsafe {
+                core::mem::transmute(d as &mut dyn BlockDevice)
+            };
+            Some(extended)
+        }
+        None => None,
+    }
+}
+
+pub fn with_device<F, R>(id: usize, f: F) -> R
+where F: FnOnce(Option<&mut dyn BlockDevice>) -> R
+{
+    let mut registry = REGISTRY.lock();
+    let device = registry.get_mut(id);
+    f(device)
 }
 
 pub fn device_count() -> usize {
-    unsafe { REGISTRY.count }
+    REGISTRY.lock().len()
 }
 
 pub fn flush_all() {
-    let count = device_count();
+    let mut registry = REGISTRY.lock();
+    let count = registry.len();
     for id in 0..count {
-        if let Some(dev) = get_device(id) {
+        if let Some(dev) = registry.get_mut(id) {
             if dev.device_info().kind != DriveType::Atapi {
                 let _ = dev.flush_cache();
             }

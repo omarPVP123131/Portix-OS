@@ -1095,7 +1095,7 @@ pub unsafe extern "C" fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
 // SCANCODE_BUF  → kernel UI (main loop)
 // RING3_SCANCODE_BUF → ring-3 stdin (syscall)
 // MOUSE_BUF     → mouse bytes via IRQ12
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const SCANCODE_BUF_SIZE: usize = 1024;
 pub const RING3_BUF_SIZE: usize = 256;
@@ -1158,19 +1158,19 @@ pub fn pop_mouse_byte() -> Option<u8> {
     pop_ring(&MOUSE_HEAD, &MOUSE_TAIL, unsafe { &MOUSE_BUF }, MOUSE_BUF_SIZE as u32)
 }
 
-// Process blocked on stdin
-static mut BLOCKED_STDIN_PID: u64 = 0;
+// Process blocked on stdin — AtomicU64 para acceso seguro desde IRQ1
+static BLOCKED_STDIN_PID: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_stdin_blocked(pid: u64) {
-    unsafe { BLOCKED_STDIN_PID = pid; }
+    BLOCKED_STDIN_PID.store(pid, Ordering::Release);
 }
 
 pub fn clear_stdin_blocked() {
-    unsafe { BLOCKED_STDIN_PID = 0; }
+    BLOCKED_STDIN_PID.store(0, Ordering::Release);
 }
 
 pub fn wake_stdin_blocked() {
-    let pid = unsafe { BLOCKED_STDIN_PID };
+    let pid = BLOCKED_STDIN_PID.load(Ordering::Acquire);
     if pid == 0 { return; }
     if let Some(proc) = crate::process::process_by_pid(pid) {
         if proc.state == crate::process::ProcessState::Blocked {
@@ -1187,7 +1187,6 @@ extern "C" fn irq1_handler_rust(scancode: u8) {
     wake_stdin_blocked();
 }
 
-use core::sync::atomic::AtomicU64;
 static IRQ12_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Tick when IRQ12 last fired (for polling timeout in main loop).
 static IRQ12_LAST_TICK: AtomicU64 = AtomicU64::new(0);

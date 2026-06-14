@@ -73,15 +73,16 @@ use crate::drivers::storage::fat32::{Fat32Volume, FatError};
 use crate::drivers::storage::mkfs;
 use crate::drivers::storage::registry;
 use crate::drivers::storage::traits::BlockDevice;
+use crate::arch::Spinlock;
 use crate::drivers::storage::vfs::{VfsMount, path_split, path_join, basename, parent_copy};
 
 // ── Caché global del volumen FAT32 ────────────────────────────────────────────
 // mount_vol() monta una sola vez y cachea; comandos posteriores reutilizan.
 
-static mut VOL_CACHE: Option<(Fat32Volume<'static>, VfsMount)> = None;
+static VOL_CACHE: Spinlock<Option<(Fat32Volume<'static>, VfsMount)>> = Spinlock::new(None);
 
 pub fn invalidate_vol_cache() {
-    unsafe { VOL_CACHE = None; }
+    *VOL_CACHE.lock() = None;
 }
 
 // ── Helpers privados ──────────────────────────────────────────────────────────
@@ -134,9 +135,12 @@ fn fat_err_msg(e: FatError) -> &'static [u8] {
 }
 
 fn mount_vol(t: &mut Terminal) -> Option<(&'static mut Fat32Volume<'static>, &'static mut VfsMount)> {
-    unsafe {
-        if let Some(ref mut pair) = VOL_CACHE {
-            return Some((&mut pair.0, &mut pair.1));
+    // Fast path: check cache with brief lock
+    if let Some(mut cache) = VOL_CACHE.try_lock() {
+        if cache.is_some() {
+            let vol = &mut cache.as_mut().unwrap().0 as *mut _;
+            let mnt = &mut cache.as_mut().unwrap().1 as *mut _;
+            return Some((unsafe { &mut *vol }, unsafe { &mut *mnt }));
         }
     }
 
@@ -160,12 +164,11 @@ fn mount_vol(t: &mut Terminal) -> Option<(&'static mut Fat32Volume<'static>, &'s
             let root = vol.root_cluster();
             mnt.register("/", root);
             let _ = resolve_and_register(&mut vol, root, &mut mnt);
-            unsafe {
-                VOL_CACHE = Some((vol, mnt));
-                if let Some(pair) = VOL_CACHE.as_mut() {
-                    return Some((&mut pair.0, &mut pair.1));
-                }
-            }
+            let mut cache = VOL_CACHE.lock();
+            *cache = Some((vol, mnt));
+            let vol = &mut cache.as_mut().unwrap().0 as *mut _;
+            let mnt = &mut cache.as_mut().unwrap().1 as *mut _;
+            return Some((unsafe { &mut *vol }, unsafe { &mut *mnt }));
         }
     }
 

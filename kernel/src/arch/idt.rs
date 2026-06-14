@@ -65,6 +65,9 @@ pub struct Tss {
 #[repr(align(16))]
 struct Stack16K([u8; 16384]);
 
+// SAFETY: Todas estas estructuras se inicializan UNA SOLA VEZ durante
+// init_idt() antes de que cualquier concurrencia sea posible. No necesitan
+// Spinlock porque son read-only después del boot.
 static mut DF_STACK: Stack16K = Stack16K([0u8; 16384]);
 
 static mut TSS: Tss = Tss {
@@ -84,6 +87,8 @@ struct Gdt {
     tss_high:  u64,  // 0x30
 }
 
+// SAFETY: Init-once, ver nota arriba. GDT y GDT_PTR se escriben en init_idt()
+// antes de habilitar interrupciones, luego son read-only.
 static mut GDT: Gdt = Gdt {
     null:   0x0000_0000_0000_0000,
     code64: 0x00AF_9A00_0000_FFFF,
@@ -94,9 +99,11 @@ static mut GDT: Gdt = Gdt {
     tss_low: 0, tss_high: 0,
 };
 
+// SAFETY: Init-once. GDT_PTR e IDT_PTR se escriben antes de lgdt/lidt.
 static mut GDT_PTR: GdtPtr = GdtPtr { limit:0, base:0 };
 static mut IDT_PTR: IdtPtr = IdtPtr { limit:0, base:0 };
 
+// SAFETY: Init-once. IDT se escribe en init_idt() antes de habilitar IRQs.
 #[no_mangle]
 static mut IDT: [IdtEntry; 256] = [IdtEntry::new(); 256];
 

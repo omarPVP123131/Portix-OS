@@ -13,22 +13,21 @@ unsafe fn outb(port: u16, val: u8) {
     core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack, nomem));
 }
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 /// Global tick counter, incremented each IRQ0.  100 ticks = 1 second.
-pub static mut TICKS: u64 = 0;
+pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Called from the IRQ0 stub in isr.asm.
 #[no_mangle]
 pub extern "C" fn pit_tick() {
-    unsafe {
-        let v = core::ptr::read_volatile(&raw const TICKS);
-        core::ptr::write_volatile(&raw mut TICKS, v.wrapping_add(1));
-    }
+    TICKS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Atomically read current tick count.
 #[inline(always)]
 pub fn ticks() -> u64 {
-    unsafe { core::ptr::read_volatile(&raw const TICKS) }
+    TICKS.load(Ordering::Relaxed)
 }
 
 /// Uptime in full seconds.

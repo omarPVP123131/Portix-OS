@@ -473,18 +473,20 @@ pub fn copy_to_user(dst: usize, src: &[u8]) -> Result<usize, ()> {
     }
 }
 
-static mut EXPECT_USER_FAULT: bool = false;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static EXPECT_USER_FAULT: AtomicBool = AtomicBool::new(false);
 
 pub fn set_expect_user_fault() {
-    unsafe { EXPECT_USER_FAULT = true; }
+    EXPECT_USER_FAULT.store(true, Ordering::SeqCst);
 }
 
 pub fn clear_expect_user_fault() {
-    unsafe { EXPECT_USER_FAULT = false; }
+    EXPECT_USER_FAULT.store(false, Ordering::SeqCst);
 }
 
 pub fn is_expecting_user_fault() -> bool {
-    unsafe { EXPECT_USER_FAULT }
+    EXPECT_USER_FAULT.load(Ordering::SeqCst)
 }
 
 pub fn init() {

@@ -48,7 +48,7 @@ impl<T> Spinlock<T> {
     }
 
     /// Try to acquire the lock (non-blocking)
-    pub fn try_lock(&self) -> Option<SpinlockGuard<T>> {
+    pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
         match self.lock.compare_exchange_weak(
             UNLOCKED,
             LOCKED,
@@ -65,7 +65,7 @@ impl<T> Spinlock<T> {
     /// # Warning
     /// This will spin forever if the lock cannot be acquired.
     /// Do NOT hold locks for extended periods or during I/O waits.
-    pub fn lock(&self) -> SpinlockGuard<T> {
+    pub fn lock(&self) -> SpinlockGuard<'_, T> {
         // Spin until lock is acquired
         loop {
             // Try to acquire with weak compare-exchange for performance

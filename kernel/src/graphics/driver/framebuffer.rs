@@ -288,6 +288,7 @@ pub struct Framebuffer {
     bpp:        u8,
     back_pitch: usize,
     pub dirty:  DirtyRegion,
+    pub direct_lfb: bool,
 }
 
 impl Framebuffer {
@@ -364,11 +365,16 @@ impl Framebuffer {
 
             init_alpha_lut(); // mejora #6
 
+            let cr3 = crate::mem::paging::read_cr3();
+            let is_backbuf_mapped = crate::mem::paging::translate(cr3, BACKBUF_ADDR as usize).is_some();
+            let direct_lfb = !is_backbuf_mapped || lfb == 0;
+
             Self {
                 lfb, backbuf: BACKBUF_ADDR,
                 width: w, height: h,
                 lfb_pitch, bpp, back_pitch,
                 dirty: DirtyRegion::clean(),
+                direct_lfb,
             }
         }
     }
@@ -418,20 +424,82 @@ impl Framebuffer {
     #[inline(always)]
     pub unsafe fn draw_pixel(&mut self, x: usize, y: usize, color: Color) {
         if x >= self.width || y >= self.height { return; }
-        let off = (y * self.back_pitch + x * 4) as u64;
-        core::ptr::write_volatile((self.backbuf + off) as *mut u32, color.0);
+        if self.direct_lfb {
+            if self.lfb == 0 { return; }
+            match self.bpp {
+                32 => {
+                    let off = (y * self.lfb_pitch + x * 4) as u64;
+                    core::ptr::write_volatile((self.lfb + off) as *mut u32, color.0);
+                }
+                24 => {
+                    let off = (y * self.lfb_pitch + x * 3) as u64;
+                    let dst = (self.lfb + off) as *mut u8;
+                    core::ptr::write_volatile(dst,       ( color.0        & 0xFF) as u8);
+                    core::ptr::write_volatile(dst.add(1), ((color.0 >>  8) & 0xFF) as u8);
+                    core::ptr::write_volatile(dst.add(2), ((color.0 >> 16) & 0xFF) as u8);
+                }
+                16 => {
+                    let off = (y * self.lfb_pitch + x * 2) as u64;
+                    let r = ((color.0 >> 16) & 0xFF) as u16;
+                    let g = ((color.0 >>  8) & 0xFF) as u16;
+                    let bv = ( color.0        & 0xFF) as u16;
+                    let val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (bv >> 3);
+                    core::ptr::write_volatile((self.lfb + off) as *mut u16, val);
+                }
+                _ => {
+                    let bpp_b = (self.bpp as usize + 7) / 8;
+                    let off = (y * self.lfb_pitch + x * bpp_b) as u64;
+                    let dst = (self.lfb + off) as *mut u8;
+                    core::ptr::write_volatile(dst,   ( color.0        & 0xFF) as u8);
+                    if bpp_b > 1 { core::ptr::write_volatile(dst.add(1), ((color.0>>8)&0xFF)  as u8); }
+                    if bpp_b > 2 { core::ptr::write_volatile(dst.add(2), ((color.0>>16)&0xFF) as u8); }
+                }
+            }
+        } else {
+            if self.backbuf == 0 { return; }
+            let off = (y * self.back_pitch + x * 4) as u64;
+            core::ptr::write_volatile((self.backbuf + off) as *mut u32, color.0);
+        }
     }
 
     #[inline(always)]
     pub unsafe fn read_back_pixel(&self, x: usize, y: usize) -> Color {
         if x >= self.width || y >= self.height { return Color::BLACK; }
-        let off = (y * self.back_pitch + x * 4) as u64;
-        Color(core::ptr::read_volatile((self.backbuf + off) as *const u32))
+        if self.direct_lfb {
+            if self.lfb == 0 { return Color::BLACK; }
+            match self.bpp {
+                32 => {
+                    let off = (y * self.lfb_pitch + x * 4) as u64;
+                    Color(core::ptr::read_volatile((self.lfb + off) as *const u32))
+                }
+                24 => {
+                    let off = (y * self.lfb_pitch + x * 3) as u64;
+                    let src = (self.lfb + off) as *const u8;
+                    let r = core::ptr::read_volatile(src.add(2)) as u32;
+                    let g = core::ptr::read_volatile(src.add(1)) as u32;
+                    let b = core::ptr::read_volatile(src) as u32;
+                    Color((r << 16) | (g << 8) | b)
+                }
+                16 => {
+                    let off = (y * self.lfb_pitch + x * 2) as u64;
+                    let val = core::ptr::read_volatile((self.lfb + off) as *const u16) as u32;
+                    let r = ((val >> 11) & 0x1F) << 3;
+                    let g = ((val >> 5) & 0x3F) << 2;
+                    let b = (val & 0x1F) << 3;
+                    Color((r << 16) | (g << 8) | b)
+                }
+                _ => Color::BLACK,
+            }
+        } else {
+            if self.backbuf == 0 { return Color::BLACK; }
+            let off = (y * self.back_pitch + x * 4) as u64;
+            Color(core::ptr::read_volatile((self.backbuf + off) as *const u32))
+        }
     }
 
     // ── present() — dirty-rect (mejora #2) + rep movsd (mejora #1) ───────────
     pub fn present(&mut self) {
-        if self.lfb == 0 || !self.dirty.dirty { return; }
+        if self.direct_lfb || self.lfb == 0 || !self.dirty.dirty { return; }
         let x0 = self.dirty.min_x.min(self.width);
         let y0 = self.dirty.min_y.min(self.height);
         let x1 = self.dirty.max_x.min(self.width);
@@ -505,11 +573,31 @@ impl Framebuffer {
     pub fn clear(&self, color: Color) {
         let val   = color.0;
         let total = self.width * self.height;
-        unsafe { Self::fast_fill_u32(self.backbuf as *mut u32, val, total); }
+        if self.direct_lfb {
+            if self.lfb == 0 { return; }
+            unsafe {
+                match self.bpp {
+                    32 => {
+                        Self::fast_fill_u32(self.lfb as *mut u32, val, total);
+                    }
+                    _ => {
+                        for y in 0..self.height {
+                            for x in 0..self.width {
+                                let ptr = self as *const Self as *mut Self;
+                                (*ptr).draw_pixel(x, y, color);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            if self.backbuf == 0 { return; }
+            unsafe { Self::fast_fill_u32(self.backbuf as *mut u32, val, total); }
+        }
     }
 
     pub fn fill_rect(&mut self, sx: usize, sy: usize, w: usize, h: usize, c: Color) {
-        if self.backbuf == 0 || w == 0 || h == 0 { return; }
+        if (self.backbuf == 0 && !self.direct_lfb) || w == 0 || h == 0 { return; }
         let ex = sx.saturating_add(w).min(self.width);
         let ey = sy.saturating_add(h).min(self.height);
         if sx >= ex || sy >= ey { return; }
@@ -517,11 +605,17 @@ impl Framebuffer {
         let val = c.0;
         unsafe {
             for y in sy..ey {
-                let row = (self.backbuf + (y * self.back_pitch + sx * 4) as u64) as *mut u32;
-                Self::fast_fill_u32(row, val, rw);
+                if self.direct_lfb {
+                    for x in sx..ex {
+                        self.draw_pixel(x, y, c);
+                    }
+                } else {
+                    let row = (self.backbuf + (y * self.back_pitch + sx * 4) as u64) as *mut u32;
+                    Self::fast_fill_u32(row, val, rw);
+                }
             }
         }
-        self.dirty.mark(sx, sy, ex - sx, ey - sy);
+        self.dirty.mark(sx, sy, rw, ey - sy);
     }
 
     pub fn hline(&mut self, x: usize, y: usize, l: usize, c: Color) { self.fill_rect(x,y,l,1,c); }
@@ -654,13 +748,28 @@ impl Framebuffer {
                              lines: usize, fill: Color) {
         if lines == 0 || lines >= h || w == 0 { return; }
         let visible = h - lines;
-        for row in 0..visible {
-            let src_y = sy + row + lines;
-            let dst_y = sy + row;
-            if src_y >= self.height { break; }
-            let src = (self.backbuf + (src_y * self.back_pitch + sx * 4) as u64) as *const u32;
-            let dst = (self.backbuf + (dst_y * self.back_pitch + sx * 4) as u64) as *mut u32;
-            unsafe { Self::fast_copy_u32(dst, src, w.min(self.width - sx)); }
+        if self.direct_lfb {
+            for row in 0..visible {
+                let src_y = sy + row + lines;
+                let dst_y = sy + row;
+                if src_y >= self.height { break; }
+                let cols = w.min(self.width - sx);
+                for col in 0..cols {
+                    unsafe {
+                        let c = self.read_back_pixel(sx + col, src_y);
+                        self.draw_pixel(sx + col, dst_y, c);
+                    }
+                }
+            }
+        } else {
+            for row in 0..visible {
+                let src_y = sy + row + lines;
+                let dst_y = sy + row;
+                if src_y >= self.height { break; }
+                let src = (self.backbuf + (src_y * self.back_pitch + sx * 4) as u64) as *const u32;
+                let dst = (self.backbuf + (dst_y * self.back_pitch + sx * 4) as u64) as *mut u32;
+                unsafe { Self::fast_copy_u32(dst, src, w.min(self.width - sx)); }
+            }
         }
         for row in visible..h {
             self.fill_rect(sx, sy + row, w, 1, fill);

@@ -37,6 +37,8 @@
 #   [FIX-GP-DF]        ISRs con guardia valid==0 → VGA 0xB8000 fallback.
 
 import math, os, shutil, struct, subprocess, sys, threading, time, uuid, binascii
+import glob
+import importlib
 from pathlib import Path
 from datetime import datetime
 
@@ -198,7 +200,7 @@ def arg_val(prefix):
 
 def _make_boot_cd_img():
     """Boot image para El Torito no-emul: portix.img LBA 0 hasta fin de kernel.
-    
+
     Incluye boot.bin (LBA 0), stage2.bin (LBA 1-64), gap (LBA 65-67),
     y kernel.bin (LBA 68+). Esto asegura que stage2 pueda leer el kernel
     desde CD via INT 13h/42h con LDA = BIT_BOOT_LBA + KERNEL_LBA/4,
@@ -220,14 +222,165 @@ def _make_boot_cd_img():
 # FAT32 Python-puro  (pyfatfs)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _check_pyfatfs():
+def _pyfatfs_pip_install():
+    """Intenta instalar pyfatfs con pip probando distintos flag sets.
+
+    Orden de intentos:
+      1. Sin flags         — funciona en Windows y venvs.
+      2. --user            — funciona en Linux sin externally-managed.
+      3. --break-system-packages          — necesario en Debian/Ubuntu/Fedora
+                                            modernos (PEP 668).
+      4. --break-system-packages --user   — último recurso.
+
+    Devuelve True si algún intento tuvo éxito.
+    """
+    base = [sys.executable, "-m", "pip", "install", "pyfatfs",
+            "--quiet", "--disable-pip-version-check"]
+    flag_sets = [
+        [],
+        ["--user"],
+        ["--break-system-packages"],
+        ["--break-system-packages", "--user"],
+    ]
+    for flags in flag_sets:
+        try:
+            r = subprocess.run(base + flags, capture_output=True, text=True, timeout=300)
+            if r.returncode == 0:
+                return True
+            log(f"  [DEPS] pip {' '.join(flags) or '(sin flags)'} -> rc={r.returncode}")
+        except Exception as e:
+            log(f"  [DEPS] pip error ({flags}): {e}")
+    return False
+
+
+def _pyfatfs_try_import():
+    """Intenta el import directo. Devuelve (PyFat, PyFatFS) o None."""
     try:
         from pyfatfs.PyFat import PyFat
         from pyfatfs.PyFatFS import PyFatFS
         return PyFat, PyFatFS
     except ImportError:
-        log("[ERROR] pyfatfs no instalado. Ejecuta:  pip install pyfatfs")
-        sys.exit(1)
+        return None
+
+
+def _pyfatfs_bridge_search():
+    """Busca pyfatfs en otros intérpretes Python del sistema.
+
+    Si lo encuentra, agrega su site-packages a sys.path (bridge) e intenta
+    el import. Devuelve (PyFat, PyFatFS) o None.
+    """
+    candidates = []
+
+    def add(p):
+        if p and p not in candidates and Path(p).is_file():
+            candidates.append(p)
+
+    # PATH: nombres comunes
+    for name in ("python3", "python", "py"):
+        add(shutil.which(name))
+
+    # Windows: py launcher
+    if sys.platform == "win32":
+        py = shutil.which("py")
+        if py:
+            try:
+                out = subprocess.run([py, "-0p"], capture_output=True, text=True, timeout=10)
+                for line in out.stdout.splitlines():
+                    for tok in line.split():
+                        if tok.lower().endswith("python.exe") and Path(tok).is_file():
+                            add(tok)
+            except Exception:
+                pass
+        for pat in [
+            r"C:\Python*\python.exe",
+            r"C:\Program Files\Python*\python.exe",
+            r"C:\Program Files (x86)\Python*\python.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python*\python.exe"),
+        ]:
+            for m in glob.glob(pat):
+                add(m)
+
+    # Linux/Mac: rutas típicas
+    for pat in ["/usr/bin/python3*", "/usr/local/bin/python3*",
+                "/opt/*/bin/python3*",
+                str(Path.home() / ".pyenv/versions/*/bin/python3*")]:
+        for m in glob.glob(pat):
+            add(m)
+
+    for exe in candidates:
+        # No probar el intérprete actual (ya falló)
+        try:
+            if Path(exe).resolve() == Path(sys.executable).resolve():
+                continue
+        except Exception:
+            pass
+
+        try:
+            probe = [exe, "-c",
+                     "import pyfatfs, os; "
+                     "print(os.path.abspath("
+                     "os.path.join(os.path.dirname(pyfatfs.__file__), os.pardir)))"]
+            r = subprocess.run(probe, capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                continue
+            site_dir = r.stdout.strip().splitlines()[-1]
+            if not site_dir or not Path(site_dir).is_dir():
+                continue
+            if site_dir not in sys.path:
+                sys.path.insert(0, site_dir)
+            importlib.invalidate_caches()
+            result = _pyfatfs_try_import()
+            if result:
+                log(f"  [DEPS] pyfatfs localizado en {exe} -> {site_dir}")
+                return result
+            # Si el import sigue fallando, deshacer para no contaminar sys.path
+            sys.path.remove(site_dir)
+        except Exception:
+            continue
+
+    return None
+
+
+def _check_pyfatfs():
+    """Garantiza que PyFat y PyFatFS sean importables. Siempre devuelve
+    (PyFat, PyFatFS) o termina el proceso con sys.exit(1).
+
+    Estrategia:
+      1. Import directo  — pyfatfs ya instalado en el intérprete actual.
+      2. Bridge search   — busca en otros Pythons del sistema y hace
+                           sys.path bridge si lo encuentra.
+      3. pip install     — intenta instalar con 4 combinaciones de flags
+                           (cubre Windows, venvs, Linux con PEP 668).
+      4. Fallo explícito — mensaje claro con instrucción manual.
+    """
+    # 1. Import directo
+    result = _pyfatfs_try_import()
+    if result:
+        return result
+
+    log("[WARN]  pyfatfs no disponible en el intérprete actual, buscando alternativas...")
+
+    # 2. Bridge: otro Python del sistema que ya lo tenga
+    result = _pyfatfs_bridge_search()
+    if result:
+        return result
+
+    # 3. pip install con fallback de flags
+    log("[INFO]  Instalando pyfatfs con pip...")
+    if _pyfatfs_pip_install():
+        importlib.invalidate_caches()
+        result = _pyfatfs_try_import()
+        if result:
+            log("[OK]    pyfatfs instalado correctamente")
+            return result
+
+    # 4. Fallo
+    log("[ERROR] pyfatfs no disponible y no se pudo instalar/localizar.")
+    log("        Instala manualmente:")
+    log("          pip install pyfatfs")
+    log("          pip install pyfatfs --break-system-packages   (Linux moderno)")
+    sys.exit(1)
+
 
 def _fat_mkdir(fs, path):
     parts = [p for p in path.strip("/").split("/") if p]
@@ -358,10 +511,10 @@ def check_tools():
     for t in ["qemu-img","xorriso","genisoimage","mkisofs"]:
         p = find_tool(t)
         log(f"{'[OK]   ' if p else '[--]   '} {t}{' -> '+p if p else ' (opcional)'}")
-    try:
-        import pyfatfs; log(f"[OK]    pyfatfs")
-    except ImportError:
-        log("[FALTA] pyfatfs.  Instalar:  pip install pyfatfs"); sys.exit(1)
+    # _check_pyfatfs ya maneja búsqueda, bridge y pip-install internamente.
+    # Si falla, termina el proceso con sys.exit(1).
+    _check_pyfatfs()
+    log("[OK]    pyfatfs")
     ovmf = find_ovmf()
     if ovmf: log(f"[OK]    OVMF -> {ovmf}")
     else:
@@ -586,7 +739,6 @@ def _inject_pt(img_path, data_lba_start, data_sectors):
     data[0x1BE:0x1BE+16] = part1
 
     # Partition 2: FAT32 data partition
-    data_end = data_lba_start + data_sectors
     ts = len(data) // 512
     part2 = bytearray(16)
     part2[0] = 0x00
@@ -607,8 +759,6 @@ def create_raw(ks):
     # Align kernel end to 1 MB boundary
     kernel_end_lba = (total + 2047) // 2048 * 2048  # round up to 1 MB
     data_image_size = DATA_PART_MB * 1048576
-    # Build FAT32 data partition first to get exact size
-    part_sectors = _build_data_part(ks)
     total_mb = max(math.ceil((kernel_end_lba * 512 + data_image_size) / 1048576), DISK_MIN_MB + DATA_PART_MB)
 
     log(f"  Layout: Boot@0 Stage2@1-{KERNEL_LBA_START-1} "
@@ -629,7 +779,7 @@ def create_raw(ks):
     wa(STAGE2BIN, 1)
     wa(KERNELBIN, KERNEL_LBA_START)
 
-    # Build FAT32 data partition and append it
+    # Build FAT32 data partition y appendar
     part_sectors = _build_data_part(ks)
     part_data = DATA_PART_IMG.read_bytes()
     with open(DISK_IMG, "r+b") as f:
@@ -668,23 +818,6 @@ def create_ventoy_sim():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [FIX-SINGLE-ISO]  Una sola ISO dual BIOS+UEFI para todos los entornos
-#
-# Estrategia:
-#   El Torito entrada BIOS: no-emul, carga boot_cd.img (portix.img),
-#     con -boot-info-table → xorriso parcha [0x7C0C] con el LBA del
-#     boot image en el CD → stage2 v9.9 detecta CD por BIT, no INT 13h/48h.
-#
-#   El Torito entrada EFI:  no-emul, carga efi.img (ESP FAT32 64 MB),
-#     contiene /EFI/BOOT/BOOTX64.EFI → firmware UEFI lo ejecuta directamente.
-#
-# Con xorriso 1.5.x la sintaxis es:
-#   -b boot/boot_cd.img -no-emul-boot -boot-load-size <N> -boot-info-table
-#   -eltorito-alt-boot
-#   -b efi.img -no-emul-boot
-#
-# La ISO resultante tiene:
-#   Sector 0 (LBA 0 del ISO): System Area (MBR nulo + descriptor)
-#   BIT parchado en offset 0x08 del boot image → stage2 lo lee en [0x7C0C]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _xorriso_path():
@@ -693,7 +826,6 @@ def _xorriso_path():
 def _genisoimage_path():
     return find_tool("genisoimage","mkisofs")
 
-# ═══════════════ ISO dual BIOS+UEFI ═══════════════
 def _try_xorriso_dual():
     global _ISO_METHOD
     t = _xorriso_path()
@@ -917,7 +1049,6 @@ def run_qemu():
             ] + persist_drive + base)
 
     def iso_uefi():
-        """QEMU con OVMF usando portix.iso (entrada EFI embebida)."""
         ovmf = find_ovmf()
         if not ovmf:
             log("[ERROR] OVMF no encontrado."); return
@@ -938,7 +1069,6 @@ def run_qemu():
         ] + persist_drive + base)
 
     def uefi():
-        """QEMU con OVMF usando portix-uefi.img (disco GPT+ESP)."""
         ovmf = find_ovmf()
         if not ovmf:
             log("[ERROR] OVMF no encontrado.")
@@ -961,7 +1091,7 @@ def run_qemu():
 
     dispatch = {
         "iso":        iso,
-        "iso-uefi":   iso_uefi,   # [FIX-SINGLE-ISO] QEMU+OVMF con portix.iso
+        "iso-uefi":   iso_uefi,
         "ventoy-sim": vsim,
         "uefi":       uefi,
         "dual":       dual,
@@ -1069,10 +1199,6 @@ def main():
     check_tools()
 
     assemble_boot()
-    # Two-pass stage2: placeholder first, then real KERNEL_SECTORS after kernel is built.
-    # This resolves the circular dependency: stage2.bin needs KERNEL_SECTORS, but the
-    # kernel (which embeds stage2.bin via include_bytes!) determines KERNEL_SECTORS.
-    # Generate the ring-3 hello.elf first (needed by kernel's include_bytes!)
     run(["python", str(ROOT / "scripts" / "mkhello.py")])
     assemble_stage2(1)
     ks = build_kernel()

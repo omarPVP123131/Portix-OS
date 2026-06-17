@@ -65,6 +65,10 @@ const KERNEL_BASE: usize = 0xFFFF_8000_0000_0000;
 
 pub(crate) fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) -> Result<(), &'static str> {
     let hdr: &Elf64Header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
+    let phdr_end = (hdr.e_phoff as usize)
+        .checked_add(hdr.e_phnum as usize * core::mem::size_of::<Elf64Phdr>())
+        .ok_or("phdr overflow")?;
+    if phdr_end > data.len() { return Err("phdr beyond EOF"); }
     let phdr_slice = unsafe {
         let ptr = data.as_ptr().add(hdr.e_phoff as usize);
         core::slice::from_raw_parts(ptr as *const Elf64Phdr, hdr.e_phnum as usize)
@@ -78,12 +82,9 @@ pub(crate) fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) ->
         let filesz = phdr.p_filesz as usize;
         let offset = phdr.p_offset as usize;
 
-        if vaddr + memsz > KERNEL_BASE {
+        let seg_end = vaddr.checked_add(memsz).ok_or("segment size overflow")?;
+        if seg_end >= KERNEL_BASE {
             return Err("segment extends into kernel space");
-        }
-
-        if vaddr + memsz < vaddr {
-            return Err("segment size overflow");
         }
 
         let vaddr_page = paging::page_align_down(vaddr);
@@ -105,6 +106,9 @@ pub(crate) fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) ->
                 let dst_off = page_seg_start - page_va;
                 let src_off = offset + (page_seg_start - vaddr);
                 let n = page_seg_end - page_seg_start;
+                if src_off.checked_add(n).ok_or("seg copy overflow")? > data.len() {
+                    return Err("segment data beyond ELF");
+                }
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         data.as_ptr().add(src_off),
@@ -125,8 +129,10 @@ pub(crate) fn load_segments_into_cr3(cr3: u64, data: &[u8], info: &ElfLoader) ->
             }
         }
 
-        if (vaddr + memsz) as u64 > info.total_size {
-            // not reached since we compute total_size upfront
+        if let Some(seg_end_addr) = vaddr.checked_add(memsz) {
+            if (seg_end_addr as u64) > info.total_size {
+                // not reached since we compute total_size upfront
+            }
         }
     }
 
@@ -145,6 +151,10 @@ fn parse_elf(data: &[u8]) -> Result<ElfLoader, &'static str> {
     let mut load_end: u64 = 0;
     let mut seg_count = 0usize;
 
+    let phdr_end_off = (hdr.e_phoff as usize)
+        .checked_add(hdr.e_phnum as usize * core::mem::size_of::<Elf64Phdr>())
+        .ok_or("phdr overflow")?;
+    if phdr_end_off > data.len() { return Err("phdr beyond EOF"); }
     let phdr_slice = unsafe {
         let ptr = data.as_ptr().add(hdr.e_phoff as usize);
         core::slice::from_raw_parts(ptr as *const Elf64Phdr, hdr.e_phnum as usize)
@@ -170,25 +180,27 @@ pub fn elf_load_raw(data: &[u8]) -> Result<ElfLoader, &'static str> {
 }
 
 pub fn elf_load(path: &str) -> Result<ElfLoader, &'static str> {
-    let drive = registry::get_device(0).ok_or("no device 0")?;
-    let mut vol = Fat32Volume::mount(drive).map_err(|_| "mount failed")?;
-    let root = vol.root_cluster();
+    registry::with_device(0, |d| {
+        let drive = d.ok_or("no device 0")?;
+        let mut vol = Fat32Volume::mount(drive).map_err(|_| "mount failed")?;
+        let root = vol.root_cluster();
 
-    let (dir_cluster, filename) = resolve_path(&mut vol, root, path)?;
-    let entry = vol.find_entry(dir_cluster, filename).map_err(|_| "file not found")?;
+        let (dir_cluster, filename) = resolve_path(&mut vol, root, path)?;
+        let entry = vol.find_entry(dir_cluster, filename).map_err(|_| "file not found")?;
 
-    if entry.is_dir {
-        return Err("is a directory");
-    }
+        if entry.is_dir {
+            return Err("is a directory");
+        }
 
-    let file_size = entry.size as usize;
-    let mut file_data = alloc::vec![0u8; file_size];
-    let read = vol.read_file(&entry, &mut file_data).map_err(|_| "read failed")?;
-    if read != file_size {
-        return Err("short read");
-    }
+        let file_size = entry.size as usize;
+        let mut file_data = alloc::vec![0u8; file_size];
+        let read = vol.read_file(&entry, &mut file_data).map_err(|_| "read failed")?;
+        if read != file_size {
+            return Err("short read");
+        }
 
-    elf_load_raw(&file_data)
+        elf_load_raw(&file_data)
+    })
 }
 
 pub(crate) fn resolve_path<'p>(

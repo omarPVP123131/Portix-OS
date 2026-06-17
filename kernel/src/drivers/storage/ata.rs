@@ -310,9 +310,7 @@ impl Channel {
         Ok(())
     }
 
-    unsafe fn identify(&self, is_slave: bool) -> Option<[u16; 256]> {
-        self.reset_and_init();
-
+    unsafe fn identify_no_reset(&self, is_slave: bool) -> Option<[u16; 256]> {
         let head = if is_slave { 0xB0u8 } else { 0xA0u8 };
         self.outb(reg::DRIVE_HEAD, head);
         self.delay400ns();
@@ -585,8 +583,12 @@ impl AtaBus {
         let mut drives = [None; 4];
         let mut count  = 0;
 
+        // Un soft-reset por canal (no por drive) para no matar el bus ATA
+        unsafe { PRIMARY.reset_and_init(); }
+        unsafe { SECONDARY.reset_and_init(); }
+
         for (id, chan, is_slave) in slots {
-            if let Some(words) = unsafe { chan.identify(is_slave) } {
+            if let Some(words) = unsafe { chan.identify_no_reset(is_slave) } {
                 drives[id as usize] = Some(parse_identify(words, id));
                 count += 1;
             }

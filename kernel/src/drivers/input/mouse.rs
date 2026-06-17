@@ -243,12 +243,7 @@ pub fn feed(&mut self, byte: u8) -> bool {
             // Byte 3: delta Z (wheel) para IntelliMouse
             self.pkt_idx = 0;
             // Guardar scroll delta para procesamiento posterior
-            let flags = self.pkt[0];
-            let dz: i32 = if flags & 0x10 != 0 { // Reutiliza bit de signo X para Z (simplificado)
-                (byte as i32) - 256
-            } else {
-                byte as i32
-            };
+            let dz: i32 = byte as i8 as i32;
             self.scroll_delta = dz;
             self.process()
         }
@@ -300,7 +295,8 @@ pub fn init(&mut self, sw: usize, sh: usize) -> bool {
         // 2. Leer CCB y activar IRQ12 + aux clock (bit 1=IRQ12, bit 5=aux clock)
         if !wait_write() { serial::log("MS", "FAIL: CCB read WW"); return false; }
         outb(PS2_CMD, 0x20);
-        let ccb = if wait_read() { inb(PS2_DATA) } else { 0x47 };
+        if !wait_read() { serial::log("MS", "FAIL: CCB read timeout"); return false; }
+        let ccb = inb(PS2_DATA);
         serial::write_str("[MS] CCB=");
         serial::write_hex(ccb as usize);
         serial::write_str("\n");
@@ -380,52 +376,7 @@ pub fn init(&mut self, sw: usize, sh: usize) -> bool {
     true
 }
 
-    unsafe fn try_send_mouse_cmd(cmd: u8) -> bool {
-        macro_rules! inb {
-            ($port:expr) => {{
-                let v: u8;
-                core::arch::asm!("in al, dx", out("al") v, in("dx") $port,
-                                 options(nostack, nomem));
-                v
-            }}
-        }
-        macro_rules! io_wait { () => {
-            core::arch::asm!("out 0x80, al", in("al") 0u8, options(nostack, nomem));
-        }}
-        let mut st: u8;
-        // Wait for IBF=0
-        loop {
-            st = inb!(0x64u16);
-            if st & 0x02 == 0 { break; }
-            io_wait!();
-        }
-        core::arch::asm!("out dx, al", in("dx") 0x64u16, in("al") 0xD4u8,
-                         options(nostack, nomem));
-        loop {
-            st = inb!(0x64u16);
-            if st & 0x02 == 0 { break; }
-            io_wait!();
-        }
-        core::arch::asm!("out dx, al", in("dx") 0x60u16, in("al") cmd,
-                         options(nostack, nomem));
-        // Wait for response (may timeout in QEMU)
-        for _ in 0..50000 {
-            st = inb!(0x64u16);
-            if st & 0x01 != 0 {
-                let b: u8;
-                core::arch::asm!("in al, dx", out("al") b, in("dx") 0x60u16,
-                                 options(nostack, nomem));
-                return b == 0xFA;
-            }
-            io_wait!();
-        }
-        false
-    }
 
-    unsafe fn try_send_mouse_cmd_with_arg(cmd: u8, arg: u8) -> bool {
-        Self::try_send_mouse_cmd(cmd) &&
-        Self::try_send_mouse_cmd(arg)
-    }
 
     /// Read ANY byte from output buffer (no AUXB filter), with timeout.
     /// Returns 0xFF on timeout.

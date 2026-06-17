@@ -335,7 +335,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
     // Estrategia: LocateHandleBuffer encuentra TODOS los handles GOP,
     //             fallback a ConsoleOutHandle si no se encuentra ninguno.
     let locate_hb_gop: FnLocateHandleBuffer = bs_call(bs, 312);
-    let open_proto_gop: FnOpenProto = bs_call(bs, 288);
+    let open_proto_gop: FnOpenProto = bs_call(bs, 280);
     let free_pool_gop: FnFreePool = bs_call(bs, 72);
 
     let mut candidates: [EfiHandle; 8] = [core::ptr::null_mut(); 8];
@@ -518,7 +518,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
         data1: 0x964E5B21, data2: 0x6459, data3: 0x11D2,
         data4: [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
     };
-    let open_proto: FnOpenProto = bs_call(bs, 288);
+    let open_proto: FnOpenProto = bs_call(bs, 280);
     let allocate_pool: FnAllocPool = bs_call(bs, 64);
     let free_pool: FnFreePool = bs_call(bs, 72);
     let allocate_pages: FnAllocPages = bs_call(bs, 40);

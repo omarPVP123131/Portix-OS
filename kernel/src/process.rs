@@ -161,12 +161,11 @@ impl Process {
     }
 }
 
-fn alloc_pid() -> Option<u64> {
-    PROCESS_TABLE.lock().alloc_pid()
-}
-
-fn find_slot() -> Option<usize> {
-    PROCESS_TABLE.lock().find_slot()
+fn alloc_slot_and_pid() -> Option<(usize, u64)> {
+    let mut guard = PROCESS_TABLE.lock();
+    let slot = guard.find_slot()?;
+    let pid = guard.alloc_pid()?;
+    Some((slot, pid))
 }
 
 pub fn current_process() -> Option<&'static mut Process> {
@@ -192,8 +191,8 @@ pub fn process_create(entry: u64, name: &str) -> Option<u64> {
 }
 
 pub fn process_create_into(cr3: u64, entry: u64, name: &str) -> Option<u64> {
-    let slot = find_slot()?;
-    let pid = alloc_pid()?;
+    if entry as usize >= USER_STACK_TOP { return None; }
+    let (slot, pid) = alloc_slot_and_pid()?;
 
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, PAGE_SIZE).ok()?;
     let ks_ptr = unsafe { alloc::alloc::alloc_zeroed(ks_layout) };
@@ -267,20 +266,37 @@ pub fn process_create_into(cr3: u64, entry: u64, name: &str) -> Option<u64> {
 }
 
 pub fn set_current(pid: u64) -> Option<()> {
-    let proc = process_by_pid(pid)?;
-    {
-        let guard = PROCESS_TABLE.lock();
+    let guard = PROCESS_TABLE.lock();
+    let target = {
+        let mut t: *mut Process = core::ptr::null_mut();
         for p in &guard.processes {
             unsafe {
                 let pp = p.as_ptr() as *mut Process;
-                if (*pp).state == ProcessState::Running {
-                    (*pp).state = ProcessState::Ready;
+                if (*pp).pid == pid && (*pp).state != ProcessState::Dead {
+                    t = pp;
+                    break;
                 }
             }
         }
+        t
+    };
+    if target.is_null() {
+        drop(guard);
+        return None;
     }
-    proc.state = ProcessState::Running;
-    set_tss_rsp0(proc.kernel_stack_top as u64);
+    for p in &guard.processes {
+        unsafe {
+            let pp = p.as_ptr() as *mut Process;
+            if (*pp).state == ProcessState::Running {
+                (*pp).state = ProcessState::Ready;
+            }
+        }
+    }
+    unsafe {
+        (*target).state = ProcessState::Running;
+        set_tss_rsp0((*target).kernel_stack_top as u64);
+    }
+    drop(guard);
     serial::write_str("PROC: set_current PID=");
     serial::write_usize(pid as usize);
     serial::write_str("\n");
@@ -288,28 +304,51 @@ pub fn set_current(pid: u64) -> Option<()> {
 }
 
 pub fn process_exit(pid: u64, code: i32) {
-    let slot = pid_to_slot(pid);
-    let proc = match process_by_pid(pid) {
-        Some(p) => p,
-        None => {
+    let guard = PROCESS_TABLE.lock();
+    let (cr3, ks_base, us_phys, slot) = {
+        let mut ptr: *mut Process = core::ptr::null_mut();
+        let mut sl = None;
+        for (i, p) in guard.processes.iter().enumerate() {
+            unsafe {
+                let pp = p.as_ptr() as *mut Process;
+                if (*pp).pid == pid && (*pp).state != ProcessState::Dead {
+                    ptr = pp;
+                    sl = Some(i);
+                    break;
+                }
+            }
+        }
+        if ptr.is_null() {
+            drop(guard);
             serial::write_str("PROC: exit unknown PID=");
             serial::write_usize(pid as usize);
             serial::write_str("\n");
             return;
         }
+        unsafe {
+            serial::write_str("PROC: exit PID=");
+            serial::write_usize(pid as usize);
+            serial::write_str(" name='");
+            serial::write_str((*ptr).name_str());
+            serial::write_str("' code=");
+            serial::write_usize(code as usize);
+            serial::write_str("\n");
+
+            let cr3_val = (*ptr).cr3;
+            let ks_val = (*ptr).kernel_stack_base;
+            let us_val = (*ptr).user_stack_phys;
+
+            (*ptr).state = ProcessState::Dead;
+            (*ptr).pid = 0;
+            (*ptr).cr3 = 0;
+            (*ptr).kernel_stack_base = 0;
+            (*ptr).kernel_stack_top = 0;
+            (*ptr).user_stack_phys = 0;
+
+            (cr3_val, ks_val, us_val, sl)
+        }
     };
-
-    serial::write_str("PROC: exit PID=");
-    serial::write_usize(pid as usize);
-    serial::write_str(" name='");
-    serial::write_str(proc.name_str());
-    serial::write_str("' code=");
-    serial::write_usize(code as usize);
-    serial::write_str("\n");
-
-    let cr3 = proc.cr3;
-    let ks_base = proc.kernel_stack_base;
-    let us_phys = proc.user_stack_phys;
+    drop(guard);
 
     if let Some(s) = slot {
         crate::ipc::cleanup_process(s);
@@ -340,13 +379,6 @@ pub fn process_exit(pid: u64, code: i32) {
     if cr3 != 0 && cr3 != paging::read_cr3() {
         paging::free_address_space(cr3);
     }
-
-    proc.state = ProcessState::Dead;
-    proc.pid = 0;
-    proc.cr3 = 0;
-    proc.kernel_stack_base = 0;
-    proc.kernel_stack_top = 0;
-    proc.user_stack_phys = 0;
 }
 
 // ── FD helpers ───────────────────────────────────────────────────────────
@@ -359,6 +391,12 @@ pub fn fd_alloc(proc: &mut Process, entry: FdEntry) -> Option<usize> {
         }
     }
     None
+}
+
+pub fn fd_alloc_at(proc: &mut Process, fd: usize, entry: FdEntry) -> Option<usize> {
+    if fd >= MAX_FDS { return None; }
+    proc.fds[fd] = Some(entry);
+    Some(fd)
 }
 
 pub fn fd_get(proc: &Process, fd: usize) -> Option<&FdEntry> {
@@ -471,6 +509,15 @@ pub unsafe fn pick_next_ready() -> *mut Process {
     for _ in 0..MAX_PROCS {
         let ptr = guard.processes[start].as_ptr() as *mut Process;
         if (*ptr).state == ProcessState::Ready && (*ptr).pid != current_pid {
+            return ptr;
+        }
+        start = (start + 1) % MAX_PROCS;
+    }
+    // Fallback: return current process even if Blocked, so schedule_tick
+    // doesn't lose the CPU if no other ready process exists.
+    for _ in 0..MAX_PROCS {
+        let ptr = guard.processes[start].as_ptr() as *mut Process;
+        if (*ptr).pid == current_pid {
             return ptr;
         }
         start = (start + 1) % MAX_PROCS;

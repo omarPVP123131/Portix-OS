@@ -18,12 +18,9 @@ impl<'a> FileHandle<'a> {
         if self.eof() { return Ok(0); }
         let to_read = buf.len().min((self.entry.size - self.pos) as usize);
         if to_read == 0 { return Ok(0); }
-        let mut tmp = vec![0u8; self.entry.size as usize];
-        self.vol.read_file(&self.entry, &mut tmp)?;
-        let start = self.pos as usize;
-        buf[..to_read].copy_from_slice(&tmp[start..start + to_read]);
-        self.pos += to_read as u32;
-        Ok(to_read)
+        let n = self.vol.read_file_at(&self.entry, self.pos as usize, &mut buf[..to_read])?;
+        self.pos += n as u32;
+        Ok(n)
     }
 
     pub fn write(&mut self, buf: &[u8]) -> Result<(), FatError> {

@@ -16,16 +16,23 @@ fn alloc_page() -> Option<usize> {
 }
 
 fn verify_user_buffer(buf: usize, len: usize) -> bool {
+    if buf == 0 { return false; }
+    if buf >= crate::process::USER_STACK_TOP { return false; }
     let end = buf.checked_add(len);
     match end {
-        Some(e) => e < crate::process::USER_STACK_TOP,
+        Some(e) => e < crate::process::USER_STACK_TOP && e > buf,
         None => false,
     }
 }
 
 fn verify_user_string(ptr: usize, max_len: usize) -> bool {
-    // Verificamos el acceso al primer carácter y al último posible
-    verify_user_buffer(ptr, 1) && verify_user_buffer(ptr, max_len)
+    if ptr == 0 { return false; }
+    if ptr >= crate::process::USER_STACK_TOP { return false; }
+    let end = ptr.checked_add(max_len);
+    match end {
+        Some(e) => e < crate::process::USER_STACK_TOP && e > ptr,
+        None => false,
+    }
 }
 
 pub const SYS_EXIT:   u64 = 0;
@@ -100,6 +107,11 @@ extern "C" fn syscall_dispatch(
 
 fn sys_exit(_status: usize) -> ! {
     serial::write_str("[R3] SYS_EXIT called\n");
+    if let Some(proc) = process::current_process() {
+        for i in 0..process::MAX_FDS {
+            process::fd_close(proc, i);
+        }
+    }
     unsafe { ring3_exit_trampoline(); }
     unreachable!()
 }
@@ -288,36 +300,29 @@ fn sys_read(fd: i32, buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
 
 fn sys_read_file(fd: i32, buf: usize, count: usize, info: OpenFileInfo) -> Result<i64, ()> {
     if info.pos >= info.size { return Ok(0); }
-    let to_read = (count as u32).min(info.size - info.pos) as usize;
+    let to_read = (count as u32).min(info.size - info.pos).min(65536) as usize;
     if to_read == 0 { return Ok(0); }
 
     let mut kbuf = alloc::vec![0u8; to_read];
-    let drive = registry::get_device(0).ok_or(())?;
-    let mut vol = Fat32Volume::mount(drive).map_err(|_| ())?;
+    let n = registry::with_device(0, |d| -> Result<usize, ()> {
+        let drive = d.ok_or(())?;
+        let mut vol = Fat32Volume::mount(drive).map_err(|_| ())?;
+        let entry = DirEntryInfo {
+            name:       info.name,
+            name_len:   info.name_len,
+            is_dir:     false,
+            size:       info.size,
+            cluster:    info.cluster,
+            dir_sector: 0,
+            dir_offset: 0,
+        };
+        let n = vol.read_file_at(&entry, info.pos as usize, &mut kbuf).map_err(|_| ())?;
+        Ok(n)
+    })?;
 
-    let entry = DirEntryInfo {
-        name:       info.name,
-        name_len:   info.name_len,
-        is_dir:     false,
-        size:       info.size,
-        cluster:    info.cluster,
-        dir_sector: 0,
-        dir_offset: 0,
-    };
-
-    let full_data = {
-        let mut tmp = alloc::vec![0u8; info.size as usize];
-        vol.read_file(&entry, &mut tmp).map_err(|_| ())?;
-        tmp
-    };
-    drop(vol);
-
-    let start = info.pos as usize;
-    let end   = (start + to_read).min(full_data.len());
-    let n     = end - start;
-    kbuf[..n].copy_from_slice(&full_data[start..end]);
-
-    paging::copy_to_user(buf, &kbuf[..n]).map_err(|_| ())?;
+    if n > 0 {
+        paging::copy_to_user(buf, &kbuf[..n]).map_err(|_| ())?;
+    }
 
     if let Some(proc) = process::current_process() {
         if let Some(fd_entry) = process::fd_get_mut(proc, fd as usize) {
@@ -377,36 +382,36 @@ fn sys_read_stdin(buf: usize, count: usize, current_rsp: u64) -> (i64, u64) {
     unsafe {
         // ── Fase 1: bombear scancodes → chars hasta tener al menos uno ──
         loop {
-            // Drena todos los scancodes disponibles en el ring buffer de IRQ1
-            loop {
-                match pop_ring3_scancode() {
-                    Some(sc) => {
-                        let mut guard = STDIN.lock();
-                        if let Some(key) = guard.kbd.feed_byte(sc) {
-                            let ch: u8 = match key {
-                                Key::Char(c)  => c,
-                                Key::Enter    => b'\n',
-                                Key::Backspace => 0x08,
-                                Key::Tab      => b'\t',
-                                _             => 0,
-                            };
-                            if ch != 0 {
-                                let h = guard.head;
-                                let next = (h + 1) % guard.buf.len();
-                                if next != guard.tail {
-                                    guard.buf[h] = ch;
-                                    guard.head = next;
+            // Adquiere el lock UNA VEZ para drenar todos los scancodes,
+            // protegiendo secuencias multi-byte (0xE0, 0xE1) contra
+            // interleaving de otros procesos.
+            {
+                let mut guard = STDIN.lock();
+                loop {
+                    match pop_ring3_scancode() {
+                        Some(sc) => {
+                            if let Some(key) = guard.kbd.feed_byte(sc) {
+                                let ch: u8 = match key {
+                                    Key::Char(c)  => c,
+                                    Key::Enter    => b'\n',
+                                    Key::Backspace => 0x08,
+                                    Key::Tab      => b'\t',
+                                    _             => 0,
+                                };
+                                if ch != 0 {
+                                    let h = guard.head;
+                                    let next = (h + 1) % guard.buf.len();
+                                    if next != guard.tail {
+                                        guard.buf[h] = ch;
+                                        guard.head = next;
+                                    }
                                 }
                             }
                         }
+                        None => break,
                     }
-                    None => break,
                 }
-            }
 
-            // Si hay caracteres disponibles, salir del loop de espera
-            {
-                let guard = STDIN.lock();
                 if guard.head != guard.tail { break; }
             }
 
@@ -490,66 +495,67 @@ fn sys_open(path_ptr: usize, _flags: u32) -> i64 {
     serial::write_str(path);
     serial::write_str("'\n");
 
-    let drive = match registry::get_device(0) {
-        Some(d) => d,
-        None    => { serial::write_str("[SYS] OPEN: no device\n"); return -1; }
-    };
-    let mut vol = match Fat32Volume::mount(drive) {
-        Ok(v)   => v,
-        Err(_)  => { serial::write_str("[SYS] OPEN: mount failed\n"); return -1; }
-    };
+    return registry::with_device(0, |d| {
+        let drive = match d {
+            Some(d) => d,
+            None => { serial::write_str("[SYS] OPEN: no device\n"); return -1i64; }
+        };
+        let mut vol = match Fat32Volume::mount(drive) {
+            Ok(v) => v,
+            Err(_) => { serial::write_str("[SYS] OPEN: mount failed\n"); return -1i64; }
+        };
 
-    let root = vol.root_cluster();
-    let mut bufs = [[0u8; 64]; 16];
-    let mut lens = [0usize; 16];
-    let n = vfs::path_split(path, &mut bufs, &mut lens);
-    if n == 0 {
-        serial::write_str("[SYS] OPEN: empty path\n");
-        return -1;
-    }
+        let root = vol.root_cluster();
+        let mut bufs = [[0u8; 64]; 16];
+        let mut lens = [0usize; 16];
+        let n = vfs::path_split(path, &mut bufs, &mut lens);
+        if n == 0 {
+            serial::write_str("[SYS] OPEN: empty path\n");
+            return -1i64;
+        }
 
-    let mut cur = root;
-    for i in 0..n {
-        let comp = vfs::component_str(&bufs, &lens, i);
-        if i == n - 1 {
-            let entry = match vol.find_entry(cur, comp) {
-                Ok(e)  => e,
-                Err(_) => { serial::write_str("[SYS] OPEN: not found\n"); return -1; }
-            };
-            if entry.is_dir {
-                serial::write_str("[SYS] OPEN: is a directory\n");
-                return -1;
-            }
-            let info = OpenFileInfo {
-                dir_cluster: cur,
-                cluster:     entry.cluster,
-                size:        entry.size,
-                pos:         0,
-                name:        entry.name,
-                name_len:    entry.name_len,
-            };
-            drop(vol);
-            let fd_entry = FdEntry { fd_type: FdType::File(info) };
-            if let Some(proc) = process::current_process() {
-                match process::fd_alloc(proc, fd_entry) {
-                    Some(fd) => {
-                        serial::write_str("[SYS] OPEN → fd=");
-                        serial::write_usize(fd);
-                        serial::write_str("\n");
-                        return fd as i64;
+        let mut cur = root;
+        for i in 0..n {
+            let comp = vfs::component_str(&bufs, &lens, i);
+            if i == n - 1 {
+                let entry = match vol.find_entry(cur, comp) {
+                    Ok(e) => e,
+                    Err(_) => { serial::write_str("[SYS] OPEN: not found\n"); return -1i64; }
+                };
+                if entry.is_dir {
+                    serial::write_str("[SYS] OPEN: is a directory\n");
+                    return -1i64;
+                }
+                let info = OpenFileInfo {
+                    dir_cluster: cur,
+                    cluster: entry.cluster,
+                    size: entry.size,
+                    pos: 0,
+                    name: entry.name,
+                    name_len: entry.name_len,
+                };
+                let fd_entry = FdEntry { fd_type: FdType::File(info) };
+                if let Some(proc) = process::current_process() {
+                    match process::fd_alloc(proc, fd_entry) {
+                        Some(fd) => {
+                            serial::write_str("[SYS] OPEN → fd=");
+                            serial::write_usize(fd);
+                            serial::write_str("\n");
+                            return fd as i64;
+                        }
+                        None => { serial::write_str("[SYS] OPEN: no free fd\n"); return -1i64; }
                     }
-                    None => { serial::write_str("[SYS] OPEN: no free fd\n"); return -1; }
+                }
+                return -1i64;
+            } else {
+                match vol.find_entry(cur, comp) {
+                    Ok(e) if e.is_dir => cur = e.cluster,
+                    _ => { serial::write_str("[SYS] OPEN: path component not found\n"); return -1i64; }
                 }
             }
-            return -1;
-        } else {
-            match vol.find_entry(cur, comp) {
-                Ok(e) if e.is_dir => cur = e.cluster,
-                _ => { serial::write_str("[SYS] OPEN: path component not found\n"); return -1; }
-            }
         }
-    }
-    -1
+        -1i64
+    });
 }
 
 // ── RamFS helpers (Phase 10) ──────────────────────────────────────────
@@ -768,8 +774,7 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
         None => return -1,
     };
 
-    process::fd_close(proc, newfd as usize);
-    process::fd_alloc(proc, src);
+    let _ = process::fd_alloc_at(proc, newfd as usize, src);
 
     serial::write_str("[SYS] DUP2 oldfd=");
     serial::write_usize(oldfd as usize);
@@ -816,6 +821,14 @@ fn sys_brk(addr: usize) -> i64 {
             if paging::map_page_user(cr3, vaddr, paddr).is_err() {
                 return proc.program_break as i64;
             }
+        }
+    } else if new_brk < current_end {
+        let unmap_start = (new_brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let unmap_end = (current_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let mut vaddr = unmap_start;
+        while vaddr < unmap_end {
+            let _ = paging::unmap_page(cr3, vaddr);
+            vaddr += PAGE_SIZE;
         }
     } else if new_brk < process::PROGRAM_BREAK_BASE {
         return -1;
@@ -915,33 +928,36 @@ fn sys_getdents(path_ptr: usize, buf: usize, count: usize) -> i64 {
         return sys_getdents_devfs(path, buf, count);
     }
 
-    let drive = match registry::get_device(0) {
-        Some(d) => d,
-        None => return -1,
-    };
-    let mut vol = match Fat32Volume::mount(drive) {
-        Ok(v) => v,
-        Err(_) => return -1,
-    };
-    let root = vol.root_cluster();
-    let dir_clus = match resolve_dir_cluster(path, &mut vol, root) {
-        Ok(c) => c,
-        Err(_) => return -1,
-    };
-
     #[derive(Clone)]
     struct DirEntry {
         name: [u8; 256],
         name_len: usize,
         is_dir: bool,
     }
-    let mut entries: alloc::vec::Vec<DirEntry> = alloc::vec::Vec::new();
-    let _ = vol.list_dir(dir_clus, |e| {
-        entries.push(DirEntry {
-            name: e.name,
-            name_len: e.name_len,
-            is_dir: e.is_dir,
+    let entries: alloc::vec::Vec<DirEntry> = registry::with_device(0, |d| {
+        let drive = match d {
+            Some(d) => d,
+            None => return alloc::vec::Vec::new(),
+        };
+        let mut vol = match Fat32Volume::mount(drive) {
+            Ok(v) => v,
+            Err(_) => return alloc::vec::Vec::new(),
+        };
+        let root = vol.root_cluster();
+        let dir_clus = match resolve_dir_cluster(path, &mut vol, root) {
+            Ok(c) => c,
+            Err(_) => return alloc::vec::Vec::new(),
+        };
+
+        let mut entries: alloc::vec::Vec<DirEntry> = alloc::vec::Vec::new();
+        let _ = vol.list_dir(dir_clus, |e| {
+            entries.push(DirEntry {
+                name: e.name,
+                name_len: e.name_len,
+                is_dir: e.is_dir,
+            });
         });
+        entries
     });
 
     let mut total = 0usize;
@@ -1016,36 +1032,36 @@ fn sys_execve(path_ptr: usize, argv: usize, envp: usize, current_rsp: u64) -> Sy
     serial::write_str("'\n");
 
     // 2. Read ELF file from FAT32
-    let file_data = {
-        let drive = match registry::get_device(0) {
+    let Some(file_data) = registry::with_device(0, |d| {
+        let drive = match d {
             Some(d) => d,
-            None => { serial::write_str("[EXEC] no device\n"); return SyscallResult(-1i64 as u64, 0); }
+            None => { serial::write_str("[EXEC] no device\n"); return None; }
         };
         let mut vol = match Fat32Volume::mount(drive) {
             Ok(v) => v,
-            Err(_) => { serial::write_str("[EXEC] mount failed\n"); return SyscallResult(-1i64 as u64, 0); }
+            Err(_) => { serial::write_str("[EXEC] mount failed\n"); return None; }
         };
         let root = vol.root_cluster();
         let (dir_cluster, filename) = match crate::elf::resolve_path(&mut vol, root, path) {
             Ok(r) => r,
-            Err(_) => { serial::write_str("[EXEC] path not found\n"); return SyscallResult(-1i64 as u64, 0); }
+            Err(_) => { serial::write_str("[EXEC] path not found\n"); return None; }
         };
         let entry = match vol.find_entry(dir_cluster, filename) {
             Ok(e) => e,
-            Err(_) => { serial::write_str("[EXEC] file not found\n"); return SyscallResult(-1i64 as u64, 0); }
+            Err(_) => { serial::write_str("[EXEC] file not found\n"); return None; }
         };
         if entry.is_dir {
             serial::write_str("[EXEC] is a directory\n");
-            return SyscallResult(-1i64 as u64, 0);
+            return None;
         }
         let size = entry.size as usize;
         let mut data = alloc::vec![0u8; size];
         if vol.read_file(&entry, &mut data).is_err() {
             serial::write_str("[EXEC] read failed\n");
-            return SyscallResult(-1i64 as u64, 0);
+            return None;
         }
-        data
-    };
+        Some(data)
+    }) else { return SyscallResult(-1i64 as u64, 0); };
 
     // 3. Validate and parse ELF
     let info = match crate::elf::elf_load_raw(&file_data) {
@@ -1068,9 +1084,13 @@ fn sys_execve(path_ptr: usize, argv: usize, envp: usize, current_rsp: u64) -> Sy
         return SyscallResult(-1i64 as u64, 0);
     }
 
-    // 6. Copy argv/envp from old userspace
-    let argv_strs = unsafe { copy_user_str_array(argv) };
-    let envp_strs = unsafe { copy_user_str_array(envp) };
+    // 6. Copy argv/envp from old userspace (limit to prevent stack overflow)
+    const MAX_ARGV: usize = 64;
+    const MAX_ENVP: usize = 64;
+    let mut argv_strs = unsafe { copy_user_str_array(argv) };
+    let mut envp_strs = unsafe { copy_user_str_array(envp) };
+    argv_strs.truncate(MAX_ARGV);
+    envp_strs.truncate(MAX_ENVP);
 
     // 7. Allocate and set up new user stack
     let us_size = crate::process::USER_STACK_SIZE;
@@ -1114,6 +1134,7 @@ fn sys_execve(path_ptr: usize, argv: usize, envp: usize, current_rsp: u64) -> Sy
     let mut envp_str_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     for s in &envp_strs {
         let total_len = s.len() + 1; // +1 null
+        if total_len > sp { break; }
         sp = sp.wrapping_sub(total_len);
         stack_slice[sp..sp + s.len()].copy_from_slice(s);
         stack_slice[sp + s.len()] = 0;
@@ -1124,6 +1145,7 @@ fn sys_execve(path_ptr: usize, argv: usize, envp: usize, current_rsp: u64) -> Sy
     let mut argv_str_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     for s in &argv_strs {
         let total_len = s.len() + 1;
+        if total_len > sp { break; }
         sp = sp.wrapping_sub(total_len);
         stack_slice[sp..sp + s.len()].copy_from_slice(s);
         stack_slice[sp + s.len()] = 0;
@@ -1195,7 +1217,18 @@ fn sys_execve(path_ptr: usize, argv: usize, envp: usize, current_rsp: u64) -> Sy
         paging::free_address_space(old_cr3);
     }
 
-    // 9. Modify IRET frame on current kernel stack:
+    // 9. Validate current_rsp before modifying IRET frame
+    {
+        let stack_bottom = proc.kernel_stack_base;
+        let stack_top = proc.kernel_stack_top;
+        let rsp = current_rsp as usize;
+        if rsp <= stack_bottom || rsp >= stack_top || (rsp - stack_bottom) < 256 {
+            serial::write_str("[EXEC] CRITICAL: invalid current_rsp in IRET frame\n");
+            return SyscallResult(-1i64 as u64, 0);
+        }
+    }
+
+    // 10. Modify IRET frame on current kernel stack:
     //    After PUSH_REGS (15 regs × 8 = 120 bytes), the IRET frame:
     //    [rsp+120] = RIP, [rsp+128] = CS, [rsp+136] = RFLAGS, [rsp+144] = RSP, [rsp+152] = SS
     unsafe {
@@ -1273,7 +1306,7 @@ fn sys_recv(buf: usize, len: usize, current_rsp: u64) -> (i64, u64) {
         1 => {
             if let Some(proc) = process::current_process() {
                 proc.state = process::ProcessState::Blocked;
-                proc.sleep_until = 1;
+                proc.sleep_until = 0;
             }
             let cs = saved_cs_from_rsp(current_rsp);
             let new_rsp = process::schedule_tick(current_rsp, cs);
@@ -1299,26 +1332,32 @@ fn sys_reg_irq(irq: u64, pid: u64) -> i64 {
 
 fn sys_block_read(dev_id: i32, lba: u64, count: u64, buf: u64) -> i64 {
     if buf == 0 || count == 0 { return -1; }
+    // Max 128 sectors = 64 KB (overflow-safe check antes de multiplicar)
+    if count > 128 { return -1; }
     let total_bytes = (count as usize) * 512;
-    if total_bytes > 65536 { return -1; }
 
     let mut kbuf = alloc::vec![0u8; total_bytes];
-    let drive = match crate::drivers::storage::registry::get_device(dev_id as usize) {
-        Some(d) => d,
-        None => {
-            serial::write_str("[BLK] dev not found\n");
-            return -1;
+    let n = match crate::drivers::storage::registry::with_device(dev_id as usize, |d| {
+        let drive = match d {
+            Some(d) => d,
+            None => {
+                serial::write_str("[BLK] dev not found\n");
+                return None;
+            }
+        };
+        let n = (count as usize).min(drive.total_sectors() as usize);
+        let actual_bytes = n * 512;
+        kbuf.resize(actual_bytes, 0);
+        if drive.read_sectors(lba, n, &mut kbuf).is_err() {
+            serial::write_str("[BLK] read error\n");
+            return None;
         }
+        Some(n)
+    }) {
+        Some(n) => n,
+        None => return -1,
     };
-
-    let n = (count as usize).min(drive.total_sectors() as usize);
     let actual_bytes = n * 512;
-    kbuf.resize(actual_bytes, 0);
-
-    if drive.read_sectors(lba, n, &mut kbuf).is_err() {
-        serial::write_str("[BLK] read error\n");
-        return -1;
-    }
 
     if paging::copy_to_user(buf as usize, &kbuf[..actual_bytes]).is_err() {
         return -1;
@@ -1526,32 +1565,32 @@ fn sys_read_device(fd: i32, buf: usize, count: usize, info: &process::DeviceInfo
             let total_bytes = count_sectors * 512;
             let mut kbuf = alloc::vec![0u8; total_bytes];
             // Use the internal block device directly
-            if let Some(drive) = crate::drivers::storage::registry::get_device(0) {
-                if drive.read_sectors(lba as u64, count_sectors, &mut kbuf).is_err() {
-                    return (-1, 0);
-                }
-                let offset = (pos % 512) as usize;
-                let to_copy = (total_bytes - offset).min(count);
-                if paging::copy_to_user(buf, &kbuf[offset..offset + to_copy]).is_err() {
-                    return (-1, 0);
-                }
-                // Update position
-                if let Some(proc) = process::current_process() {
-                    if let Some(fde) = process::fd_get_mut(proc, fd as usize) {
-                        if let process::FdType::Device(ref mut di) = fde.fd_type {
-                            di.pos += to_copy as u32;
-                        }
+            let offset = (pos % 512) as usize;
+            let to_copy = match crate::drivers::storage::registry::with_device(0, |d| {
+                let drive = d?;
+                drive.read_sectors(lba as u64, count_sectors, &mut kbuf).ok()?;
+                Some((total_bytes - offset).min(count))
+            }) {
+                Some(n) => n,
+                None => return (-1, 0),
+            };
+            if paging::copy_to_user(buf, &kbuf[offset..offset + to_copy]).is_err() {
+                return (-1, 0);
+            }
+            // Update position
+            if let Some(proc) = process::current_process() {
+                if let Some(fde) = process::fd_get_mut(proc, fd as usize) {
+                    if let process::FdType::Device(ref mut di) = fde.fd_type {
+                        di.pos += to_copy as u32;
                     }
                 }
-                serial::write_str("[DEV] /dev/sda0 read LBA=");
-                serial::write_usize(lba as usize);
-                serial::write_str(" bytes=");
-                serial::write_usize(to_copy);
-                serial::write_str("\n");
-                (to_copy as i64, 0)
-            } else {
-                (-1, 0)
             }
+            serial::write_str("[DEV] /dev/sda0 read LBA=");
+            serial::write_usize(lba as usize);
+            serial::write_str(" bytes=");
+            serial::write_usize(to_copy);
+            serial::write_str("\n");
+            (to_copy as i64, 0)
         }
         process::DeviceType::Fb => {
             // Reading from framebuffer: return 0 bytes

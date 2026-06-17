@@ -65,6 +65,9 @@ impl<T> Spinlock<T> {
     /// # Warning
     /// This will spin forever if the lock cannot be acquired.
     /// Do NOT hold locks for extended periods or during I/O waits.
+    /// WARNING: Does NOT disable IRQs. If an ISR acquires the same lock
+    /// while the interrupted code holds it, a deadlock will occur.
+    /// Use `lock_irqsave()` pattern from BuddyAllocator for IRQ contexts.
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
         // Spin until lock is acquired
         loop {

@@ -30,6 +30,7 @@ use crate::drivers::storage::ata::DriveType;
 use crate::drivers::storage::fat32::Fat32Volume;
 use crate::drivers::storage::mkfs;
 use crate::drivers::storage::registry;
+use alloc::boxed::Box;
 use crate::drivers::storage::traits::BlockDevice;
 
 // -- Layout del area de arranque ----------------------------------------------
@@ -141,24 +142,31 @@ fn verify_write_canary(drive: &mut dyn BlockDevice, lba: u64) -> bool {
 // -- find_hdd_target ----------------------------------------------------------
 fn find_hdd_target(requested: Option<usize>) -> Result<usize, &'static str> {
     if let Some(idx) = requested {
-        let dev = registry::get_device(idx)
-            .ok_or("El dispositivo especificado no existe.")?;
-        if dev.device_info().kind == DriveType::Atapi {
-            return Err("El dispositivo es un CD-ROM (ATAPI). El destino debe ser ATA.");
+        let valid = registry::with_device(idx, |d| {
+            let dev = d.ok_or("El dispositivo especificado no existe.")?;
+            if dev.device_info().kind == DriveType::Atapi {
+                return Err("El dispositivo es un CD-ROM (ATAPI). El destino debe ser ATA.");
+            }
+            if dev.total_sectors() < 8192 {
+                return Err("El dispositivo tiene menos de 4 MiB de capacidad.");
+            }
+            Ok(())
+        });
+        match valid {
+            Ok(()) => return Ok(idx),
+            Err(e) => return Err(e),
         }
-        if dev.total_sectors() < 8192 {
-            return Err("El dispositivo tiene menos de 4 MiB de capacidad.");
-        }
-        return Ok(idx);
     }
 
     let count = registry::device_count();
     for id in 0..count {
-        if let Some(dev) = registry::get_device(id) {
-            if dev.device_info().kind != DriveType::Atapi && dev.total_sectors() > 8192 {
-                return Ok(id);
+        let valid = registry::with_device(id, |d| {
+            match d {
+                Some(dev) if dev.device_info().kind != DriveType::Atapi && dev.total_sectors() > 8192 => true,
+                _ => false,
             }
-        }
+        });
+        if valid { return Ok(id); }
     }
     Err("No se encontro un disco duro ATA valido para instalar.")
 }
@@ -168,8 +176,8 @@ fn show_devices(t: &mut Terminal) {
     t.write_line("  Dispositivos disponibles:", LineColor::Info);
     let count = registry::device_count();
     for i in 0..count {
-        if let Some(d) = registry::get_device(i) {
-            let info   = d.device_info();
+        let info = registry::with_device(i, |d| d.map(|d| d.device_info()));
+        if let Some(info) = info {
             let kind_s = if info.kind == DriveType::Atapi { b"CD-ROM " } else { b"DISCO  " };
             let mut buf = [0u8; TERM_COLS];
             let mut pos = 0;
@@ -243,13 +251,11 @@ pub fn cmd_install(t: &mut Terminal, args: &[u8]) {
         }
     };
 
-    let hdd        = match registry::get_device(hdd_id) {
-        Some(d) => d,
-        None => {
-            t.write_line("  Error: no se pudo acceder al disco de destino.", LineColor::Error);
-            return;
-        }
+    let Some(boxed_hdd) = registry::take_device(hdd_id) else {
+        t.write_line("  Error: no se pudo acceder al disco de destino.", LineColor::Error);
+        return;
     };
+    let hdd: &'static mut dyn BlockDevice = Box::leak(boxed_hdd);
     let total_secs = hdd.total_sectors();
 
     {

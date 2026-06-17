@@ -213,6 +213,12 @@ pub fn memory_regions(info: &PortixBootInfo) -> &'static [PortixMemoryRegion] {
     {
         return &[];
     }
+    let end_offset = (info.memory_map_offset as usize)
+        .checked_add(info.memory_map_count as usize * size_of::<PortixMemoryRegion>())
+        .unwrap_or(usize::MAX);
+    if end_offset > info.total_size as usize {
+        return &[];
+    }
     unsafe {
         core::slice::from_raw_parts(
             (info as *const _ as usize + info.memory_map_offset as usize)
@@ -226,6 +232,12 @@ pub fn firmware_tables(info: &PortixBootInfo) -> &'static [FirmwareTableEntry] {
     if info.firmware_tables_offset == 0
         || info.firmware_table_entry_size as usize != size_of::<FirmwareTableEntry>()
     {
+        return &[];
+    }
+    let end_offset = (info.firmware_tables_offset as usize)
+        .checked_add(info.firmware_tables_count as usize * size_of::<FirmwareTableEntry>())
+        .unwrap_or(usize::MAX);
+    if end_offset > info.total_size as usize {
         return &[];
     }
     unsafe {

@@ -68,8 +68,8 @@ unsafe fn vbe_outw(reg: u16, val: u16) {
 
 /// Intenta inicializar/leer el modo Bochs VBE.
 /// Si VBE no está activo, lo inicializa a 1024x768x32.
-/// Devuelve (width, height, bpp) o (0,0,0) si falla.
-fn bochs_vbe_setup() -> (u32, u32, u32) {
+/// Devuelve (width, height, bpp, pitch_bytes) o (0,0,0,0) si falla.
+fn bochs_vbe_setup() -> (u32, u32, u32, u32) {
     unsafe {
         let id = vbe_inw(0);
         let active = id == 0xB0C0 || id == 0xB0C1 || id == 0xB0C2 || id == 0xB0C3 || id == 0xB0C4;
@@ -92,10 +92,24 @@ fn bochs_vbe_setup() -> (u32, u32, u32) {
         let bpp  = vbe_inw(3) as u32;
         if xres == 0 || yres == 0 || bpp < 15 {
             serial::log("VBE", "invalid resolution after init");
-            return (0, 0, 0);
+            return (0, 0, 0, 0);
         }
+
+        // Leer stride real del HW: registro 6 = virtual width (pixels per scanline)
+        let stride_dwords = vbe_inw(6) as u32;
+        let pitch = if stride_dwords > 0 {
+            stride_dwords * 4
+        } else {
+            xres * (bpp / 8)
+        };
+
         serial::log("VBE", if active { "resolution OK (active)" } else { "resolution OK (init)" });
-        (xres, yres, bpp)
+        serial::write_str("[VBE] stride_dwords=");
+        serial::write_usize(stride_dwords as usize);
+        serial::write_str(" pitch_bytes=");
+        serial::write_usize(pitch as usize);
+        serial::write_byte(b'\n');
+        (xres, yres, bpp, pitch)
     }
 }
 
@@ -295,7 +309,7 @@ impl Framebuffer {
     pub fn new() -> Self {
         unsafe {
             let mut needs_vbe_init;
-            let (mut lfb, mut w_raw, mut h_raw, p_raw, mut bpp_raw) =
+            let (mut lfb, mut w_raw, mut h_raw, mut p_raw, mut bpp_raw) =
                 if let Some(info) = bootinfo::get() {
                     let fb = &info.framebuffer;
                     needs_vbe_init = fb.source != 1;
@@ -330,7 +344,7 @@ impl Framebuffer {
             }
 
             if needs_vbe_init && lfb != 0 {
-                let (vbe_w, vbe_h, vbe_bpp) = bochs_vbe_setup();
+                let (vbe_w, vbe_h, vbe_bpp, vbe_pitch) = bochs_vbe_setup();
                 serial::log("FB", "VBE resolution (w x h x bpp):");
                 serial::write_usize(vbe_w as usize);
                 serial::write_byte(b'x');
@@ -342,6 +356,9 @@ impl Framebuffer {
                     w_raw = vbe_w as usize;
                     h_raw = vbe_h as usize;
                     bpp_raw = vbe_bpp as u8;
+                    if vbe_pitch > 0 {
+                        p_raw = vbe_pitch as usize;
+                    }
                 } else {
                     w_raw = 1024;
                     h_raw = 768;

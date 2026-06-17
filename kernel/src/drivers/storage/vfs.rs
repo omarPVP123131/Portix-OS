@@ -93,14 +93,16 @@ pub fn component_str<'a>(bufs: &'a [[u8; 64]], lens: &[usize], idx: usize) -> &'
 }
 
 /// Construye un path: dir + "/" + name en `out`, devuelve bytes escritos.
-pub fn path_join(dir: &str, name: &str, out: &mut [u8]) -> usize {
+pub fn path_join(dir: &str, name: &str, out: &mut [u8]) -> Result<usize, ()> {
+    let needed = dir.len() + 1 + name.len();
+    if needed > out.len() { return Err(()); }
     let mut p = 0usize;
-    for &b in dir.as_bytes()  { if p < out.len() { out[p] = b; p += 1; } }
+    for &b in dir.as_bytes()  { out[p] = b; p += 1; }
     if p > 0 && out.get(p - 1) != Some(&b'/') {
-        if p < out.len() { out[p] = b'/'; p += 1; }
+        out[p] = b'/'; p += 1;
     }
-    for &b in name.as_bytes() { if p < out.len() { out[p] = b; p += 1; } }
-    p
+    for &b in name.as_bytes() { out[p] = b; p += 1; }
+    Ok(p)
 }
 
 /// Nombre base: "/home/user/foo.txt" → "foo.txt"

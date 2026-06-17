@@ -79,7 +79,7 @@ impl RamFs {
         if self.files[idx].is_dir { return Err(()); }
         let file = &mut self.files[idx];
         let start = offset as usize;
-        let end = start + data.len();
+        let end = start.checked_add(data.len()).ok_or(())?;
         if end > file.data.len() {
             file.data.resize(end, 0);
         }

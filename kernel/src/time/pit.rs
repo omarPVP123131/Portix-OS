@@ -6,7 +6,7 @@ const PIT_CMD:      u16 = 0x43;
 
 // 1_193_182 Hz / 100 = 11931 → ~100 Hz
 pub const PIT_HZ: u32 = 100;
-const PIT_DIVISOR: u16 = 11931;
+const PIT_DIVISOR: u16 = 11932;
 
 #[inline(always)]
 unsafe fn outb(port: u16, val: u8) {

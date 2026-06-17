@@ -42,6 +42,16 @@ pub fn page_align_up(x: usize) -> usize {
     (x + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
+pub const KERNEL_BASE: usize = 0xFFFF_8000_0000_0000;
+
+pub fn virt_to_phys(vaddr: usize) -> usize {
+    if vaddr >= KERNEL_BASE {
+        vaddr - KERNEL_BASE
+    } else {
+        vaddr
+    }
+}
+
 pub fn read_cr3() -> u64 {
     let v: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) v, options(nostack, nomem)) }
@@ -142,7 +152,7 @@ fn ensure_or_create(phys: usize, index: usize, user: bool) -> Option<usize> {
     let mut flags: u64 = PRESENT | WRITABLE;
     if user { flags |= USER; }
     unsafe {
-        write_entry(phys, index, new_tbl as u64 | flags);
+        write_entry(phys, index, virt_to_phys(new_tbl) as u64 | flags);
     }
     Some(new_tbl)
 }
@@ -161,7 +171,7 @@ fn split_huge_pde(pd_p: usize, pde_index: usize) -> Option<()> {
             write_entry(pt_p, i, pte);
         }
         let new_pde_flags = PRESENT | WRITABLE | ACCESSED | (pde & (USER | NO_EXECUTE));
-        write_entry(pd_p, pde_index, pt_p as u64 | new_pde_flags);
+        write_entry(pd_p, pde_index, virt_to_phys(pt_p) as u64 | new_pde_flags);
         flush_tlb();
         Some(())
     }
@@ -181,7 +191,7 @@ fn split_huge_pdpt(pdpt_p: usize, pdpt_index: usize) -> Option<()> {
             write_entry(pd_p, i, pde);
         }
         let new_pdpte_flags = PRESENT | WRITABLE | ACCESSED | (pdpte & (USER | NO_EXECUTE));
-        write_entry(pdpt_p, pdpt_index, pd_p as u64 | new_pdpte_flags);
+        write_entry(pdpt_p, pdpt_index, virt_to_phys(pd_p) as u64 | new_pdpte_flags);
         flush_tlb();
         Some(())
     }
@@ -290,7 +300,7 @@ pub fn new_address_space() -> Option<u64> {
             }
         }
     }
-    Some(new_pml4 as u64)
+    Some(virt_to_phys(new_pml4) as u64)
 }
 
 fn is_dynamic_addr(paddr: usize) -> bool {
@@ -423,24 +433,24 @@ pub fn copy_from_user(dst: &mut [u8], src: usize, count: usize) -> Result<usize,
     let saved_flags: u64;
     unsafe { core::arch::asm!("pushfq; pop {}", out(reg) saved_flags, options(nostack)); }
     unsafe { core::arch::asm!("cli", options(nostack)); }
-    let ok = is_user_range_safe(src, count);
+    let mut ok = is_user_range_safe(src, count);
     if ok {
+        set_expect_user_fault();
         unsafe {
             core::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), count);
+        }
+        let had_fault = !is_expecting_user_fault();
+        clear_expect_user_fault();
+        if had_fault {
+            ok = false;
         }
     }
     if saved_flags & 0x200 != 0 {
         unsafe { core::arch::asm!("sti", options(nostack)); }
     }
-    crate::drivers::serial::write_str("[PAGING] copy_from_user src=");
-    crate::drivers::serial::write_hex(src);
-    crate::drivers::serial::write_str(" count=");
-    crate::drivers::serial::write_usize(count);
     if ok {
-        crate::drivers::serial::write_str(" OK\n");
         Ok(count)
     } else {
-        crate::drivers::serial::write_str(" FAIL\n");
         Err(())
     }
 }
@@ -451,24 +461,24 @@ pub fn copy_to_user(dst: usize, src: &[u8]) -> Result<usize, ()> {
     let saved_flags: u64;
     unsafe { core::arch::asm!("pushfq; pop {}", out(reg) saved_flags, options(nostack)); }
     unsafe { core::arch::asm!("cli", options(nostack)); }
-    let ok = is_user_range_safe(dst, count);
+    let mut ok = is_user_range_safe(dst, count);
     if ok {
+        set_expect_user_fault();
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, count);
+        }
+        let had_fault = !is_expecting_user_fault();
+        clear_expect_user_fault();
+        if had_fault {
+            ok = false;
         }
     }
     if saved_flags & 0x200 != 0 {
         unsafe { core::arch::asm!("sti", options(nostack)); }
     }
-    crate::drivers::serial::write_str("[PAGING] copy_to_user dst=");
-    crate::drivers::serial::write_hex(dst);
-    crate::drivers::serial::write_str(" count=");
-    crate::drivers::serial::write_usize(count);
     if ok {
-        crate::drivers::serial::write_str(" OK\n");
         Ok(count)
     } else {
-        crate::drivers::serial::write_str(" FAIL\n");
         Err(())
     }
 }

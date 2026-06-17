@@ -134,7 +134,11 @@ pub fn draw_chrome(
 
     // CPU pill centrado
     let brand  = hw.cpu.brand_str();
-    let brand  = if brand.len() > 38 { &brand[..38] } else { brand };
+    let brand  = if brand.len() > 38 {
+        let mut idx = 38;
+        while !brand.is_char_boundary(idx) { idx -= 1; }
+        &brand[..idx]
+    } else { brand };
     let pill_w = brand.len() * cw + 20;
     let pill_x = fw / 2 - pill_w / 2;
     let pill_y = (hh.saturating_sub(20)) / 2;
@@ -204,7 +208,7 @@ pub fn draw_chrome(
         let fkey_w    = fkey.len() * cw;
         let label_w   = label.len() * cw;
         let content_w = fkey_w + 5 + label_w;
-        let cx = if tw > content_w + 8 { tx + (tw - content_w) / 2 } else { tx + 4 };
+        let cx = if tw > content_w + 8 { tx + (tw - content_w + 1) / 2 } else { tx + 4 };
         let cy = ty + (th - ch) / 2;
 
         let fkey_fg  = if is_act { Pal::YELLOW } else if hov { Pal::GOLD } else { Pal::BOR_WARM };

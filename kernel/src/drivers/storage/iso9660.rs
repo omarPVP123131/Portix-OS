@@ -42,20 +42,30 @@ impl<'a> Iso9660Reader<'a> {
     }
 
     fn find_recursive(
-        &mut self, dir_lba: u64, dir_size: u32, path: &[u8],
+        &mut self, mut dir_lba: u64, mut dir_size: u32, path: &[u8],
     ) -> Result<FileInfo, AtaError> {
-        if let Some(slash) = path.iter().position(|&b| b == b'/') {
-            let comp = &path[..slash];
-            let rest = &path[slash + 1..];
-            match self.find_in_dir(dir_lba, dir_size, comp)? {
-                Some(sub) if sub.is_dir => self.find_recursive(sub.lba, sub.size, rest),
-                Some(_) => Err(AtaError::DriveFault),
-                None => Err(AtaError::DriveFault),
-            }
-        } else {
-            match self.find_in_dir(dir_lba, dir_size, path)? {
-                Some(f) => Ok(f),
-                None => Err(AtaError::DriveFault),
+        let mut remaining = path;
+        let mut depth = 0u32;
+        loop {
+            if depth >= 64 { return Err(AtaError::DriveFault); }
+            depth += 1;
+
+            if let Some(slash) = remaining.iter().position(|&b| b == b'/') {
+                let comp = &remaining[..slash];
+                remaining = &remaining[slash + 1..];
+                match self.find_in_dir(dir_lba, dir_size, comp)? {
+                    Some(sub) if sub.is_dir => {
+                        dir_lba = sub.lba;
+                        dir_size = sub.size;
+                        // continue loop
+                    }
+                    _ => return Err(AtaError::DriveFault),
+                }
+            } else {
+                return match self.find_in_dir(dir_lba, dir_size, remaining)? {
+                    Some(f) => Ok(f),
+                    None => Err(AtaError::DriveFault),
+                };
             }
         }
     }

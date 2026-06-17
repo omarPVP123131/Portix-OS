@@ -101,6 +101,7 @@ pub fn write_byte(b: u8) {
     while !tx_ready() && limit > 0 {
         limit -= 1;
     }
+    if !tx_ready() { return; }
     unsafe { outb(COM1, b); }
 }
 
@@ -136,15 +137,27 @@ pub fn write_u32(mut n: u32) {
 }
 
 pub fn write_usize(n: usize) {
-    write_u32(n as u32); // suficiente para 32-bit; ampliar si se porta a 64-bit
+    if n == 0 {
+        write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0usize;
+    let mut m = n;
+    while m > 0 {
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        i += 1;
+    }
+    buf[..i].reverse();
+    write_bytes_raw(&buf[..i]);
 }
 
-/// Imprime un `usize` como `0xDEADBEEF`.
+/// Imprime un `usize` como `0xDEADBEEF` (64-bit completo en x86_64).
 pub fn write_hex(n: usize) {
     const HEX: &[u8] = b"0123456789ABCDEF";
     write_str("0x");
-    // 8 dígitos para 32-bit
-    for shift in (0..8).rev() {
+    for shift in (0..16).rev() {
         let nibble = (n >> (shift * 4)) & 0xF;
         write_byte(HEX[nibble]);
     }
@@ -169,13 +182,117 @@ pub fn log_level(level: Level, tag: &str, msg: &str) {
     write_byte(b'\n');
 }
 
+/// kprintln! — Log con nivel, tag, y archivo:línea automáticos.
+/// Uso: kprintln!(Info, "TAG", "mensaje {}", arg);
+///      kprintln!(Error, "TAG", "fallo en x={}", val);
 #[macro_export]
-macro_rules! serial_log {
-    ($lvl:ident, $tag:expr, $msg:expr) => {
+macro_rules! kprintln {
+    ($lvl:ident, $tag:expr, $msg:expr $(, $arg:expr)* $(,)?) => {{
         $crate::drivers::serial::log_level(
             $crate::drivers::serial::Level::$lvl,
             $tag,
-            $msg,
-        )
+            core::concat!(
+                $msg,
+                " [",
+                core::file!(),
+                ":",
+                core::stringify!(core::line!()),
+                "]"
+            ),
+        );
+        $( $crate::drivers::serial::write_str("  arg=");
+           $crate::drivers::serial::write_hex($arg as usize);
+           $crate::drivers::serial::write_byte(b'\n'); )*
+    }};
+}
+
+/// kassert! — Assert que logea ubicación antes de panic.
+/// Uso: kassert!(condición, "mensaje opcional");
+#[macro_export]
+macro_rules! kassert {
+    ($cond:expr $(, $msg:expr)? $(,)?) => {
+        if !$cond {
+            $crate::kprintln!(Error, "ASSERT",
+                core::concat!("FAIL: ", core::stringify!($cond) $(, ": ", $msg)?));
+            panic!(core::concat!("ASSERT FAIL: ", core::stringify!($cond)
+                $(, ": ", $msg)?));
+        }
     };
+}
+
+/// kassert_eq! — Assert con igualdad que logea ubicación.
+#[macro_export]
+macro_rules! kassert_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        if $left != $right {
+            $crate::kprintln!(Error, "ASSERT_EQ",
+                core::concat!(
+                    "FAIL: ", core::stringify!($left), " != ", core::stringify!($right)
+                ));
+            panic!(core::concat!(
+                "ASSERT_EQ FAIL: ", core::stringify!($left), " != ", core::stringify!($right)
+            ));
+        }
+    };
+}
+
+/// hexdump — Imprime `len` bytes de `data` en formato hex+ASCII por serial.
+pub fn hexdump(tag: &str, data: &[u8], len: usize) {
+    let n = len.min(data.len());
+    let mut off = 0usize;
+    while off < n {
+        let row_end = (off + 16).min(n);
+        write_str(tag);
+        write_str("  ");
+        write_hex(off);
+        write_str("  ");
+        for i in off..row_end {
+            let b = data[i];
+            const H: &[u8] = b"0123456789ABCDEF";
+            write_byte(H[(b >> 4) as usize]);
+            write_byte(H[(b & 0xF) as usize]);
+            write_byte(b' ');
+        }
+        for _ in row_end..off + 16 { write_str("   "); }
+        write_str(" |");
+        for i in off..row_end {
+            let b = data[i];
+            write_byte(if b >= 0x20 && b < 0x7F { b } else { b'.' });
+        }
+        write_str("|\n");
+        off = row_end;
+    }
+}
+
+/// dump_regs — Imprime registros en formato grid para debugging.
+pub fn dump_regs(tag: &str, rip: u64, rsp: u64, cr3: u64, gpr: &[u64; 15]) {
+    write_str("[ ");
+    write_str(tag);
+    write_str(" ] ");
+    write_str("RIP=");
+    write_hex(rip as usize);
+    write_str("  RSP=");
+    write_hex(rsp as usize);
+    write_str("  CR3=");
+    write_hex(cr3 as usize);
+    write_byte(b'\n');
+    write_str("  RAX="); write_hex(gpr[0] as usize);
+    write_str("  RBX="); write_hex(gpr[1] as usize);
+    write_str("  RCX="); write_hex(gpr[2] as usize);
+    write_str("  RDX="); write_hex(gpr[3] as usize);
+    write_byte(b'\n');
+    write_str("  RSI="); write_hex(gpr[4] as usize);
+    write_str("  RDI="); write_hex(gpr[5] as usize);
+    write_str("  RBP="); write_hex(gpr[6] as usize);
+    write_str("  R08="); write_hex(gpr[7] as usize);
+    write_byte(b'\n');
+    write_str("  R09="); write_hex(gpr[8] as usize);
+    write_str("  R10="); write_hex(gpr[9] as usize);
+    write_str("  R11="); write_hex(gpr[10] as usize);
+    write_str("  R12="); write_hex(gpr[11] as usize);
+    write_byte(b'\n');
+    write_str("  R13="); write_hex(gpr[12] as usize);
+    write_str("  R14="); write_hex(gpr[13] as usize);
+    write_str("  R15="); write_hex(gpr[14] as usize);
+    write_byte(b'\n');
 }

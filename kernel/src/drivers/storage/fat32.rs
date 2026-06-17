@@ -174,6 +174,7 @@ impl<'a> Fat32Volume<'a> {
         if vbr[510] != 0x55 || vbr[511] != 0xAA { return Err(FatError::NotFat32); }
 
         let bytes_per_sec = u16::from_le_bytes([vbr[11], vbr[12]]);
+        if bytes_per_sec != 512 { return Err(FatError::NotFat32); }
         let sec_per_clus  = vbr[13] as u32;
         let reserved_secs = u16::from_le_bytes([vbr[14], vbr[15]]) as u32;
         let num_fats      = vbr[16] as u32;
@@ -252,7 +253,8 @@ impl<'a> Fat32Volume<'a> {
     }
 
     fn alloc_cluster(&mut self) -> FatResult<u32> {
-        for c in 2..self.clus_count + 2 {
+        let max = self.clus_count.saturating_add(2);
+        for c in 2..max {
             if self.read_fat(c)? == FAT_FREE {
                 self.write_fat(c, 0x0FFF_FFFF)?;
                 return Ok(c);
@@ -263,10 +265,13 @@ impl<'a> Fat32Volume<'a> {
 
     fn free_chain(&mut self, start: u32) -> FatResult<()> {
         let mut cur = start;
+        let mut iter = 0u32;
         while !self.is_eoc(cur) && cur >= 2 {
+            if iter >= self.clus_count + 2 { return Err(FatError::Corrupt); }
             let next = self.read_fat(cur)?;
             self.write_fat(cur, FAT_FREE)?;
             cur = next;
+            iter += 1;
         }
         Ok(())
     }
@@ -352,11 +357,39 @@ impl<'a> Fat32Volume<'a> {
         Ok(done)
     }
 
+    pub fn read_file_at(&mut self, entry: &DirEntryInfo, offset: usize, buf: &mut [u8]) -> FatResult<usize> {
+        if entry.is_dir { return Err(FatError::IsDir); }
+        if offset >= entry.size as usize { return Ok(0); }
+        let to_read = buf.len().min((entry.size as usize).saturating_sub(offset));
+        if to_read == 0 { return Ok(0); }
+        let bpc = self.bpc();
+        let mut clus = entry.cluster;
+        let mut pos = 0usize;
+        while pos + bpc <= offset && !self.is_eoc(clus) && clus >= 2 {
+            pos += bpc;
+            clus = self.read_fat(clus)?;
+        }
+        let mut done = 0usize;
+        while done < to_read && !self.is_eoc(clus) && clus >= 2 {
+            let mut cb = ClusterBuf::new(bpc);
+            self.read_cluster(clus, &mut cb)?;
+            let skip_in_cluster = offset.saturating_sub(pos);
+            let avail = bpc - skip_in_cluster;
+            let chunk = (to_read - done).min(avail);
+            buf[done..done + chunk].copy_from_slice(&cb.data[skip_in_cluster..skip_in_cluster + chunk]);
+            done += chunk;
+            pos += bpc;
+            clus = self.read_fat(clus)?;
+        }
+        Ok(done)
+    }
+
     pub fn write_file(&mut self, entry: &mut DirEntryInfo, data: &[u8]) -> FatResult<()> {
         if entry.is_dir { return Err(FatError::IsDir); }
         let bpc = self.bpc();
-        if entry.cluster != 0 { self.free_chain(entry.cluster)?; }
+        let old_chain = if entry.cluster != 0 { Some(entry.cluster) } else { None };
         let first = self.alloc_cluster()?;
+        if let Some(old) = old_chain { self.free_chain(old)?; }
         entry.cluster = first;
         self.update_cluster_field(entry, first)?;
 
@@ -424,7 +457,10 @@ impl<'a> Fat32Volume<'a> {
     fn write_dir_entry(&mut self, dir_cluster: u32, entry: &DirEntry83) -> FatResult<(u64, usize)> {
         let bpc = self.bpc();
         let mut clus = dir_cluster;
+        let mut iter = 0u32;
         while !self.is_eoc(clus) && clus >= 2 {
+            if iter >= self.clus_count + 2 { return Err(FatError::Corrupt); }
+            iter += 1;
             let mut buf = ClusterBuf::new(bpc);
             self.read_cluster(clus, &mut buf)?;
             for i in 0..bpc / DIR_ENTRY_SIZE {
@@ -517,10 +553,11 @@ fn accumulate_lfn(lfn: &LfnEntry, buf: &mut [u16; 256], len: &mut usize) {
         if pos < 256 { buf[pos] = w; pos += 1; }
     }
 
-    if pos > *len { *len = pos; }
+    if pos > *len { *len = pos.min(256); }
 }
 
 fn build_entry(raw: &DirEntry83, lfn: &[u16; 256], lfn_len: usize, dir_sector: u64, dir_offset: usize) -> DirEntryInfo {
+    let lfn_len = lfn_len.min(256);
     let mut name = [0u8; 256];
     let name_len;
     if lfn_len > 0 {

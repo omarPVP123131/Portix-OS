@@ -404,7 +404,8 @@ impl ExplorerState {
     }
 
     pub fn load_preview(&mut self, vol: &mut Fat32Volume) {
-        if let Some(entry) = self.entries[self.selected].as_ref() {
+        let sel = self.selected.min(self.entry_count.saturating_sub(1));
+        if let Some(entry) = self.entries[sel].as_ref() {
             if entry.is_dir { self.preview_len = 0; return; }
             let mut n = [0u8; 256];
             n[..entry.name_len].copy_from_slice(&entry.name[..entry.name_len]);

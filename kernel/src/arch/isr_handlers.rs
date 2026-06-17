@@ -383,8 +383,31 @@ fn draw_corner_rip(c: &mut Console, rip: u64, valid: u8) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    use crate::drivers::serial;
+    serial::write_str("\n\n=== KERNEL PANIC ===\n");
+    if let Some(loc) = info.location() {
+        serial::write_str("  at ");
+        serial::write_str(loc.file());
+        serial::write_byte(b':');
+        serial::write_usize(loc.line() as usize);
+        serial::write_byte(b':');
+        serial::write_usize(loc.column() as usize);
+        serial::write_byte(b'\n');
+    }
+    serial::write_str("=====================\n");
+
     unsafe { inline_capture_frame(); }
     let f = frame();
+    let gpr = [
+        f.rax, f.rbx, f.rcx, f.rdx,
+        f.rsi, f.rdi, f.rbp,
+        f.r8, f.r9, f.r10, f.r11,
+        f.r12, f.r13, f.r14, f.r15,
+    ];
+    serial::dump_regs("PANIC", f.rip, f.rsp, f.cr3, &gpr);
+    serial::write_str("RFLAGS=");
+    serial::write_hex(f.rflags as usize);
+    serial::write_str("\n");
 
     // [FIX-GP-DF] El panic handler siempre tiene un contexto válido de Rust
     // (no viene de un ISR en cascada), así que puede llamar Console::new()
@@ -637,16 +660,16 @@ extern "C" fn isr_page_fault(ec: u64) -> u64 {
     let cr2: u64;
     unsafe { core::arch::asm!("mov {r}, cr2", r = out(reg) cr2, options(nostack, preserves_flags)); }
 
-    if crate::mem::paging::is_expecting_user_fault() {
-        crate::mem::paging::clear_expect_user_fault();
-        crate::drivers::serial::write_str("#PF recovered (expected user fault)\n");
-        return 0;
-    }
-
     // Try ring-3 recovery first
     let recovered = try_recover_ring3("page_fault", ec);
     if recovered != 0 {
         return recovered;
+    }
+
+    if crate::mem::paging::is_expecting_user_fault() {
+        crate::mem::paging::clear_expect_user_fault();
+        crate::drivers::serial::write_str("#PF recovered (expected user fault)\n");
+        return 0;
     }
 
     let f = frame();

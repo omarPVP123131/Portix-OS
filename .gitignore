@@ -129,6 +129,9 @@ desktop.ini
 *.core
 
 #######################################################
+# Firmware UEFI local (copiado de la instalación de QEMU)
+OVMF.fd
+
 # 🔒 NUNCA IGNORAR (Whitelist mental)
 #######################################################
 # boot/

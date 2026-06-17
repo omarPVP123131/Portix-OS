@@ -76,7 +76,7 @@ pub(crate) fn parse_u64(s: &[u8]) -> Option<u64> {
     let mut n = 0u64;
     for &b in s {
         if !b.is_ascii_digit() { return None; }
-        n = n.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
     }
     Some(n)
 }
@@ -97,7 +97,7 @@ pub(crate) fn parse_hex_raw(s: &[u8]) -> Option<u64> {
             b'A'..=b'F' => b - b'A' + 10,
             _ => return None,
         };
-        n = n.wrapping_shl(4).wrapping_add(d as u64);
+        n = n.checked_shl(4)?.checked_add(d as u64)?;
     }
     Some(n)
 }

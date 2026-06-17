@@ -19,13 +19,15 @@ impl DeviceRegistry {
         }
     }
 
-    fn register(&mut self, dev: Box<dyn BlockDevice>) -> usize {
+    fn register(&mut self, dev: Box<dyn BlockDevice>) -> Option<usize> {
         let id = self.count;
         if id < MAX_DEVICES {
             self.devices[id] = Some(dev);
             self.count += 1;
+            Some(id)
+        } else {
+            None
         }
-        id
     }
 
     fn get(&self, id: usize) -> Option<&dyn BlockDevice> {
@@ -34,6 +36,10 @@ impl DeviceRegistry {
 
     fn get_mut(&mut self, id: usize) -> Option<&mut dyn BlockDevice> {
         self.devices.get_mut(id)?.as_mut().map(|b| &mut **b as &mut dyn BlockDevice)
+    }
+
+    fn take(&mut self, id: usize) -> Option<Box<dyn BlockDevice>> {
+        if id < MAX_DEVICES { self.devices[id].take() } else { None }
     }
 
     fn len(&self) -> usize { self.count }
@@ -45,24 +51,12 @@ unsafe impl Send for DeviceRegistry {}
 
 static REGISTRY: Spinlock<DeviceRegistry> = Spinlock::new(DeviceRegistry::new());
 
-pub fn register_device(dev: Box<dyn BlockDevice>) -> usize {
+pub fn register_device(dev: Box<dyn BlockDevice>) -> Option<usize> {
     REGISTRY.lock().register(dev)
 }
 
-pub fn get_device(id: usize) -> Option<&'static mut dyn BlockDevice> {
-    let mut guard = REGISTRY.lock();
-    match guard.get_mut(id) {
-        Some(d) => {
-            // SAFETY: El registro vive en un static (nunca se mueve).
-            // El Spinlock protege el acceso concurrente.
-            // El kernel es single-threaded: no hay carreras después del unlock.
-            let extended: &'static mut dyn BlockDevice = unsafe {
-                core::mem::transmute(d as &mut dyn BlockDevice)
-            };
-            Some(extended)
-        }
-        None => None,
-    }
+pub fn take_device(id: usize) -> Option<Box<dyn BlockDevice>> {
+    REGISTRY.lock().take(id)
 }
 
 pub fn with_device<F, R>(id: usize, f: F) -> R

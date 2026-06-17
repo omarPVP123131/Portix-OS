@@ -206,6 +206,7 @@ fn ide_dropdown_hit(mx: i32, my: i32, menu_idx: usize, content_y: usize, font_w:
 
 #[no_mangle]
 extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
+    drivers::serial::init();
     unsafe { bootinfo::init(boot_info); }
     unsafe { init_cpu_features(); }
 
@@ -221,8 +222,6 @@ unsafe {
         drivers::serial::write_str("[CPU] WARN: SSE no habilitado correctamente\n");
     }
 }
-
-    drivers::serial::init();  // serial antes que nada para debug
 
     // IDT primero — sin esto cualquier excepción = triple fault opaco
     unsafe { arch::idt::init_idt(); }  // instala GDT+TSS+IDT y hace STI
@@ -314,8 +313,6 @@ unsafe {
     // Inicializar grandes estructuras en BSS (no stack)
     unsafe {
         core::ptr::addr_of_mut!(IDE_STORAGE).write(core::mem::MaybeUninit::new(IdeState::new()));
-        core::ptr::addr_of_mut!(EXPLORER_STORAGE)
-            .write(core::mem::MaybeUninit::new(ExplorerState::new(2)));
     }
 
     crate::drivers::storage::vfs::mount("/tmp", crate::drivers::storage::vfs::FsType::RamFs);
@@ -343,7 +340,7 @@ unsafe {
         }
 
         // Montar FAT32 o formatear si no existe (usa device 0 = Primary0)
-        let dev0_kind = registry::get_device(0).map(|d| d.device_info().kind);
+        let dev0_kind = registry::with_device(0, |d| d.map(|d| d.device_info().kind));
 
         // Si device 0 es ATAPI (CD-ROM), mostrar guía en vez de montar/formatear
         if let Some(DriveType::Atapi) = dev0_kind {
@@ -356,28 +353,30 @@ unsafe {
         serial::write_str("\n");
         if let Some(DriveType::Ata) = dev0_kind {
             serial::write_str("[FS] Attempting FAT32 mount...\n");
-            if let Some(drive) = registry::get_device(0) {
-                serial::write_str("[FS] Got drive, mounting...\n");
-                let mut mbr = [0u8; 512];
-                if drive.read_sectors(0, 1, &mut mbr).is_ok() {
-                    serial::write_str("[FS] MBR read OK, sig=");
-                    serial::write_hex(mbr[510] as usize);
-                    serial::write_hex(mbr[511] as usize);
-                    serial::write_str("\n");
-                    serial::write_str("[FS] P1 type=");
-                    serial::write_hex(mbr[0x1BE+4] as usize);
-                    serial::write_str(" P2 type=");
-                    serial::write_hex(mbr[0x1CE+4] as usize);
-                    serial::write_str("\n");
+            registry::with_device(0, |d| {
+                if let Some(drive) = d {
+                    serial::write_str("[FS] Got drive, mounting...\n");
+                    let mut mbr = [0u8; 512];
+                    if drive.read_sectors(0, 1, &mut mbr).is_ok() {
+                        serial::write_str("[FS] MBR read OK, sig=");
+                        serial::write_hex(mbr[510] as usize);
+                        serial::write_hex(mbr[511] as usize);
+                        serial::write_str("\n");
+                        serial::write_str("[FS] P1 type=");
+                        serial::write_hex(mbr[0x1BE+4] as usize);
+                        serial::write_str(" P2 type=");
+                        serial::write_hex(mbr[0x1CE+4] as usize);
+                        serial::write_str("\n");
+                    }
+                    if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
+                        root_cluster = vol.root_cluster();
+                        mount_ok = true;
+                        serial::log("FS", "FAT32 montado correctamente");
+                    } else {
+                        serial::log("FS", "FAT32 no encontrado en particion");
+                    }
                 }
-                if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
-                    root_cluster = vol.root_cluster();
-                    mount_ok = true;
-                    serial::log("FS", "FAT32 montado correctamente");
-                } else {
-                    serial::log("FS", "FAT32 no encontrado en particion");
-                }
-            }
+            });
             serial::write_str("[FS] mount_ok=");
             serial::write_usize(mount_ok as usize);
             serial::write_str("\n");
@@ -387,28 +386,34 @@ unsafe {
         serial::write_str("\n");
 
         if !mount_ok {
-            if let Some(drive) = registry::get_device(0) {
-                let total_secs = drive.total_sectors();
-                if mkfs::auto_format(drive, total_secs).is_some() {
-                    if let Some(drive) = registry::get_device(0) {
-                        if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
-                            root_cluster = vol.root_cluster();
-                        }
+            registry::with_device(0, |d| {
+                if let Some(drive) = d {
+                    let total_secs = drive.total_sectors();
+                    if mkfs::auto_format(drive, total_secs).is_some() {
+                        registry::with_device(0, |d2| {
+                            if let Some(drive) = d2 {
+                                if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
+                                    root_cluster = vol.root_cluster();
+                                }
+                            }
+                        });
                     }
                 }
-            }
+            });
         }
 
         // Quick FAT32 test: list directories
         if mount_ok {
-            if let Some(drive) = registry::get_device(0) {
-                if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
-                    serial::write_str("[FS] mount_ok, testing list...\n");
-                    fat32_list_dir(&mut vol, "bin");
-                    fat32_list_dir(&mut vol, "home");
-                    fat32_list_dir(&mut vol, "etc");
+            registry::with_device(0, |d| {
+                if let Some(drive) = d {
+                    if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
+                        serial::write_str("[FS] mount_ok, testing list...\n");
+                        fat32_list_dir(&mut vol, "bin");
+                        fat32_list_dir(&mut vol, "home");
+                        fat32_list_dir(&mut vol, "etc");
+                    }
                 }
-            }
+            });
         }
 
         unsafe {
@@ -528,12 +533,14 @@ fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
     // the scheduler's ready pool for preemptive multitasking (future).
     // The kernel boots directly into the main loop UI.
     if mount_ok {
-        if let Some(drive) = registry::get_device(0) {
-            if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
-                let root = vol.root_cluster();
-                let _ = load_ring3_init(&mut vol, root);
+        registry::with_device(0, |d| {
+            if let Some(drive) = d {
+                if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
+                    let root = vol.root_cluster();
+                    let _ = load_ring3_init(&mut vol, root);
+                }
             }
-        }
+        });
     } else {
         let hello_elf = include_bytes!("../../build/hello.elf");
         if let Some(pid1) = elf::elf_load_and_create_process(hello_elf, "shell") {

@@ -92,16 +92,6 @@ impl IpcState {
         serial::write_usize(copy_len);
         serial::write_str("\n");
 
-        if let Some(proc) = process::process_by_pid(dst_pid) {
-            if proc.state == ProcessState::Blocked {
-                proc.state = ProcessState::Ready;
-                proc.sleep_until = 0;
-                serial::write_str("[IPC] wake PID ");
-                serial::write_usize(dst_pid as usize);
-                serial::write_str("\n");
-            }
-        }
-
         0
     }
 
@@ -163,11 +153,28 @@ pub fn init() {
 }
 
 pub fn cleanup_process(slot: usize) {
-    IPC.lock().cleanup_process(slot);
+    if let Some(mut guard) = IPC.try_lock() {
+        guard.cleanup_process(slot);
+    } else {
+        serial::write_str("[IPC] cleanup_process: lock busy, skipping\n");
+    }
 }
 
 pub fn send(src_pid: u64, dst_pid: u64, msg_type: u64, data: &[u8]) -> i64 {
-    IPC.lock().send(src_pid, dst_pid, msg_type, data)
+    let res = IPC.lock().send(src_pid, dst_pid, msg_type, data);
+    // Wake destination outside IPC lock to avoid deadlock with process lock
+    if res == 0 {
+        if let Some(proc) = process::process_by_pid(dst_pid) {
+            if proc.state == ProcessState::Blocked {
+                proc.state = ProcessState::Ready;
+                proc.sleep_until = 0;
+                serial::write_str("[IPC] wake PID ");
+                serial::write_usize(dst_pid as usize);
+                serial::write_str("\n");
+            }
+        }
+    }
+    res
 }
 
 pub fn recv(pid: u64, buf: &mut [u8]) -> i64 {
@@ -192,17 +199,16 @@ pub fn register_irq(irq: usize, pid: u64) -> i64 {
 
 pub fn notify_irq(irq: usize) {
     if irq >= MAX_IRQ { return; }
-    let dst_pid = match IPC.try_lock().and_then(|g| g.irq_routes[irq]) {
-        Some(pid) => pid,
-        None => return,
-    };
     let data = [irq as u8; IPC_DATA_SIZE];
-    serial::write_str("[IPC] IRQ");
-    serial::write_usize(irq);
-    serial::write_str(" -> PID ");
-    serial::write_usize(dst_pid as usize);
-    serial::write_str("\n");
-    let _ = send(0, dst_pid, 0xFF, &data);
+    let mut guard = IPC.lock();
+    if let Some(dst_pid) = guard.irq_routes[irq] {
+        serial::write_str("[IPC] IRQ");
+        serial::write_usize(irq);
+        serial::write_str(" -> PID ");
+        serial::write_usize(dst_pid as usize);
+        serial::write_str("\n");
+        let _ = guard.send(0, dst_pid, 0xFF, &data);
+    }
 }
 
 fn irq_routed(irq: u64) -> u8 {

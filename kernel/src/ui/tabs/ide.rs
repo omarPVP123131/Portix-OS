@@ -160,7 +160,7 @@ const MAX_LINES:       usize = 4096;
 const MAX_LINE_LEN:    usize = 512;
 const MAX_BUFFERS:     usize = 8;
 const PAGE_LINES:      usize = 64;
-const MAX_PAGES_TOTAL: usize = 8;
+const MAX_PAGES_TOTAL: usize = 256;
 
 #[derive(Clone, Copy)]
 pub struct Line { pub data: [u8; MAX_LINE_LEN], pub len: usize }
@@ -438,6 +438,7 @@ impl TextBuffer {
 
     fn insert_line_at(&mut self, at: usize, line: Line) {
         if at > self.line_cnt { return; }
+        if self.line_cnt + 1 > MAX_LINES { return; }
         if at == self.line_cnt { self.append_empty_line(); if let Some(d) = self.get_line_mut(at) { *d = line; } return; }
         self.append_empty_line();
         if self.line_cnt < 2 { if let Some(d) = self.get_line_mut(at) { *d = line; } return; }

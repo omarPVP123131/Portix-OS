@@ -172,7 +172,7 @@ impl KeyboardState {
         let up = sh ^ self.caps;
 
         let idx = sc as usize;
-        if idx >= 88 { return 0; }
+        if idx >= NORMAL.len() { return 0; }
 
         const NORMAL: &[u8] = &[
             0,0, b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9',b'0',b'-',b'=',0,0,

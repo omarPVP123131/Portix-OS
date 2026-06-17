@@ -45,7 +45,11 @@ pub fn draw_system_tab(
     // Procesador
     section_label(c, rx, ry, " PROCESADOR", rw); ry += 20;
     let brand = hw.cpu.brand_str();
-    let brand = if brand.len() > 34 { &brand[..34] } else { brand };
+    let brand = if brand.len() > 34 {
+        let mut idx = 34;
+        while !brand.is_char_boundary(idx) { idx -= 1; }
+        &brand[..idx]
+    } else { brand };
     c.write_at(brand, rx + 6, ry, Color::WHITE); ry += lay.line_h + 2;
 
     {

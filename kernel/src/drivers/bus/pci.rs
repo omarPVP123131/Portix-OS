@@ -135,12 +135,7 @@ pub fn pci_find_vga_framebuffer() -> u64 {
     unsafe {
         for b in 0u8..=255u8 {
             for d in 0u8..32u8 {
-                let id = pci_read32(b, d, 0, 0);
-                let vendor = (id & 0xFFFF) as u16;
-                if vendor == 0xFFFF { continue; }
-                let header = pci_read8(b, d, 0, 0x0E);
-                let max_func: u8 = if header & 0x80 != 0 { 8 } else { 1 };
-                for f in 0u8..max_func {
+                for f in 0u8..8u8 {
                     let fid = pci_read32(b, d, f, 0);
                     if (fid & 0xFFFF) as u16 == 0xFFFF { continue; }
                     let cls = pci_read32(b, d, f, 0x08);
@@ -173,14 +168,7 @@ impl PciBus {
         unsafe {
             'outer: for b in 0u8..=255u8 {
                 for d in 0u8..32u8 {
-                    let id = pci_read32(b, d, 0, 0);
-                    let vendor = (id & 0xFFFF) as u16;
-                    if vendor == 0xFFFF { continue; }
-
-                    let header = pci_read8(b, d, 0, 0x0E);
-                    let max_func: u8 = if header & 0x80 != 0 { 8 } else { 1 };
-
-                    for f in 0u8..max_func {
+                    for f in 0u8..8u8 {
                         let fid = pci_read32(b, d, f, 0);
                         let fvendor = (fid & 0xFFFF) as u16;
                         if fvendor == 0xFFFF { continue; }

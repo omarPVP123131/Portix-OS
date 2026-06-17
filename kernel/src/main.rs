@@ -362,11 +362,16 @@ unsafe {
                         serial::write_hex(mbr[510] as usize);
                         serial::write_hex(mbr[511] as usize);
                         serial::write_str("\n");
-                        serial::write_str("[FS] P1 type=");
-                        serial::write_hex(mbr[0x1BE+4] as usize);
-                        serial::write_str(" P2 type=");
-                        serial::write_hex(mbr[0x1CE+4] as usize);
-                        serial::write_str("\n");
+                        let is_gpt = crate::drivers::storage::gpt::is_gpt_disk(&mbr);
+                        if is_gpt {
+                            serial::write_str("[FS] GPT protective MBR detectado\n");
+                        } else {
+                            serial::write_str("[FS] P1 type=");
+                            serial::write_hex(mbr[0x1BE+4] as usize);
+                            serial::write_str(" P2 type=");
+                            serial::write_hex(mbr[0x1CE+4] as usize);
+                            serial::write_str("\n");
+                        }
                     }
                     if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
                         root_cluster = vol.root_cluster();
@@ -532,16 +537,18 @@ fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
     // Create PID 1 in Ready state. Process is NOT auto-executed — it enters
     // the scheduler's ready pool for preemptive multitasking (future).
     // The kernel boots directly into the main loop UI.
+    let mut r3_loaded = false;
     if mount_ok {
         registry::with_device(0, |d| {
             if let Some(drive) = d {
                 if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
                     let root = vol.root_cluster();
-                    let _ = load_ring3_init(&mut vol, root);
+                    r3_loaded = load_ring3_init(&mut vol, root);
                 }
             }
         });
-    } else {
+    }
+    if !r3_loaded {
         let hello_elf = include_bytes!("../../build/hello.elf");
         if let Some(pid1) = elf::elf_load_and_create_process(hello_elf, "shell") {
             if let Some(proc) = process::process_by_pid(pid1) {

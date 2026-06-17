@@ -20,6 +20,15 @@ pub(crate) fn append_u32(buf: &mut [u8], pos: &mut usize, mut n: u32) {
     append_str(buf, pos, &tmp[..i]);
 }
 
+pub(crate) fn append_u64(buf: &mut [u8], pos: &mut usize, mut n: u64) {
+    if n == 0 { append_str(buf, pos, b"0"); return; }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while n > 0 { tmp[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+    tmp[..i].reverse();
+    append_str(buf, pos, &tmp[..i]);
+}
+
 pub(crate) fn append_hex8_byte(buf: &mut [u8], pos: &mut usize, v: u8) {
     const H: &[u8] = b"0123456789ABCDEF";
     append_str(buf, pos, &[H[(v >> 4) as usize], H[(v & 0xF) as usize]]);

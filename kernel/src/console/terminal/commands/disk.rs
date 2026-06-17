@@ -1040,39 +1040,46 @@ fn show_device_fat32(t: &mut Terminal, drive: &mut dyn BlockDevice, idx: usize) 
                 }
             }
 
-            t.write_line("  Tabla de particiones:", LineColor::Info);
-            t.write_line("  #  Estado   Tipo    LBA inicio   Tamaño (sectores)", LineColor::Normal);
-            for i in 0..4usize {
-                let off    = 0x1BE + i * 16;
-                let status = mbr[off];
-                let ptype  = mbr[off + 4];
-                let lba    = u32::from_le_bytes([mbr[off+8], mbr[off+9], mbr[off+10], mbr[off+11]]);
-                let size   = u32::from_le_bytes([mbr[off+12], mbr[off+13], mbr[off+14], mbr[off+15]]);
-                if ptype == 0 { continue; }
+            // Check for GPT protective MBR
+            let is_gpt = crate::drivers::storage::gpt::is_gpt_disk(&mbr);
+            if is_gpt {
+                t.write_line("  GPT protective MBR detectado (tipo 0xEE)", LineColor::Info);
+                show_gpt_partitions(t, drive);
+            } else {
+                t.write_line("  Tabla de particiones MBR:", LineColor::Info);
+                t.write_line("  #  Estado   Tipo    LBA inicio   Tamaño (sectores)", LineColor::Normal);
+                for i in 0..4usize {
+                    let off    = 0x1BE + i * 16;
+                    let status = mbr[off];
+                    let ptype  = mbr[off + 4];
+                    let lba    = u32::from_le_bytes([mbr[off+8], mbr[off+9], mbr[off+10], mbr[off+11]]);
+                    let size   = u32::from_le_bytes([mbr[off+12], mbr[off+13], mbr[off+14], mbr[off+15]]);
+                    if ptype == 0 { continue; }
 
-                let tipo_s: &[u8] = match ptype {
-                    0x0B | 0x0C => b"FAT32   ",
-                    0x0E        => b"FAT16   ",
-                    0x83        => b"Linux   ",
-                    0x07        => b"NTFS    ",
-                    _           => b"Otro    ",
-                };
+                    let tipo_s: &[u8] = match ptype {
+                        0x0B | 0x0C => b"FAT32   ",
+                        0x0E        => b"FAT16   ",
+                        0x83        => b"Linux   ",
+                        0x07        => b"NTFS    ",
+                        _           => b"Otro    ",
+                    };
 
-                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-                append_str(&mut buf, &mut pos, b"  ");
-                append_u32(&mut buf, &mut pos, (i + 1) as u32);
-                append_str(&mut buf, &mut pos, b"  ");
-                if status == 0x80 {
-                    append_str(&mut buf, &mut pos, b"Activa   ");
-                } else {
-                    append_str(&mut buf, &mut pos, b"Inactiva ");
+                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                    append_str(&mut buf, &mut pos, b"  ");
+                    append_u32(&mut buf, &mut pos, (i + 1) as u32);
+                    append_str(&mut buf, &mut pos, b"  ");
+                    if status == 0x80 {
+                        append_str(&mut buf, &mut pos, b"Activa   ");
+                    } else {
+                        append_str(&mut buf, &mut pos, b"Inactiva ");
+                    }
+                    buf[pos..pos + tipo_s.len()].copy_from_slice(tipo_s); pos += tipo_s.len();
+                    append_str(&mut buf, &mut pos, b"  ");
+                    append_u32(&mut buf, &mut pos, lba);
+                    append_str(&mut buf, &mut pos, b"          ");
+                    append_u32(&mut buf, &mut pos, size);
+                    t.write_bytes(&buf[..pos], LineColor::Normal);
                 }
-                buf[pos..pos + tipo_s.len()].copy_from_slice(tipo_s); pos += tipo_s.len();
-                append_str(&mut buf, &mut pos, b"  ");
-                append_u32(&mut buf, &mut pos, lba);
-                append_str(&mut buf, &mut pos, b"          ");
-                append_u32(&mut buf, &mut pos, size);
-                t.write_bytes(&buf[..pos], LineColor::Normal);
             }
         }
         Err(e) => {
@@ -1116,6 +1123,93 @@ fn show_device_fat32(t: &mut Terminal, drive: &mut dyn BlockDevice, idx: usize) 
         }
     }
     t.write_empty();
+}
+
+fn show_gpt_partitions(t: &mut Terminal, drive: &mut dyn BlockDevice) {
+    let mut sector = [0u8; 512];
+    if drive.read_sectors(1, 1, &mut sector).is_err() {
+        t.write_line("  Error leyendo cabecera GPT", LineColor::Error);
+        return;
+    }
+
+    if &sector[0..8] != b"EFI PART" {
+        t.write_line("  Cabecera GPT invalida", LineColor::Error);
+        return;
+    }
+
+    let partition_entry_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap());
+    let num_partition_entries = u32::from_le_bytes(sector[80..84].try_into().unwrap());
+    let size_of_partition_entry = u32::from_le_bytes(sector[84..88].try_into().unwrap());
+
+    if size_of_partition_entry < 128 {
+        t.write_line("  Tamaño entrada GPT invalido", LineColor::Error);
+        return;
+    }
+
+    let entry_size = size_of_partition_entry as usize;
+    let _num_entries = num_partition_entries.min(128) as usize;
+    let entries_per_sector = 512 / entry_size;
+    if entries_per_sector == 0 {
+        return;
+    }
+
+    let esp_guid: [u8; 16] = [
+        0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
+        0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
+    ];
+    let basic_data_guid: [u8; 16] = [
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+        0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+    ];
+
+    let mut entry_buf = [0u8; 512];
+    let mut shown = 0usize;
+    let max_entries = num_partition_entries.min(128) as usize;
+
+    t.write_line("  Tabla de particiones GPT:", LineColor::Info);
+    t.write_line("  #  GUID                                    LBA inicio   Tamaño (sectores)  Tipo", LineColor::Normal);
+
+    for i in 0..max_entries {
+        let sector_idx = i / (512 / entry_size);
+        let off_in_sector = (i % (512 / entry_size)) * entry_size;
+
+        if off_in_sector == 0 {
+            if drive.read_sectors(partition_entry_lba + sector_idx as u64, 1, &mut entry_buf).is_err() {
+                return;
+            }
+        }
+
+        if off_in_sector + 16 > 512 { continue; }
+
+        let type_guid: &[u8; 16] = match entry_buf[off_in_sector..off_in_sector + 16].try_into() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        let is_fat32 = type_guid == &esp_guid || type_guid == &basic_data_guid;
+        let tipo_str: &[u8] = if is_fat32 { b"FAT32   " } else { b"Otro    " };
+
+        if off_in_sector + 40 > 512 { continue; }
+        let starting_lba = u64::from_le_bytes(entry_buf[off_in_sector + 32..off_in_sector + 40].try_into().unwrap());
+        let ending_lba = u64::from_le_bytes(entry_buf[off_in_sector + 40..off_in_sector + 48].try_into().unwrap());
+        if starting_lba == 0 { continue; }
+        let size = ending_lba.saturating_sub(starting_lba) + 1;
+
+        let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+        append_str(&mut buf, &mut pos, b"  ");
+        append_u32(&mut buf, &mut pos, (shown + 1) as u32);
+        append_str(&mut buf, &mut pos, b"  ");
+        append_u64(&mut buf, &mut pos, starting_lba);
+        append_str(&mut buf, &mut pos, b"          ");
+        append_u64(&mut buf, &mut pos, size);
+        append_str(&mut buf, &mut pos, b"  ");
+        buf[pos..pos + tipo_str.len()].copy_from_slice(tipo_str); pos += tipo_str.len();
+        t.write_bytes(&buf[..pos], LineColor::Normal);
+        shown += 1;
+    }
+    if shown == 0 {
+        t.write_line("  (sin particiones FAT32 detectadas en GPT)", LineColor::Warning);
+    }
 }
 
 // DISKPART — Panel de información del disco

@@ -11,6 +11,7 @@
 use alloc::vec;
 use alloc::boxed::Box;
 use crate::drivers::storage::ata::AtaError;
+use crate::drivers::storage::gpt;
 use crate::drivers::storage::traits::BlockDevice;
 
 // ── Errores ───────────────────────────────────────────────────────────────────
@@ -166,7 +167,7 @@ impl<'a> Fat32Volume<'a> {
     pub fn mount(drive: &'a mut dyn BlockDevice) -> FatResult<Self> {
         let mut mbr = [0u8; 512];
         drive.read_sectors(0, 1, &mut mbr).map_err(FatError::Ata)?;
-        let part_lba = Self::find_fat32_partition(&mbr)?;
+        let part_lba = Self::find_fat32_partition(&mbr, drive)?;
 
         let mut vbr = [0u8; 512];
         drive.read_sectors(part_lba, 1, &mut vbr).map_err(FatError::Ata)?;
@@ -200,7 +201,15 @@ impl<'a> Fat32Volume<'a> {
         })
     }
 
-    fn find_fat32_partition(mbr: &[u8; 512]) -> FatResult<u64> {
+    fn find_fat32_partition(mbr: &[u8; 512], drive: &mut dyn BlockDevice) -> FatResult<u64> {
+        if gpt::is_gpt_disk(mbr) {
+            crate::drivers::serial::log("FS", "GPT detectado — buscando particion FAT32 en tabla GPT");
+            if let Some(lba) = gpt::find_fat32_partition_gpt(drive) {
+                crate::drivers::serial::log("FS", "Particion FAT32 encontrada via GPT");
+                return Ok(lba);
+            }
+            crate::drivers::serial::log("FS", "GPT sin particion FAT32 — intentando MBR legacy");
+        }
         for i in 0..4usize {
             let off   = 0x1BE + i * 16;
             let ptype = mbr[off + 4];

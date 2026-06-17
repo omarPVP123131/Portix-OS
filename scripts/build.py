@@ -411,6 +411,8 @@ def _build_esp_fat32(out_img):
         _fat_mkdir(fs, "/PORTIX")
         _fat_copy(fs, EFIBIN,    "/EFI/BOOT/BOOTX64.EFI")
         _fat_copy(fs, KERNELBIN, "/PORTIX/KERNEL.BIN")
+        for dst in ["/sh", "/hello", "/echo", "/ls"]:
+            _fat_copy(fs, HELLO_ELF, f"/PORTIX{dst}")
         with fs.open("/startup.nsh", "wb") as f:
             f.write(b"\\EFI\\BOOT\\BOOTX64.EFI\r\n")
     finally:

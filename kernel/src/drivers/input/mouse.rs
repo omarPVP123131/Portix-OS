@@ -19,6 +19,31 @@ const PS2_DATA:   u16 = 0x60;
 const PS2_STATUS: u16 = 0x64;
 const PS2_CMD:    u16 = 0x64;
 
+struct InterruptGuard {
+    flags: u64,
+}
+
+impl InterruptGuard {
+    fn new() -> Self {
+        let flags: u64;
+        unsafe {
+            core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nostack));
+            core::arch::asm!("cli", options(nostack));
+        }
+        Self { flags }
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        if self.flags & 0x200 != 0 {
+            unsafe {
+                core::arch::asm!("sti", options(nostack));
+            }
+        }
+    }
+}
+
 static BYTE_LOG_CNT: AtomicU32 = AtomicU32::new(0);
 static PKT_LOG_CNT: AtomicU32 = AtomicU32::new(0);
 pub fn init_done() -> u32 { BYTE_LOG_CNT.load(Ordering::Relaxed) }
@@ -252,6 +277,7 @@ pub fn feed(&mut self, byte: u8) -> bool {
 }
 
 pub fn init(&mut self, sw: usize, sh: usize) -> bool {
+    let _guard = InterruptGuard::new();
     self.max_x = (sw as i32).saturating_sub(1);
     self.max_y = (sh as i32).saturating_sub(1);
     self.x = self.max_x / 2;

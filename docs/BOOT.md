@@ -1,5 +1,6 @@
 # Portix OS — Cadena de Arranque
 
+
 ## Visión general
 
 Portix soporta dos rutas de arranque. Ambas producen la misma estructura

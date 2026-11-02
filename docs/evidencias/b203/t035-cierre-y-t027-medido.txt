@@ -1,0 +1,39 @@
+T-035 · CIERRE CERTIFICADO CON PARIDAD DE FIRMWARE — 1 de noviembre de 2026
+======================================================================
+
+BIOS  (scripts/sonda_t035_b203.py) sobre portix.img 2958ae9082ab4ca9...
+  T-035 RESULTADO: casos=30/30; aprobados=30; fallidos=0; omitidos=0;
+                   integridad_ext2=PASS; no certifica b203
+  Caso que definía el defecto (protegida-materializada), traza real:
+    [T035] fase=materializada valor=77
+    [SIG] SIGSEGV ... (page_fault) ... CR2=0x0000300000003000 EC=0x4 PTE=0x8080000005475000
+    [T035] fase=lectura-prohibida senal=11 codigo=2 faltas=1 direccion=correcta
+    [T035] fase=lectura-permitida valor=77
+    [SIG] SIGSEGV ... CR2=0x0000300000003000 EC=0x7 PTE=0x8000000005475025
+    [T035] fase=escritura-prohibida senal=11 codigo=2 faltas=1 direccion=correcta
+    [T035] fase=restauracion inicial=77 nueva=88
+
+UEFI  (scripts/sonda_t035_uefi.py, OVMF real) sobre portix-uefi.img ed8b65afe7433aef...
+  [PASS] T-035 UEFI protegida-materializada   [PASS] T-035 UEFI pila-protegida
+  [PASS] T-035 UEFI fork                      [PASS] T-035 UEFI perezosa
+  [PASS] T-035 UEFI control-perezosa-desmapeada  [PASS] T-035 UEFI pila-creciente
+  SONDA UEFI T-035: 6/6 casos PASS; integridad_ext2=PASS
+
+T-027 · MEDIDO Y NO DEMOSTRADO — 1 de noviembre de 2026
+======================================================================
+
+Hipótesis 1 (pila + guarda + madvise + escritura): DESCARTADA
+  scripts/sonda_pila_t027.py 200 vueltas:
+  [INFO] BIOS pared=2.1 s marcas_de_progreso=4 fin=True fallo=False SIGSEGV=0
+  [PASS] 200 vueltas de pila + guarda + madvise + escritura, ninguna perdida
+
+Hipótesis 2 (carrera mprotect <-> fallo de página en la misma PTE): ENDURECIDA, NO REPRODUCIDA
+  scripts/sonda_carrera_t027.py 400 vueltas:
+  [INFO] pared=1.2 s fin=True fallo=False SIGSEGV_en_la_corrida=0
+  [INFO] carreras de PTE: antes=0 despues=0
+  [PASS] 400 vueltas de mprotect contra fallo de página concurrente:
+         ninguna protección perdida; carreras resueltas=0
+
+  LECTURA HONESTA: el estresor no entró en la ventana (carreras=0). El arreglo
+  (cerrojo CERROJO_PTE + relectura de la protección vigente al materializar) es un
+  endurecimiento con causa demostrada en el CÓDIGO, no una corrección reproducida.

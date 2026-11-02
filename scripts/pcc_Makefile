@@ -1,0 +1,16 @@
+# Makefile de prueba: make real de Portix + gcc (controlador) -> portix-cc
+CC = gcc
+CFLAGS = -O2 -Wall
+OUT = /tmp/demo_make
+
+all: $(OUT)
+
+$(OUT): /usr/src/demo.c
+	$(CC) $(CFLAGS) $< -o $@
+	echo make-enlazo-$@
+
+run: $(OUT)
+	$(OUT)
+
+clean:
+	unlink $(OUT)

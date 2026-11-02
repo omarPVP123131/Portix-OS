@@ -1,0 +1,7 @@
+[package]
+name = "java"
+version = "0.9.5"
+edition = "2021"
+
+[dependencies]
+portix-rt = { path = "../../crates/portix-rt" }

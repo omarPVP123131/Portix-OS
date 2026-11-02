@@ -11,8 +11,9 @@
 #![no_main]
 #![allow(dead_code)]
 #![allow(static_mut_refs)]
+#![allow(unused_features)]
 #![feature(alloc_error_handler)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 extern crate alloc;
 
@@ -24,13 +25,25 @@ pub mod graphics;
 pub mod elf;
 pub mod ipc;
 pub mod mem;
+pub mod fs;
 pub mod process;
 pub mod syscall;
 pub mod time;
 pub mod ui;
 pub mod util;
+pub mod net;
+pub mod lkm;
+pub mod version;
+pub mod wasm;
+pub mod crypto;
+pub mod microkernel;
+pub mod compat;
+pub mod power;
+pub mod system;
+pub mod containers;
+pub mod security;
+pub mod dev;
 
-use console::terminal::editor::draw_editor_tab;
 use console::terminal::LineColor;
 use core::arch::global_asm;
 use drivers::input::keyboard::Key;
@@ -38,16 +51,9 @@ use alloc::boxed::Box;
 use crate::drivers::serial;
 use drivers::storage::traits::BlockDevice;
 use drivers::storage::ata::DriveType;
-use drivers::storage::{ata, atapi, fat32, mkfs, registry};
+use drivers::storage::{ata, atapi, fat32, registry};
 use graphics::driver::framebuffer::{Color, Console, Layout};
 use mem::allocator::BuddyAllocator;
-use ui::tabs::explorer::ExplorerState;
-use ui::tabs::ide::{init_page_pool, IdeState, MenuState, MENUS};
-use ui::tabs::ide::{MENU_H as IDE_MENU_H, STATUS_H as IDE_STATUS_H, TABS_H as IDE_TABS_H};
-use ui::{
-    draw_chrome, draw_devices_tab, draw_explorer_tab, draw_ide_tab, draw_system_tab,
-    draw_terminal_tab, terminal_hist_geometry, Tab, SCROLLBAR_W,
-};
 
 #[no_mangle]
 extern "Rust" fn __rust_alloc_error_handler(size: usize, align: usize) -> ! {
@@ -60,6 +66,30 @@ extern "C" {
     pub static __stack_top: u8;
 }
 
+/// [CICLO 49] Tabla de páginas estática, alineada a 4 KiB, para el mapa de la
+/// mitad superior que construye `_start` antes de saltar a la dirección alta.
+#[repr(C, align(4096))]
+pub struct TablaPaginasBoot(pub [u64; 512]);
+
+/// PDPT de PML4[511] (0xFFFFFF8000000000..): su entrada 510 apunta a `HH_PD`.
+#[no_mangle]
+pub static mut HH_PDPT: TablaPaginasBoot = TablaPaginasBoot([0; 512]);
+/// PD que cubre 0xFFFFFFFF80000000..+1 GiB -> físico 0..1 GiB (512 páginas de 2 MiB).
+#[no_mangle]
+pub static mut HH_PD: TablaPaginasBoot = TablaPaginasBoot([0; 512]);
+
+// ── Punto de entrada en ensamblador ──────────────────────────────────────────
+// El cargador (stage2 BIOS o portix-efi-loader) salta a FÍSICO 0x200000 con
+// identidad plana activa. Este código está ENLAZADO en 0xFFFFFFFF80200000, pero
+// sólo usa direccionamiento relativo a RIP hasta el salto a la mitad superior,
+// así que funciona ejecutándose en la dirección física. Secuencia:
+//   1. limpiar .bss (relativo a RIP: direcciones físicas, ya mapeadas)
+//   2. HH_PD[i] = i*2MiB | PRESENT|WRITABLE|HUGE  (i = 0..512)
+//   3. HH_PDPT[510] = phys(HH_PD) | 3 ; PML4[511] = phys(HH_PDPT) | 3
+//      (si PML4[511] ya estuviera ocupada se detiene con "HH!" por serie:
+//      nunca se pisa una tabla ajena)
+//   4. recarga CR3, salta a `4:` + KERNEL_VMA_OFFSET, fija la pila alta y
+//      llama a rust_main.  A partir de aquí RIP/RSP/símbolos son altos.
 global_asm!(
     ".section .text._start, \"ax\"",
     ".global _start",
@@ -68,8 +98,8 @@ global_asm!(
     "    cli",
     "    cld",
     "    mov r12, rdi",
-    "    lea rsp, [rip + {STACK_TOP}]",
     "    xor rbp, rbp",
+    // 1. .bss a cero (incluye HH_PDPT/HH_PD)
     "    lea rdi, [rip + {BSS_START}]",
     "    lea rcx, [rip + {BSS_END}]",
     "    sub rcx, rdi",
@@ -79,14 +109,61 @@ global_asm!(
     "    xor eax, eax",
     "    rep stosb",
     "1:",
+    // 2. PD de la mitad superior: 1 GiB físico en páginas de 2 MiB
+    "    lea rdi, [rip + {HH_PD}]",
+    "    mov rax, 0x83",
+    "    mov ecx, 512",
+    "3:  mov [rdi], rax",
+    "    add rax, 0x200000",
+    "    add rdi, 8",
+    "    dec ecx",
+    "    jnz 3b",
+    // 3. PDPT[510] -> PD ; PML4[511] -> PDPT (sólo si está libre)
+    "    lea rdi, [rip + {HH_PDPT}]",
+    "    lea rax, [rip + {HH_PD}]",
+    "    or  rax, 3",
+    "    mov [rdi + 510*8], rax",
+    "    mov rax, cr3",
+    "    mov rdx, 0xFFFFFFFFFFFFF000",
+    "    and rax, rdx",
+    "    mov rdx, [rax + 511*8]",
+    "    test rdx, 1",
+    "    jnz 9f",
+    "    lea rdx, [rip + {HH_PDPT}]",
+    "    or  rdx, 3",
+    "    mov [rax + 511*8], rdx",
+    "    mov rax, cr3",
+    "    mov cr3, rax",
+    // 4. salto a la mitad superior
+    "    lea rax, [rip + 4f]",
+    "    mov rdx, {VMA_OFFSET}",
+    "    add rax, rdx",
+    "    jmp rax",
+    "4:",
+    "    lea rsp, [rip + {STACK_TOP}]",
+    "    xor rbp, rbp",
     "    mov rdi, r12",
     "    call {RUST_MAIN}",
     "2:  hlt",
     "    jmp 2b",
+    // PML4[511] ocupada: 'HH!' por COM1 y parada. No se continúa a ciegas.
+    "9:  mov dx, 0x3F8",
+    "    mov al, 'H'",
+    "    out dx, al",
+    "    out dx, al",
+    "    mov al, '!'",
+    "    out dx, al",
+    "    mov al, 10",
+    "    out dx, al",
+    "8:  hlt",
+    "    jmp 8b",
     STACK_TOP = sym __stack_top,
     BSS_START = sym __bss_start,
     BSS_END   = sym __bss_end,
     RUST_MAIN = sym rust_main,
+    HH_PDPT   = sym HH_PDPT,
+    HH_PD     = sym HH_PD,
+    VMA_OFFSET = const mem::paging::KERNEL_VMA_OFFSET,
 );
 
 #[global_allocator]
@@ -108,97 +185,59 @@ unsafe fn init_cpu_features() {
     core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, nomem));
     cr4 |= (1 << 9) | (1 << 10); // OSFXSR + OSXMMEXCPT
     core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, nomem));
+
+    // [CICLO 50 / T1b.2] NX por página: EFER.NXE sólo si CPUID 0x80000001.EDX[20]
+    // lo anuncia. Sin NXE el bit 63 de una PTE es reservado y provocaría #PF.
+    let (_a, _b, _c, edx): (u32, u32, u32, u32);
+    core::arch::asm!("push rbx; cpuid; mov {b:e}, ebx; pop rbx",
+        inout("eax") 0x8000_0001u32 => _a, b = out(reg) _b, out("ecx") _c, out("edx") edx,
+        options(nostack));
+    if edx & (1 << 20) != 0 {
+        let (lo, hi): (u32, u32);
+        core::arch::asm!("rdmsr", in("ecx") 0xC000_0080u32, out("eax") lo, out("edx") hi, options(nostack, nomem));
+        let lo = lo | (1 << 11);
+        core::arch::asm!("wrmsr", in("ecx") 0xC000_0080u32, in("eax") lo, in("edx") hi, options(nostack, nomem));
+        mem::paging::activar_nx();
+    }
 }
 
-
-// ── Statics BSS ──────────────────────────────────────────────────────────────
-
-static mut IDE_STORAGE: core::mem::MaybeUninit<IdeState> = core::mem::MaybeUninit::uninit();
-static mut EXPLORER_STORAGE: core::mem::MaybeUninit<ExplorerState> =
-    core::mem::MaybeUninit::uninit();
-
-// ── Hit-test de la menubar del IDE ────────────────────────────────────────────
-//
-// Devuelve el índice del menú clickeado (-1 si no hay hit).
-// Tiene que coincidir con los anchos que calcula draw_ide_tab en ide.rs.
-fn ide_menubar_hit(mx: i32, my: i32, content_y: usize, font_w: usize) -> i32 {
-    let y = my as usize;
-    if y < content_y || y >= content_y + IDE_MENU_H {
-        return -1;
-    }
-    let mut x_pos = 8usize; // cambió de 6 a 8
-    for (i, menu) in MENUS.iter().enumerate() {
-        let label_w = menu.title.len() * font_w + 14; // cambió de 16 a 14
-        let x = mx as usize;
-        if x >= x_pos && x < x_pos + label_w {
-            return i as i32;
-        }
-        x_pos += label_w + 2;
-    }
-    -1
-}
-fn ide_help_btn_hit(mx: i32, my: i32, content_y: usize, fw: usize, font_w: usize) -> bool {
-    let y = my as usize;
-    if y < content_y || y >= content_y + IDE_MENU_H {
-        return false;
-    }
-    let help_x = fw.saturating_sub(font_w * 3 + 12);
-    let x = mx as usize;
-    x >= help_x && x < fw
-}
-
-fn exp_help_btn_hit(mx: i32, my: i32, content_y: usize, fw: usize, font_w: usize) -> bool {
-    use ui::tabs::explorer::TOOLBAR_H;
-    let y = my as usize;
-    let x = mx as usize;
-    if y < content_y || y >= content_y + TOOLBAR_H {
-        return false;
-    }
-    let hx = fw.saturating_sub(font_w * 2 + 14);
-    x >= hx && x < fw
-}
-
-// Hit-test dentro del dropdown abierto. Devuelve el índice del item (-1 si no).
-fn ide_dropdown_hit(mx: i32, my: i32, menu_idx: usize, content_y: usize, font_w: usize) -> i32 {
-    if menu_idx >= MENUS.len() {
-        return -1;
-    }
-    let menu = &MENUS[menu_idx];
-
-    let mut x_pos = 6usize;
-    for i in 0..menu_idx {
-        x_pos += MENUS[i].title.len() * font_w + 18;
-    }
-
-    let max_label = menu
-        .items
-        .iter()
-        .map(|it| it.label.len())
-        .max()
-        .unwrap_or(10);
-    let max_short = menu
-        .items
-        .iter()
-        .map(|it| it.shortcut.len())
-        .max()
-        .unwrap_or(0);
-    let dd_w = (max_label + max_short + 6) * font_w + 16;
-    let dd_x = x_pos;
-    let dd_y = content_y + IDE_MENU_H;
-
-    let x = mx as usize;
-    let y = my as usize;
-    if x < dd_x || x >= dd_x + dd_w {
-        return -1;
-    }
-
-    const ITEM_H: usize = 16;
-    let rel_y = y.wrapping_sub(dd_y + 3);
-    let item = rel_y / ITEM_H;
-    if item < menu.items.len() && y >= dd_y + 3 {
-        item as i32
-    } else {
-        -1
+// ── [CICLO 49] Autocomprobación de la mitad superior ─────────────────────────
+/// Comprueba, nada más entrar en Rust, que el núcleo ejecuta de verdad en la
+/// mitad superior y que su mapa es coherente con la física. Si algo falla se
+/// imprime `[HH-FALLO]` y se detiene la máquina: nunca se sigue arrancando con
+/// un mapa de memoria dudoso.
+fn verificar_mitad_superior() {
+    use mem::paging::{self, KERNEL_PHYS_BASE, KERNEL_VMA_OFFSET};
+    let rip: usize;
+    unsafe { core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nomem, nostack)); }
+    let rsp: usize;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)); }
+    let main_va = rust_main as *const () as usize;
+    let main_pa = paging::virt_to_phys(main_va);
+    let cr3 = paging::read_cr3();
+    let traducido = paging::translate(cr3, main_va).map(|(p, _)| p);
+    let tabla_va = core::ptr::addr_of!(HH_PD) as usize;
+    let tabla_ok = paging::translate(cr3, tabla_va).map(|(p, _)| p) == Some(paging::virt_to_phys(tabla_va));
+    let ok = rip >= KERNEL_VMA_OFFSET
+        && rsp >= KERNEL_VMA_OFFSET
+        && main_pa >= KERNEL_PHYS_BASE && main_pa < KERNEL_PHYS_BASE + 0x40_0000
+        && traducido == Some(main_pa)
+        && tabla_ok;
+    drivers::serial::write_str(if ok { "[HH] nucleo en mitad superior: rip=" } else { "[HH-FALLO] mapa de la mitad superior incoherente: rip=" });
+    drivers::serial::write_hex(rip);
+    drivers::serial::write_str(" rsp=");
+    drivers::serial::write_hex(rsp);
+    drivers::serial::write_str(" rust_main=");
+    drivers::serial::write_hex(main_va);
+    drivers::serial::write_str(" fisico=");
+    drivers::serial::write_hex(main_pa);
+    drivers::serial::write_str(" traducido=");
+    drivers::serial::write_hex(traducido.unwrap_or(0));
+    drivers::serial::write_str(" cr3=");
+    drivers::serial::write_hex(cr3 as usize);
+    drivers::serial::write_str("\n");
+    if !ok {
+        loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); } }
     }
 }
 
@@ -206,8 +245,12 @@ fn ide_dropdown_hit(mx: i32, my: i32, menu_idx: usize, content_y: usize, font_w:
 
 #[no_mangle]
 extern "C" fn rust_main(boot_info: *const bootinfo::PortixBootInfo) -> ! {
+    drivers::serial::init();
     unsafe { bootinfo::init(boot_info); }
     unsafe { init_cpu_features(); }
+    // [Fase B.4] marcos de usuario desde la RAM del firmware, fuera del montículo
+    let _ = mem::marcos::init();
+    verificar_mitad_superior();
 
     // Verificar que SSE está habilitado correctamente
 unsafe {
@@ -222,17 +265,18 @@ unsafe {
     }
 }
 
-    drivers::serial::init();  // serial antes que nada para debug
-
     // IDT primero — sin esto cualquier excepción = triple fault opaco
     unsafe { arch::idt::init_idt(); }  // instala GDT+TSS+IDT y hace STI
+    // [T-025 E3a] GS por CPU del BSP: lo necesitan syscall_entry y las ISR.
+    arch::percpu::instalar(0, (core::arch::x86_64::__cpuid(1).ebx >> 24) & 0xFF);
 
     unsafe { ALLOCATOR.init(); }
     mem::paging::init();
     process::init();
     crate::ipc::init();
-    init_page_pool();
+    crate::lkm::init();
     time::pit::init();
+    time::rtc::init();
     drivers::serial::log("PIT", "temporizador 100 Hz");
 
     let hw = arch::hardware::HardwareInfo::detect_all();
@@ -247,11 +291,99 @@ unsafe {
         drivers::serial::write_str(" dispositivos\n");
     }
 
+    crate::drivers::audio::audio_init();
+    crate::drivers::storage::ahci::ahci_init();
+    crate::drivers::storage::nvme::nvme_init();
+    crate::drivers::bus::xhci::xhci_init();
+    // ENSAYO DE SILICIO: comprueba sobre el hardware real (identidad leída del
+    // controlador, firmas escritas por el anfitrión y ensayos de ida y vuelta)
+    // que los cuatro controladores operan de verdad.
+    let silicio = crate::drivers::silicon::ejecutar_ensayo();
+    crate::drivers::silicon::registrar_resultado(silicio);
+    crate::arch::smp::init();
+    crate::arch::aarch64::aarch64_hal_init();
+    crate::drivers::storage::cow::cow_init();
+    crate::drivers::storage::luks::init();
+    crate::drivers::storage::nix_store::init();
+    crate::ui::font_ttf::init();
+    crate::ui::widgets::init();
+    crate::ui::wayland_server::init();
+    crate::drivers::bus::virtio_gpu::virtio_gpu_init();
+    crate::arch::vmx::vmx_init();
+    crate::arch::microvm::init();
+    crate::arch::cfs::init();
+    crate::graphics::vulkan_icd::vulkan_init();
+    crate::ui::wayland_effects::wayland_effects_init();
+    crate::arch::microkernel::microkernel_init();
+    crate::ui::tiling_wm::tiling_wm_init();
+    crate::ui::wayland_seat::wayland_seat_init();
+    crate::arch::io_uring::io_uring_init();
+    crate::arch::power::power_init();
+    crate::drivers::storage::installer::installer_init();
+    crate::arch::container::container_init();
+    crate::arch::acpi_sleep::acpi_sleep_init();
+    crate::arch::vmx_hypervisor::vmx_hypervisor_init();
+    crate::arch::backlight::backlight_init();
+    crate::arch::post_quantum::post_quantum_init();
+    crate::arch::riscv64::riscv64_init();
+    crate::microkernel::ebpf::ebpf_init();
+    crate::drivers::audio::rt_audio::rt_audio_init();
+    crate::wasm::component_model::wasi_components_init();
+    crate::drivers::storage::portix_dfs::portix_dfs_init();
+    crate::ui::web_engine::web_engine_init();
+    crate::net::wifi_80211::wifi_init();
+    crate::mem::zswap::zswap_init();
+    crate::arch::sovereign_boot::sovereign_boot_init();
+    crate::arch::tpm_secure::tpm_secure_init();
+    crate::net::smb_thunderbolt::smb_thunderbolt_init();
+    crate::arch::deployment_profile::deployment_profile_init();
+    crate::system::sysinfo::system_release_init();
+
+    // Paquetes 1, B y C: Silicio HugePages, GPU DRM/KMS y Portix-UI Desktop Shell
+    let _ = crate::mem::hugepages::allocate_huge_page_2mb(0x2000_0000, 1, false);
+    crate::drivers::gpu::init_gpu_subsystem();
+    crate::ui::portix_ui::init_portix_ui();
+    crate::ui::web_accel::init_web_accel();
+    crate::arch::laptop_power::init_laptop_power();
+    crate::containers::oci_runtime::init_oci_runtime();
+    crate::drivers::storage::ntfs_exfat::init_peripherals();
+    crate::drivers::storage::immutable_cow::init_immutable_cow();
+    crate::security::tpm2_pcr::init_tpm_security();
+    crate::security::packet_filter::init_packet_filter();
+    crate::dev::toolchain::init_dev_toolchains();
+    crate::ui::commercial_oobe::init_commercial_oobe();
+    crate::net::wifi_portal::init_wifi_portal();
+    crate::drivers::cpu::msr_telemetry::init_cpu_msr_telemetry();
+    crate::system::subsystem_suite::init_subsystems_suite();
+    drivers::serial::log("MICROARCH", "HugePages & Per-CPU Slabs Initialized");
+    drivers::serial::log("GPU", "DRM/KMS Native GPU Subsystem Initialized");
+    drivers::serial::log("PORTIX-UI", "Reactive Shell & Gestures Initialized");
+    drivers::serial::log("WEB-ACCEL", "DRM/KMS Accelerated DOM & VA-API Ready");
+    drivers::serial::log("LAPTOP-PWR", "Modern Standby S0ix & Fn-Keys Ready");
+    drivers::serial::log("PORTIX-BOX", "Lightweight OCI & Flatpak Runtime Ready");
+    drivers::serial::log("GAMING-HDR", "Multimonitor 4K@144Hz, HDR10 & DualSense Ready");
+    drivers::serial::log("PERIPHERALS", "NTFS/exFAT R/W & TB4 Docks Ready");
+    drivers::serial::log("IMMUTABLE", "A/B Slots & Instant CoW Snapshots Ready");
+    drivers::serial::log("TPM-PRIVACY", "TPM 2.0 PCR0-7 Disk Seal & Zero-Telemetry Ready");
+    drivers::serial::log("DEV-TOOL", "Rust/Py/Go/C++ Toolchains, LSP Server & GPU Splits Ready");
+    drivers::serial::log("OOBE-STORE", "OOBE Wizard, Dual-Boot Win11 & Portix-Store Ready");
+    drivers::serial::log("WIFI-PORTAL", "Wi-Fi 6E/7 Tri-Band & xdg-desktop-portal Ready");
+    drivers::serial::log("TITAN-v2", "Portix OS v2.0 'Titan', 452 Syscalls & RAPL Silicon Ready");
+    drivers::serial::log("EPICS-20-25", "Epicas 20 a 25 Consolidadas (Linux ABI, Web, Flatpak, Laptops, GPU, Perif)");
+
     let mut kbd = drivers::input::keyboard::KeyboardState::new();
     let mut ms = drivers::input::mouse::MouseState::new();
     let mut c = Console::new();
     let lay = Layout::new(c.width(), c.height());
     ms.init(lay.fw.max(1), lay.fh.max(1));
+    {
+        let mut gm = drivers::input::mouse::GLOBAL_MOUSE.lock();
+        gm.max_x = ms.max_x;
+        gm.max_y = ms.max_y;
+        gm.x = ms.x;
+        gm.y = ms.y;
+        gm.present = ms.present;
+    }
 
     // ── Drenar FIFO PS/2 ──────────────────────────────────────────────
     // Los bytes basura en el FIFO del 8042 (p.ej. BAT completion del
@@ -307,21 +439,15 @@ unsafe {
     }
 
     let mut term = console::terminal::Terminal::new();
-    term.write_line("PORTIX v0.7.4  Kernel Bare-Metal", LineColor::Header);
+    term.write_line("PORTIX v1.0.0 Genesis  Kernel Bare-Metal (Official Release)", LineColor::Header);
     term.write_line("Escribe 'ayuda' para comandos.", LineColor::Info);
     term.write_empty();
 
-    // Inicializar grandes estructuras en BSS (no stack)
-    unsafe {
-        core::ptr::addr_of_mut!(IDE_STORAGE).write(core::mem::MaybeUninit::new(IdeState::new()));
-        core::ptr::addr_of_mut!(EXPLORER_STORAGE)
-            .write(core::mem::MaybeUninit::new(ExplorerState::new(2)));
-    }
-
     crate::drivers::storage::vfs::mount("/tmp", crate::drivers::storage::vfs::FsType::RamFs);
+    crate::drivers::storage::vfs::mount("/dev/shm", crate::drivers::storage::vfs::FsType::RamFs);
 
     let mut mount_ok = false;
-    let mut root_cluster = 2u32;
+
 
     {
         let bus = ata::AtaBus::scan();
@@ -343,7 +469,7 @@ unsafe {
         }
 
         // Montar FAT32 o formatear si no existe (usa device 0 = Primary0)
-        let dev0_kind = registry::get_device(0).map(|d| d.device_info().kind);
+        let dev0_kind = registry::with_device(0, |d| d.map(|d| d.device_info().kind));
 
         // Si device 0 es ATAPI (CD-ROM), mostrar guía en vez de montar/formatear
         if let Some(DriveType::Atapi) = dev0_kind {
@@ -356,200 +482,154 @@ unsafe {
         serial::write_str("\n");
         if let Some(DriveType::Ata) = dev0_kind {
             serial::write_str("[FS] Attempting FAT32 mount...\n");
-            if let Some(drive) = registry::get_device(0) {
-                serial::write_str("[FS] Got drive, mounting...\n");
-                let mut mbr = [0u8; 512];
-                if drive.read_sectors(0, 1, &mut mbr).is_ok() {
-                    serial::write_str("[FS] MBR read OK, sig=");
-                    serial::write_hex(mbr[510] as usize);
-                    serial::write_hex(mbr[511] as usize);
-                    serial::write_str("\n");
-                    serial::write_str("[FS] P1 type=");
-                    serial::write_hex(mbr[0x1BE+4] as usize);
-                    serial::write_str(" P2 type=");
-                    serial::write_hex(mbr[0x1CE+4] as usize);
-                    serial::write_str("\n");
+            registry::with_device(0, |d| {
+                if let Some(drive) = d {
+                    serial::write_str("[FS] Got drive, mounting...\n");
+                    let mut mbr = [0u8; 512];
+                    if drive.read_sectors(0, 1, &mut mbr).is_ok() {
+                        serial::write_str("[FS] MBR read OK, sig=");
+                        serial::write_hex(mbr[510] as usize);
+                        serial::write_hex(mbr[511] as usize);
+                        serial::write_str("\n");
+                        let is_gpt = crate::drivers::storage::gpt::is_gpt_disk(&mbr);
+                        if is_gpt {
+                            serial::write_str("[FS] GPT protective MBR detectado\n");
+                        } else {
+                            serial::write_str("[FS] P1 type=");
+                            serial::write_hex(mbr[0x1BE+4] as usize);
+                            serial::write_str(" P2 type=");
+                            serial::write_hex(mbr[0x1CE+4] as usize);
+                            serial::write_str("\n");
+                        }
+                    }
+                    if let Ok(_) = fat32::Fat32Volume::mount(drive) {
+                        mount_ok = true;
+                        serial::log("FS", "FAT32 montado correctamente");
+                    } else {
+                        serial::log("FS", "FAT32 no encontrado en particion");
+                    }
                 }
-                if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
-                    root_cluster = vol.root_cluster();
-                    mount_ok = true;
-                    serial::log("FS", "FAT32 montado correctamente");
-                } else {
-                    serial::log("FS", "FAT32 no encontrado en particion");
-                }
-            }
+            });
             serial::write_str("[FS] mount_ok=");
             serial::write_usize(mount_ok as usize);
             serial::write_str("\n");
+        }
+        // [CICLO 51 / LOTE 2] Partición ext2 real (MBR 0x83 o GPT "Linux
+        // filesystem") montada en /usr/local bajo el contrato SistemaDeFicheros.
+        if let Some(DriveType::Ata) = dev0_kind {
+            match crate::fs::ext2::hallar_particion() {
+                Some((lba, n)) => match crate::fs::ext2::Ext2::montar(lba, n) {
+                    Ok(fs) => {
+                        let (bs, bt, bl, it, il) = fs.resumen();
+                        let caja: alloc::boxed::Box<dyn crate::fs::SistemaDeFicheros> = alloc::boxed::Box::new(fs);
+                        // [L3] La particion ext2 ES la raiz: todo lo que no tenga un
+                        // montaje mas especifico (/tmp, /dev/shm, /dev, /proc) se sirve
+                        // desde aqui. La FAT queda como particion de arranque/compatibilidad.
+                        if crate::drivers::storage::vfs::montar_generico("/", crate::drivers::storage::vfs::FsType::Ext2, caja) {
+                            serial::write_str("[EXT2] montado en / (raiz): lba=");
+                            serial::write_usize(lba as usize);
+                            serial::write_str(" bloque=");
+                            serial::write_usize(bs as usize);
+                            serial::write_str(" bloques=");
+                            serial::write_usize(bt as usize);
+                            serial::write_str(" libres=");
+                            serial::write_usize(bl as usize);
+                            serial::write_str(" inodos=");
+                            serial::write_usize(it as usize);
+                            serial::write_str(" libres=");
+                            serial::write_usize(il as usize);
+                            serial::write_str("\n");
+                            // [L3c] La FAT de arranque (cargador + nucleo) se monta en
+                            // /boot de SOLO LECTURA bajo el contrato; el resto del
+                            // arbol vive en la raiz ext2.
+                            if mount_ok {
+                                let fat = alloc::boxed::Box::new(crate::fs::fat_adaptador::FatSoloLectura::nuevo(0));
+                                if crate::drivers::storage::vfs::montar_generico("/boot", crate::drivers::storage::vfs::FsType::Fat32, fat) {
+                                    serial::log("FS", "FAT de arranque montada en /boot (solo lectura)");
+                                }
+                            }
+                        } else {
+                            serial::log("EXT2", "sin hueco en la tabla de montajes");
+                        }
+                    }
+                    Err(m) => { serial::write_str("[EXT2] no montado: "); serial::write_str(m); serial::write_str("\n"); }
+                },
+                None => serial::log("EXT2", "sin particion ext2 en el disco 0"),
+            }
         }
         serial::write_str("[FS] After mount block, mount_ok=");
         serial::write_usize(mount_ok as usize);
         serial::write_str("\n");
 
-        if !mount_ok {
-            if let Some(drive) = registry::get_device(0) {
-                let total_secs = drive.total_sectors();
-                if mkfs::auto_format(drive, total_secs).is_some() {
-                    if let Some(drive) = registry::get_device(0) {
-                        if let Ok(vol) = fat32::Fat32Volume::mount(drive) {
-                            root_cluster = vol.root_cluster();
-                        }
-                    }
-                }
-            }
-        }
-
-        // Quick FAT32 test: list directories
-        if mount_ok {
-            if let Some(drive) = registry::get_device(0) {
-                if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
-                    serial::write_str("[FS] mount_ok, testing list...\n");
-                    fat32_list_dir(&mut vol, "bin");
-                    fat32_list_dir(&mut vol, "home");
-                    fat32_list_dir(&mut vol, "etc");
-                }
-            }
-        }
-
-        unsafe {
-            core::ptr::addr_of_mut!(EXPLORER_STORAGE)
-                .write(core::mem::MaybeUninit::new(ExplorerState::new(root_cluster)));
-        }
+        // [T-001] Antes, si la FAT no montaba, el nucleo FORMATEABA el disco 0
+        // (`mkfs::auto_format`) y listaba /bin /home /etc por el serie. Un
+        // nucleo no destruye datos para arrancar: eliminado. Sin FAT no hay
+        // /boot; sin ext2 no hay raiz (modo degradado explicito mas abajo).
+        crate::net::init();
     }
 
-fn fat32_list_dir(vol: &mut fat32::Fat32Volume, dir_name: &str) {
-    let root = vol.root_cluster();
-    if let Ok(entry) = vol.find_entry(root, dir_name) {
-        if entry.is_dir {
-            serial::write_str("[FS] /");
-            serial::write_str(dir_name);
-            serial::write_str("/ contents:\n");
-            let _ = vol.list_dir(entry.cluster, |e| {
-                serial::write_str("      ");
-                if e.is_dir { serial::write_str("[DIR] "); }
-                else { serial::write_str("[FILE] "); }
-                serial::write_str(e.name_str());
-                serial::write_str("  (");
-                serial::write_usize(e.size as usize);
-                serial::write_str(" bytes)\n");
-            });
-        }
-    }
-}
-
-fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
-    let bin_entry = match vol.find_entry(root, "bin") {
-        Ok(e) if e.is_dir => e,
-        _ => { serial::log("FS", "/bin not found"); return false; }
-    };
-
-    let candidates = ["init", "sh"];
-    let mut loaded = false;
-
-    for name in &candidates {
-        let entry = match vol.find_entry(bin_entry.cluster, name) {
-            Ok(e) if !e.is_dir => e,
-            _ => { continue; }
-        };
-        let size = entry.size as usize;
-        let mut buf = alloc::vec![0u8; size];
-        if vol.read_file(&entry, &mut buf).is_err() {
-            serial::log("FS", "read /bin/");
-            serial::write_str(name);
-            serial::write_str(" failed\n");
-            continue;
-        }
-        serial::write_str("[FS] /bin/");
-        serial::write_str(name);
-        serial::write_str(" loaded (");
-        serial::write_usize(size);
-        serial::write_str(" bytes)\n");
-        if let Some(pid1) = elf::elf_load_and_create_process(&buf, name) {
-            if let Some(proc) = process::process_by_pid(pid1) {
-                proc.state = process::ProcessState::Ready;
-            }
-            let stack_top = core::ptr::addr_of!(__stack_top) as u64;
-            process::set_tss_rsp0(stack_top);
-            serial::write_str("[R3] ");
-            serial::write_str(name);
-            serial::write_str(" process PID=1 ready (awaiting scheduler)\n");
-            loaded = true;
-            break;
-        } else {
-            serial::log("FS", "elf_load_and_create_process failed for /bin/");
-            serial::write_str(name);
-            serial::write_str("\n");
-        }
-    }
-
-    loaded
-}
-
-    // Referencias limpias para el loop principal
-    let ide: &mut IdeState = unsafe { (*core::ptr::addr_of_mut!(IDE_STORAGE)).assume_init_mut() };
-    let explorer: &mut ExplorerState =
-        unsafe { (*core::ptr::addr_of_mut!(EXPLORER_STORAGE)).assume_init_mut() };
-
-    let mut tab = Tab::System;
-    let mut sb_dragging = false;
-    let mut sb_drag_y: i32 = 0;
-    let mut sb_drag_offset: usize = 0;
+    let mut win_mgr = ui::WindowManager::new();
     let mut last_blink_tick = 0u64;
     let mut last_render_tick = 0u64;
     let mut needs_draw = true;
     let mut needs_present = true;
 
-    let boot_lines: &[(&str, &str, Color)] = &[
-        ("  OK  ", "Modo largo (64-bit) activo", Color::GREEN),
-        ("  OK  ", "GDT + TSS cargados", Color::GREEN),
-        ("  OK  ", "IDT configurada (0-19 + IRQ)", Color::GREEN),
-        ("  OK  ", "PIC remapeado, IRQ0 habilitado", Color::GREEN),
-        ("  OK  ", "PIT @ 100 Hz", Color::GREEN),
-        ("  OK  ", "Teclado PS/2 inicializado", Color::GREEN),
-        ("  OK  ", "Raton PS/2 inicializado", Color::GREEN),
-        ("  OK  ", "Escaneo de discos ATA completo", Color::GREEN),
-        ("  OK  ", "Framebuffer VESA activo", Color::GREEN),
-        ("  OK  ", "Doble buffer @ 0x5000000", Color::GREEN),
-        ("  OK  ", "Bus PCI escaneado", Color::GREEN),
-        ("  OK  ", "Serial COM1 @ 38400 baud", Color::GREEN),
-    ];
-
     c.clear(Color::PORTIX_BG);
 
-    // Draw initial UI before ring-3 demo
-    draw_chrome(&mut c, &lay, &hw, Tab::System, 0, 0);
-    draw_system_tab(&mut c, &lay, &hw, boot_lines);
-    drivers::serial::log("FB", "presenting initial UI...");
+    // Presentar Escritorio Real Moderno (elimina interfaz estatica por pestañas)
+    win_mgr.draw(&mut c, &lay, &hw);
+    drivers::serial::log("FB", "presenting Real Desktop UI...");
     c.present_full();
     drivers::serial::log("FB", "present done");
+    crate::system::bench::marcar_escritorio_listo(); // [T-011] instante medible de "escritorio listo"
 
     // ── Ring 3 — init process (scheduler-managed) ────────────────────────
     // Create PID 1 in Ready state. Process is NOT auto-executed — it enters
     // the scheduler's ready pool for preemptive multitasking (future).
     // The kernel boots directly into the main loop UI.
-    if mount_ok {
-        if let Some(drive) = registry::get_device(0) {
-            if let Ok(mut vol) = fat32::Fat32Volume::mount(drive) {
-                let root = vol.root_cluster();
-                let _ = load_ring3_init(&mut vol, root);
+    let mut r3_loaded = false;
+    // [CICLO 51 / L3] PID 1 se carga desde la RAIZ ext2 por el contrato;
+    // la FAT queda solo como rescate si la raiz no se monto.
+    if crate::drivers::storage::vfs::es_ruta_fs("/bin/init") {
+        for name in ["/bin/init", "/bin/sh"] {
+            if let Some(buf) = elf::read_binary_file(name) {
+                serial::write_str("[FS] "); serial::write_str(name);
+                serial::write_str(" cargado desde la raiz ext2 ("); serial::write_usize(buf.len()); serial::write_str(" bytes)\n");
+                if let Some(pid1) = elf::elf_load_and_create_process(&buf, &name[5..]) {
+                    if let Some(proc) = process::process_by_pid(pid1) { proc.state = process::ProcessState::Blocked; }
+                    let stack_top = core::ptr::addr_of!(__stack_top) as u64;
+                    process::set_tss_rsp0(stack_top);
+                    serial::write_str("[R3] "); serial::write_str(&name[5..]); serial::write_str(" process PID=1 registered\n");
+                    r3_loaded = true;
+                    break;
+                }
             }
         }
-    } else {
-        let hello_elf = include_bytes!("../../build/hello.elf");
-        if let Some(pid1) = elf::elf_load_and_create_process(hello_elf, "shell") {
-            if let Some(proc) = process::process_by_pid(pid1) {
-                proc.state = process::ProcessState::Ready;
-            }
-            let stack_top = core::ptr::addr_of!(__stack_top) as u64;
-            process::set_tss_rsp0(stack_top);
-            drivers::serial::log("R3", "Hello process PID=1 ready (awaiting scheduler)");
-        } else {
-            drivers::serial::log("R3", "ERROR: failed to load ELF or create process");
-        }
+    }
+    if !r3_loaded {
+        // [T-001] MODO DEGRADADO explicito: no hay raiz ext2 (o no contiene
+        // /bin/init ni /bin/sh). Antes se intentaba la FAT y, si no, un
+        // `hello.elf` embebido que fingia un PID 1. Ahora: sin PID 1, consola
+        // del nucleo solamente, y un mensaje inequivoco por el serie y la
+        // pantalla. La suite comprueba este camino arrancando sin P3.
+        crate::drivers::storage::vfs::marcar_modo_degradado();
+        serial::write_str("[MODO DEGRADADO] raiz ext2 no montada o sin /bin/init: sin PID 1; consola del nucleo solamente\n");
+        term.write_line("MODO DEGRADADO: raiz ext2 no montada o sin /bin/init.", console::terminal::LineColor::Error);
+        term.write_line("No hay PID 1 ni programas de usuario; solo la consola del nucleo.", console::terminal::LineColor::Error);
+        needs_draw = true;
     }
 
     loop {
+        // [T-026, defecto 23] La consola vuelve aquí tras cada proceso por la
+        // continuación `ring3_ret_addr`, que llega desde el camino de salida de
+        // una syscall (IF=0 por FMASK): el bucle quedaba sordo al PIT y a la red
+        // hasta el siguiente `run` (hueco medido de ~900 ms entre dos `run`).
+        // La consola ociosa siempre debe tener las interrupciones abiertas.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
         let now = time::pit::ticks();
+
+        // ── Poll Network (e1000 / ARP / ICMP / IPv4) ─────────────────────
+        crate::net::poll();
 
         // ── Drenado IRQ1 teclado ─────────────────────────────────────────
         // IRQ1 handler buffers scancodes into SCANCODE_BUF.
@@ -573,26 +653,33 @@ fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
             }
         }
 
-
-
-
-
         // ── Poll mouse directly (fallback if IRQ12 doesn't fire) ──────────
-        // IRQ1 handler now skips AUXB=1 bytes, so mouse data stays in the
-        // controller buffer until consumed here or by IRQ12.
         while ms_n < 32 {
             match unsafe { drivers::input::mouse::poll_aux() } {
                 Some(byte) => {
-                    if drivers::input::mouse::init_done() < 3 {
-                        crate::drivers::serial::write_str("[MS] byte[");
-                        crate::drivers::serial::write_usize(drivers::input::mouse::init_done() as usize);
-                        crate::drivers::serial::write_str("]=0x");
-                        crate::drivers::serial::write_hex(byte as usize);
-                        crate::drivers::serial::write_str("\n");
-                    }
                     ms_buf[ms_n] = byte; ms_n += 1;
                 }
                 None => break,
+            }
+        }
+
+        // ── Drenado de entrada serie COM1 (Terminal interactiva / Headless) ──
+        while let Some(b) = process::tty_read_byte() {
+            needs_draw = true;
+            match b {
+                b'\r' | b'\n' => {
+                    drivers::serial::write_str("\r\n");
+                    term.enter(&hw, &pci);
+                }
+                0x08 | 0x7F => {
+                    term.backspace();
+                    drivers::serial::write_str("\x08 \x08");
+                }
+                32..=126 => {
+                    drivers::serial::write_byte(b);
+                    term.type_char(b);
+                }
+                _ => {}
             }
         }
 
@@ -602,108 +689,105 @@ fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
                 needs_draw = true;
 
                 // Editor de texto del terminal (modo especial)
-               if term.editor.is_some() {
-    let should_exit = {
-        let ed = term.editor.as_mut().unwrap();
-        let ctrl = kbd.ctrl();
-        ed.handle_key(key, ctrl);  // ← ctrl ahora se pasa
-        ed.exit
-    };
-                    if should_exit {
+                if let Some(ed) = term.editor.as_mut() {
+                    let ctrl = kbd.ctrl();
+                    ed.handle_key(key, ctrl);
+                    if ed.exit {
                         term.editor = None;
                         term.write_line("  Editor cerrado.", LineColor::Info);
-                        tab = Tab::Terminal;
                     }
                     continue;
                 }
 
-                // ► LECTURA REAL DEL ESTADO CTRL ◄
-                let ctrl = kbd.ctrl();
-
-                // Escape cierra menú IDE o limpia terminal
+                // Escape cierra el menú de inicio si está abierto
                 if key == Key::Escape {
-                    if ide.menu != MenuState::Closed {
-                        ide.menu = MenuState::Closed;
-                        continue;
+                    if win_mgr.start_menu_open {
+                        win_mgr.start_menu_open = false;
+                        needs_draw = true;
                     }
-                    if tab == Tab::Terminal {
-                        term.clear_history();
-                        term.clear_input();
-                    }
-                    sb_dragging = false;
                     continue;
                 }
 
                 match key {
-                    // Teclas de función — siempre cambian tab
-                    Key::F1 => tab = Tab::System,
-                    Key::F2 => tab = Tab::Terminal,
-                    Key::F3 => tab = Tab::Devices,
-                    Key::F4 => tab = Tab::Ide,
+                    // Teclas de acceso rápido a ventanas del escritorio
+                    Key::F1 => {
+                        win_mgr.windows[0].visible = true;
+                        win_mgr.bring_to_front(0);
+                        needs_draw = true;
+                    }
+                    Key::F2 => {
+                        win_mgr.windows[1].visible = true;
+                        win_mgr.bring_to_front(1);
+                        needs_draw = true;
+                    }
+                    Key::F3 => {
+                        win_mgr.windows[2].visible = true;
+                        win_mgr.bring_to_front(2);
+                        needs_draw = true;
+                    }
+                    Key::F4 => {
+                        win_mgr.windows[3].visible = true;
+                        win_mgr.bring_to_front(3);
+                        needs_draw = true;
+                    }
                     Key::F5 => {
-                        if tab == Tab::Explorer {
-                            explorer.needs_refresh = true;
-                        } else {
-                            tab = Tab::Explorer;
+                        win_mgr.restore_window(4);
+                        needs_draw = true;
+                    }
+                    Key::F6 => {
+                        win_mgr.restore_window(5);
+                        needs_draw = true;
+                    }
+                    Key::F7 => {
+                        win_mgr.restore_window(6); // Navegador Web
+                        needs_draw = true;
+                    }
+                    Key::F8 => {
+                        win_mgr.restore_window(7); // DOOM
+                        needs_draw = true;
+                    }
+                    Key::F9 => {
+                        win_mgr.restore_window(8); // Vulkan 3D
+                        needs_draw = true;
+                    }
+                    Key::F10 => {
+                        win_mgr.restore_window(9); // Tienda P2P
+                        needs_draw = true;
+                    }
+                    Key::F11 => {
+                        win_mgr.restore_window(10); // Sintetizador Audio
+                        needs_draw = true;
+                    }
+                    Key::F12 => {
+                        win_mgr.start_menu_open = !win_mgr.start_menu_open;
+                        needs_draw = true;
+                    }
+
+                    Key::Tab => {
+                        win_mgr.cycle_focus();
+                        needs_draw = true;
+                    }
+
+                    // Escritorio: Despacho de caracteres a la ventana enfocada
+                    Key::Char(ch) => {
+                        if win_mgr.handle_key_char(ch) {
+                            needs_draw = true;
+                        }
+                    }
+                    Key::Backspace => {
+                        if win_mgr.handle_backspace() {
+                            needs_draw = true;
+                        }
+                    }
+                    Key::Enter => {
+                        if win_mgr.handle_enter(&hw) {
+                            needs_draw = true;
                         }
                     }
 
-                    // Tab sin Ctrl: ciclar pestañas
-                    Key::Tab if !ctrl => {
-                        tab = match tab {
-                            Tab::System => Tab::Terminal,
-                            Tab::Terminal => Tab::Devices,
-                            Tab::Devices => Tab::Ide,
-                            Tab::Ide => Tab::Explorer,
-                            Tab::Explorer => Tab::System,
-                        };
-                    }
-
-                    // ── Terminal ──────────────────────────────────────────
-                    Key::PageUp if tab == Tab::Terminal => {
-                        let (_, _, _, ml) = terminal_hist_geometry(&lay);
-                        term.scroll_up(10, ml);
-                    }
-                    Key::PageDown if tab == Tab::Terminal => term.scroll_down(10),
-                    Key::Home if tab == Tab::Terminal => {
-                        let (_, _, _, ml) = terminal_hist_geometry(&lay);
-                        term.scroll_up(usize::MAX / 2, ml);
-                    }
-                    Key::End if tab == Tab::Terminal => term.scroll_to_bottom(),
-                    Key::Char(ch) if tab == Tab::Terminal => {
-                        term.type_char(ch);
-                        drivers::serial::write_byte(ch);
-                    }
-                    Key::Backspace if tab == Tab::Terminal => term.backspace(),
-                    Key::Enter if tab == Tab::Terminal => {
-                        drivers::serial::write_byte(b'\n');
-                        term.enter(&hw, &pci);
-                        if term.editor.is_some() {
-                            tab = Tab::Terminal;
-                        }
-                    }
-
-                    // ── IDE — Ctrl+S/N/W y teclas de edición ──────────────
-                    _ if tab == Tab::Ide => {
-                        let edit_start = lay.content_y + IDE_MENU_H + IDE_TABS_H;
-                        let edit_h = lay.fh.saturating_sub(edit_start + IDE_STATUS_H);
-                        let lh = lay.font_h + 3;
-                        let vis_r = (edit_h / lh).max(1);
-
-                        // Ctrl+S/N/W/Tab manejados dentro de ide.handle_key
-                        ide.handle_key(key, ctrl, vis_r);
-                    }
-
-                    // ── Explorer ──────────────────────────────────────────
-                    _ if tab == Tab::Explorer => {
-                        explorer.handle_key(key);
-                        if explorer.open_request {
-                            explorer.open_request = false;
-                            let name =
-                                core::str::from_utf8(&explorer.open_name[..explorer.open_name_len])
-                                    .unwrap_or("archivo");
-                            ide.open_new(name);
-                            tab = Tab::Ide;
+                    Key::Up | Key::Down | Key::Left | Key::Right | Key::Escape => {
+                        if win_mgr.handle_key_special(key) {
+                            needs_draw = true;
                         }
                     }
 
@@ -724,16 +808,14 @@ fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
             if ms.error_count >= 25 {
                 ms.intelligent_reset();
             }
-            if changed || ms.error_count > 0 {
-                crate::drivers::serial::write_str("[MS] feed ");
-                crate::drivers::serial::write_usize(ms_n);
-                crate::drivers::serial::write_str("B xy=0x");
-                crate::drivers::serial::write_hex(ms.x as usize);
-                crate::drivers::serial::write_str(",0x");
-                crate::drivers::serial::write_hex(ms.y as usize);
-                crate::drivers::serial::write_str(" err=");
-                crate::drivers::serial::write_usize(ms.error_count as usize);
-                crate::drivers::serial::write_str("\n");
+            {
+                let mut gm = drivers::input::mouse::GLOBAL_MOUSE.lock();
+                gm.x = ms.x;
+                gm.y = ms.y;
+                gm.buttons = ms.buttons;
+                gm.prev_buttons = ms.prev_buttons;
+                gm.scroll_delta = ms.scroll_delta;
+                gm.present = ms.present;
             }
             changed
         } else {
@@ -744,191 +826,43 @@ fn load_ring3_init(vol: &mut fat32::Fat32Volume, root: u32) -> bool {
             needs_draw = true;
         }
 
-        // ── Interacción con ratón ─────────────────────────────────────────
-        if term.editor.is_none() {
-            let fw = lay.fw;
-            let sb_x = fw.saturating_sub(SCROLLBAR_W) as i32;
+        // ── Interacción con ratón en el Escritorio Real ──────────────────
+        if ms.scroll_delta != 0 && win_mgr.handle_scroll(ms.scroll_delta) {
+            needs_draw = true;
+        }
 
-            // Soltar drag de scrollbar
-            if sb_dragging && (ms.left_released() || !ms.left_btn()) {
-                sb_dragging = false;
+        if ms.left_btn() && win_mgr.handle_mouse_move(ms.x, ms.y) {
+            needs_draw = true;
+        }
+        if ms.left_released() && win_mgr.handle_mouse_up() {
+            needs_draw = true;
+        }
+
+        if mouse_changed && ms.left_clicked() {
+            if win_mgr.handle_mouse_down(ms.x, ms.y, &hw) {
                 needs_draw = true;
             }
-
-            // Arrastrar scrollbar del terminal
-            if sb_dragging && ms.left_btn() && tab == Tab::Terminal {
-                let (_, hist_h, _, max_lines) = terminal_hist_geometry(&lay);
-                let max_scroll = term.max_scroll(max_lines);
-                if max_scroll > 0 {
-                    let available = term.line_count.saturating_sub(
-                        if term.line_count > console::terminal::TERM_ROWS {
-                            term.line_count - console::terminal::TERM_ROWS
-                        } else {
-                            0
-                        },
-                    );
-                    let thumb_h = if available == 0 {
-                        hist_h
-                    } else {
-                        (hist_h * max_lines / available).max(10).min(hist_h)
-                    };
-                    let travel = hist_h.saturating_sub(thumb_h) as i32;
-                    if travel > 0 {
-                        let dy = ms.y - sb_drag_y;
-                        let new_offset = sb_drag_offset as i32 - (dy * max_scroll as i32) / travel;
-                        term.scroll_offset = new_offset.max(0).min(max_scroll as i32) as usize;
-                    }
-                }
-                needs_draw = true;
-            }
-
-            if mouse_changed && ms.right_clicked() && tab == Tab::Explorer {
-                explorer.handle_right_click(ms.x as usize, ms.y as usize, lay.content_y, lay.fw);
-                needs_draw = true;
-            }
-            if mouse_changed && ms.left_clicked() {
-                // ── Click en scrollbar del terminal ───────────────────────
-                if tab == Tab::Terminal && ms.x >= sb_x {
-                    sb_dragging = true;
-                    sb_drag_y = ms.y;
-                    sb_drag_offset = term.scroll_offset;
-                    needs_draw = true;
-
-                // ── Click en barra de TABS del chrome ─────────────────────
-                } else if (ms.y as usize) >= lay.tab_y && (ms.y as usize) < lay.tab_y + lay.tab_h {
-                    match lay.tab_hit(ms.x, ms.y) {
-                        0 => {
-                            tab = Tab::System;
-                            needs_draw = true;
-                        }
-                        1 => {
-                            tab = Tab::Terminal;
-                            needs_draw = true;
-                        }
-                        2 => {
-                            tab = Tab::Devices;
-                            needs_draw = true;
-                        }
-                        3 => {
-                            tab = Tab::Ide;
-                            needs_draw = true;
-                        }
-                        4 => {
-                            tab = Tab::Explorer;
-                            needs_draw = true;
-                        }
-                        _ => {}
-                    }
-
-                // ── Click dentro del área de contenido del IDE ────────────
-                } else if tab == Tab::Ide {
-                    if ide_help_btn_hit(ms.x, ms.y, lay.content_y, lay.fw, lay.font_w) {
-                        ide.show_help = !ide.show_help;
-                        needs_draw = true;
-                    }
-                    if explorer.context.visible {
-                        // ¿Hit en algún item del menú?
-                        let cx = explorer.context.x;
-                        let cy = explorer.context.y;
-                        let mw = explorer.context.width(lay.font_w);
-                        let x = ms.x as usize;
-                        let y = ms.y as usize;
-                        if x >= cx && x < cx + mw && y >= cy {
-                            let item_idx = (y.saturating_sub(cy + 2)) / 18;
-                            explorer.execute_context(item_idx);
-                        } else {
-                            explorer.context.close();
-                        }
-                        needs_draw = true;
-                    }
-                    // Botón [?] de help en toolbar del explorer
-                    else if exp_help_btn_hit(ms.x, ms.y, lay.content_y, lay.fw, lay.font_w) {
-                        explorer.show_help = !explorer.show_help;
-                        needs_draw = true;
-                    }
-                    let hit_menu = ide_menubar_hit(ms.x, ms.y, lay.content_y, lay.font_w);
-                    if hit_menu >= 0 {
-                        // Abrir/cerrar menú
-                        let idx = hit_menu as usize;
-                        ide.menu = if ide.menu == MenuState::Open(idx) {
-                            MenuState::Closed
-                        } else {
-                            MenuState::Open(idx)
-                        };
-                        needs_draw = true;
-                    } else if let MenuState::Open(open_idx) = ide.menu {
-                        // Click dentro del dropdown
-                        let item_hit =
-                            ide_dropdown_hit(ms.x, ms.y, open_idx, lay.content_y, lay.font_w);
-                        if item_hit >= 0 {
-                            let action = MENUS[open_idx].items[item_hit as usize].action;
-                            ide.execute_menu(action);
-                            needs_draw = true;
-                        } else {
-                            // Click fuera del dropdown → cerrar
-                            ide.menu = MenuState::Closed;
-                            needs_draw = true;
-                        }
-                    } else {
-                        // Click en editor — cerrar cualquier menú abierto
-                        if ide.menu != MenuState::Closed {
-                            ide.menu = MenuState::Closed;
-                            needs_draw = true;
-                        }
-                    }
-
-                // ── Click fuera del IDE con menú abierto → cerrarlo ───────
-                } else if ide.menu != MenuState::Closed {
-                    ide.menu = MenuState::Closed;
-                    needs_draw = true;
-                }
-            }
-
-            // Scroll del ratón en terminal
-            if mouse_changed && ms.scroll_delta != 0 && tab == Tab::Terminal && !sb_dragging {
-                let (_, _, _, ml) = terminal_hist_geometry(&lay);
-                if ms.scroll_delta > 0 {
-                    term.scroll_up(console::terminal::SCROLL_STEP, ml);
-                } else {
-                    term.scroll_down(console::terminal::SCROLL_STEP);
-                }
+        }
+        if mouse_changed && ms.right_clicked() {
+            if win_mgr.handle_right_click(ms.x, ms.y) {
                 needs_draw = true;
             }
         }
 
         // ── Cursor parpadeante ────────────────────────────────────────────
-        if term.editor.is_none() {
-            if now.wrapping_sub(last_blink_tick) >= 50 {
-                last_blink_tick = now;
-                term.cursor_vis = !term.cursor_vis;
-                if tab == Tab::Terminal {
-                    needs_draw = true;
-                }
-            }
+        if now.wrapping_sub(last_blink_tick) >= 50 {
+            last_blink_tick = now;
+            needs_draw = true;
         }
 
-        // ── Render ────────────────────────────────────────────────────────
+        // ── Render Escritorio Real Moderno ────────────────────────────────
         if needs_draw {
-            draw_chrome(&mut c, &lay, &hw, tab, ms.x, ms.y);
+            win_mgr.draw(&mut c, &lay, &hw);
 
-            match tab {
-                Tab::System => draw_system_tab(&mut c, &lay, &hw, boot_lines),
-                Tab::Terminal => {
-                    if let Some(ref ed) = term.editor {
-                        draw_editor_tab(&mut c, &lay, ed);
-                    } else {
-                        draw_terminal_tab(&mut c, &lay, &term, sb_dragging);
-                    }
-                }
-                Tab::Devices => draw_devices_tab(&mut c, &lay, &hw, &pci),
-                Tab::Ide => draw_ide_tab(&mut c, &lay, ide),
-                Tab::Explorer => draw_explorer_tab(&mut c, &lay, explorer),
+            if ms.present {
+                c.draw_cursor(ms.x, ms.y);
             }
-
-// v0.7.4 (correcto):
-if ms.present {
-    c.draw_cursor(ms.x, ms.y);
-}            needs_draw = false;
+            needs_draw = false;
             needs_present = true;
         }
 

@@ -1,5 +1,6 @@
 # Portix OS — Arquitectura
 
+
 ## Objetivo del sistema
 
 | Campo         | Valor                                        |
@@ -8,7 +9,7 @@
 | Arranque      | BIOS (ISO El Torito) + UEFI (GPT + ESP)      |
 | Lenguaje      | Rust nightly, `no_std`, `no_main`            |
 | Enlazador     | `rust-lld` + script personalizado `linker.ld`|
-| Build         | Python (`build.py` v5.0)                     |
+| Build         | Python (`build.py` v1.0.0)                     |
 
 ### Especificación del target del kernel (`x86_64-portix.json`)
 
@@ -43,20 +44,22 @@ kernel/src/
     mod.rs
 
   drivers/
-    serial.rs         COM1 38400 8N1, niveles de log, write_usize/hex
+    serial.rs         COM1 38400 8N1, niveles de log
     mod.rs
     bus/
-      acpi.rs         Soporte básico ACPI (apagado vía puerto 0x604)
-      pci.rs          Enumeración PCI por puertos CF8/CFC, búsqueda de BAR VGA
+      acpi.rs         Soporte básico ACPI
+      pci.rs          Enumeración PCI
       mod.rs
     input/
       keyboard.rs     Driver teclado PS/2 (IRQ1)
       mouse.rs        Driver ratón PS/2 (IRQ12)
       mod.rs
     storage/
-      ata.rs          ATA PIO LBA48 con caché de sectores
-      fat32.rs        Lectura/escritura FAT32, cadena de clústeres
-      mkfs.rs         Formato FAT32 en primer arranque
+      ata.rs          ATA PIO LBA48
+      fat32.rs        Lectura/escritura FAT32
+      fat_adaptador.rs Adaptador FAT solo lectura (/boot)
+      ext2.rs         ext2 RW (raíz /)
+      ramfs_adaptador.rs Adaptador ramfs
       vfs.rs          Trait Virtual File System
       mod.rs
 
@@ -70,48 +73,72 @@ kernel/src/
       mod.rs
     mod.rs
 
+  fs/
+    mod.rs            Contrato SistemaDeFicheros + errno
+    ext2.rs           ext2 RW (bitmaps, indirectos, directorios)
+    ramfs_adaptador.rs Adaptador ramfs
+    fat_adaptador.rs  Adaptador FAT solo lectura
+
   mem/
-    allocator.rs      Buddy allocator con listas libres intrusivas
+    allocator.rs      Buddy allocator (64 MiB, órdenes 0-11)
+    marcos.rs         Asignador de marcos físicos (mapa de bits, E820/UEFI)
+    paging.rs         Paginación 4 niveles, COW, crecer_pila
+    mod.rs
+
+  net/
+    mod.rs            Ethernet, ARP, IPv4, ICMP, loopback
+    tcp.rs            TCP (retransmisión, SACK, ventana, RTO)
+    ipv6.rs           IPv6 (SLAAC, NDP, ICMPv6)
+    socket.rs         Sockets (AF_INET, AF_INET6, AF_UNIX, socketpair)
+    mod.rs
+
+  process/
+    mod.rs            Procesos, fork, exec, exit, pipes, FIFOs
+    types.rs          Process, ProcessState, FdType, etc.
+    signals.rs        Señales POSIX (sigaction, sigreturn, entrega)
+    scheduler.rs      Planificador, SMP, wait_hlt_preemptible
+    mod.rs
+
+  syscall/
+    mod.rs            Despachador nativo + traductor ABI Linux
+    futex.rs          Futex real con cola de espera
+    numbers.rs        Números de syscall
+    types.rs          Tipos ABI
+
+  system/
+    devsuite.rs       Trazador TSC, profiler, symbols
+    consagracion.rs   ABI freeze, certificación bare-metal
+    subsystem_suite.rs Sumarios de subsistemas
+    symbols.rs        Símbolos ELF por proceso
+    mod.rs
+
+  arch/
+    smp.rs            SMP real (RSDP, MADT, IPI)
+    percpu.rs         Estado por CPU (gs:)
+    debug_regs.rs     DR0-DR3, breakpoints HW
+    isr_handlers.rs   Manejadores de excepciones
+    isr.asm           Stubs ISR en NASM
     mod.rs
 
   time/
     pit.rs            Temporizador PIT a 100 Hz
+    rtc.rs            RTC (CMOS)
     mod.rs
 
   ui/
-    chrome.rs         Barra de pestañas, panel lateral, dibuja todas las pestañas
-    exception.rs      Primitivas gráficas para pantallas de error
-    input.rs          Enrutamiento de entrada
-    mod.rs
-    tabs/
-      system.rs       Pestaña Sistema
-      terminal.rs     Pestaña Terminal
-      devices.rs      Pestaña Dispositivos
-      ide.rs          Editor de código integrado
-      explorer.rs     Explorador de archivos
-      mod.rs
+    (compositor de ventanas, terminal gráfica, verificación)
 
   console/
-    terminal/
-      terminal.rs     Emulador de terminal con historial y scrollback
-      editor.rs       Editor de texto en línea de comandos (nano)
-      fmt.rs          Formateo interno del terminal
-      mod.rs
-      commands/
-        system.rs     Comandos: ayuda, sysinfo, meminfo, pci, reboot, apagado
-        disk.rs       Comandos: ls, cat, nano
-        debug.rs      Comandos de depuración
-        convert.rs    Comandos de conversión
-        fun.rs        Comandos recreativos
-        mod.rs
+    terminal/         Emulador de terminal, comandos
     mod.rs
 
   util/
-    fmt.rs            fmt_u32(), fmt_hex() — formateo numérico sin std
+    fmt.rs            Formateo numérico
     mod.rs
 
   bootinfo.rs         Struct PortixBootInfo (parser + validación)
   main.rs             Punto de entrada del kernel, loop principal
+  version.rs          Versión 1.0.0
 ```
 
 ---
@@ -189,7 +216,7 @@ Excepción de CPU / IRQ
 | `0x100000–0x101FFF`     | Datos/stack del cargador EFI (modo UEFI)           |
 | **`0x200000`**          | **Kernel** (`.text`, `.rodata`, `.data`, `.bss`)   |
 | `0x500000`              | Heap — buddy allocator                             |
-| **`0x600000`**          | **PortixBootInfo** (6 656 bytes, magic + checksum) |
+| **`0xE00000`**          | **PortixBootInfo** (magic + checksum)              |
 | **`0x5000000`**         | **Backbuffer** (copia software del framebuffer)    |
 | `0x1000000+` (variable) | Framebuffer LFB — dirección del BAR de VRAM        |
 
@@ -217,7 +244,7 @@ Bloque mínimo: 64 bytes (`MIN_ORDER`). Pool fijo en `~0x500000`. Expone
 contadores atómicos en `ALLOC_STATS` visibles desde la UI sin bloqueo.
 
 **4. PortixBootInfo estandarizado.**
-Estructura a `0x600000` producida tanto por el stage2 BIOS como por el cargador
+Estructura a `0xE00000` (BIOS) producida tanto por el stage2 BIOS como por el cargador
 UEFI. Contiene: framebuffer, mapa de memoria, rangos reservados y tablas de
 firmware. Validado por magic `0x50525458424F4F54` ("PRTXBOOT") y checksum de 32
 bits. Permite que el kernel sea agnóstico al método de arranque.
@@ -230,3 +257,27 @@ framebuffer solo se inicializa después de que serial esté listo.
 Cada ISR comprueba `crash_frame.valid` antes de llamar a `Console::new()`.
 Si `valid == 0` (frame no capturado o framebuffer inaccesible), cae al buffer
 de texto VGA en `0xB8000`, impidiendo la cascada #GP → #DF.
+
+---
+
+## Extensiones Arquitectónicas Modernas (v0.9.5)
+
+### 1. Pila de Red Dual IPv4/IPv6, WireGuard VPN & eBPF/XDP
+- **IPv6 y NDP**: Cabeceras fijas de 40 bytes (`0x86DD`), generación EUI-64 link-local (`fe80::`), Neighbor Discovery Protocol (NDP) con resolución de direcciones físicas por solicitudes/anuncios ICMPv6 y tabla de rutas con gateway por defecto.
+- **WireGuard VPN**: Protocolo de túnel seguro implementado en Rust puro `no_std`. Emplea Curve25519 (X25519) para el intercambio de claves efímeras bajo el Noise Protocol Framework, ChaCha20-Poly1305 AEAD para encapsulación de paquetes y protección anti-replay mediante contadores de secuencia de 64 bits.
+- **eBPF / XDP L2 Engine**: Gancho de procesamiento ultrarrápido a velocidad de línea en la capa de enlace del controlador Intel e1000. Descarte (`XDP_DROP`) y reenvío (`XDP_TX`/`XDP_PASS`) en cero copias de memoria para mitigación inmediata de ataques de denegación de servicio.
+
+### 2. Pila Gráfica Vulkan 1.3 ICD, SPIR-V & Efectos Wayland
+- **Vulkan 1.3 ICD**: Driver cliente instalable conforme a Khronos con soporte para pipelines gráficos, swapchains KHR, enumeración de dispositivos VirtIO-GPU Venus 3D y rasterizador multi-core de CPU.
+- **Validador SPIR-V**: Parseo e interpretación de flujos de bytecode SPIR-V 1.3 (`0x07230203`), mapeando instrucciones de transformación matricial (`OpMatrixTimesVector`) y modelos de memoria.
+- **Efectos Wayland**: Filtro de convolución 1D separable para Desenfoque Gaussiano (kernel 5x5), sombras proyectadas paramétricas en ventanas `xdg_toplevel`, y animaciones fluidas a 60 FPS con curva cúbica ease-in-out.
+
+### 3. Microkernel Modular con Fast-IPC de Capacidades (<100 ciclos)
+- **Seguridad por Capacidades**: Estructura *CSpace* con badges criptográficos inviolables y máscara de derechos de acceso (`CAP_READ`, `CAP_WRITE`, `CAP_CALL`, `CAP_GRANT`).
+- **Fast-IPC en Registros**: Transferencia directa de mensajes síncronos (Rendezvous) utilizando registros de CPU (`RDX`, `RSI`, `RDI`, `R8`, `R9`, `R10`) completando llamadas en ~78 ciclos de reloj.
+- **Servicios Aislados en Ring-3 y Auto-sanación**: Drivers y servicios (`vfs-server`, `net-server`, `audio-server`, `display-server`) confinados con reinicio en caliente (*Crash & Respawn*) transparente.
+
+### 4. Autohospedaje (Self-Hosting) y Gestor Tiling Sway/i3
+- **Self-Hosting Soberano**: Cadena de compilación y enlace nativa dentro de Portix OS (`/bin/portix-cc`, `/bin/ld-portix`, `/bin/ar`) capaz de generar ejecutables ELF64 en el VFS de manera totalmente autónoma.
+- **Gestor Tiling BSP (Sway/i3)**: Partición espacial binaria automática sin solapamiento (*zero overlap*), soporte multi-workspace y barra integrada *Portix-Bar* con telemetría en tiempo real.
+

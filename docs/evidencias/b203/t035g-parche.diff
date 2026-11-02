@@ -1,0 +1,38 @@
+--- docs/evidencias/b203/t035f-isr.rs	2026-10-31 15:41:52.267409168 +0000
++++ kernel/src/arch/isr_handlers.rs	2026-10-31 16:03:07.866561461 +0000
+@@ -1004,6 +1004,9 @@
+ 
+     // [b191 / T-014] Reserva perezosa (mmap anónimo sin marco): se materializa en
+     // silencio, es el camino normal de la memoria, no una excepción que registrar.
++    // [T-035] La misma ruta restaura una página protegida CON marco cuando la
++    // protección permite el acceso: sin asignar memoria y conservando el
++    // contenido; si no lo permite, devuelve false y acaba en señal.
+     if ec & 1 == 0 && ec & 4 != 0 {
+         if crate::mem::paging::materializar_perezosa(crate::mem::paging::read_cr3(), cr2 as usize, ec & 2 != 0) {
+             return 0;
+@@ -1061,8 +1064,10 @@
+     // proceso: no puede convertirse en pila escribible. Si la reserva permite el
+     // acceso ya la habrán materializado los intentos anteriores; si no, este
+     // fallo debe llegar a la señal, no a `crecer_pila`.
++    // [T-035] Una página protegida con marco tampoco es un hueco: crecer la
++    // pila encima de ella la haría escribible y perdería su contenido.
+     let hueco_de_verdad = crate::mem::paging::pte_cruda(current_cr3, cr2 as usize)
+-        .map_or(true, |pte| !crate::mem::paging::es_perezosa(pte));
++        .map_or(true, |pte| pte == 0);
+     if ec & 1 == 0 && ec & 4 != 0 && hueco_de_verdad { // [T-004] pila de usuario extensible (8 MiB)
+         if crate::mem::paging::crecer_pila(current_cr3, cr2 as usize) {
+             linea_pf("[PILA]");
+@@ -1092,9 +1097,12 @@
+     // ACCERR para la reserva (existe, pero el acceso está prohibido), y MAPERR
+     // para un hueco. Sólo se reclasifica la reserva perezosa de protección cero;
+     // no se atribuyen a permisos otros fallos, p. ej. falta de memoria.
++    // [T-035] Una página PROTEGIDA con marco es una dirección que existe y cuyo
++    // acceso está prohibido: ACCERR, igual que la reserva perezosa sin acceso.
+     let reserva_sin_acceso = ec & 4 != 0 &&
+         crate::mem::paging::pte_cruda(current_cr3, cr2 as usize).map_or(false, |pte| {
+-            crate::mem::paging::es_perezosa(pte) && crate::mem::paging::prot_perezosa(pte) == 0
++            crate::mem::paging::es_protegida(pte)
++                || (crate::mem::paging::es_perezosa(pte) && crate::mem::paging::prot_perezosa(pte) == 0)
+         });
+     let fallo = crate::process::signals::InfoFallo {
+         code: if ec & 1 != 0 || reserva_sin_acceso { crate::process::signals::SEGV_ACCERR } else { crate::process::signals::SEGV_MAPERR },

@@ -1,0 +1,1748 @@
+// arch/isr_handlers.rs — PORTIX OS v3.2
+//
+// [FIX-REG-EXHAUSTION]  inline_capture_frame() ya no usa outputs separados por
+//                       registro. En su lugar escribe directamente a crash_frame
+//                       usando un único puntero de entrada (in(reg) ptr).
+//                       Esto evita "inline assembly requires more registers than
+//                       available" — el compilador solo necesita asignar 1 reg.
+//
+// [FIX-RBP-OFFSET]      CrashFrame: rbp en +144, valid en +152.
+//                       IMPORTANTE: actualizar isr.asm línea:
+//                         mov byte [crash_frame + 144], 1
+//                       a:
+//                         mov byte [crash_frame + 152], 1
+//
+// [FIX-GP-DF] v3.2      CAUSA RAÍZ del #DF en BIOS/raw:
+//                       isr_gp_handler e isr_page_fault llamaban Console::new()
+//                       incondicionalmente. Console::new() resuelve el framebuffer
+//                       desde la info de la BIOS → dirección 0x01000000 (16 MB)
+//                       que NO está en el mapa de páginas de QEMU sin VBE/VESA.
+//                       Ese acceso dispara otro #GP/#PF. Un #GP dentro de #GP
+//                       = #DF (Double Fault).
+//
+//                       Solución: TODOS los ISR comprueban crash_frame.valid
+//                       ANTES de llamar Console::new(). Si valid == 0 el frame
+//                       no fue capturado (stack potencialmente corrupto o
+//                       framebuffer inaccesible) → caemos al fallback de texto
+//                       VGA en 0xB8000, igual que isr_double_fault. Esto rompe
+//                       la cadena #GP → #GP → #DF.
+//
+//                       Adicionalmente, inline_capture_frame ya NO usa pushfq/
+//                       pop rax para capturar RFLAGS (push/pop adicional en un
+//                       stack que podría estar a punto de agotarse). En su lugar
+//                       usa lahf + seto para reconstruir los bits relevantes de
+//                       RFLAGS sin tocar el stack.
+//
+// Mejoras visuales vs v2:
+//   • Grid GPR 3 columnas — usa toda la pantalla
+//   • Mensaje del panic en write_at_tall (grande, legible)
+//   • Hints dinámicos según mensaje de panic
+//   • RIP real en esquina superior derecha
+
+#![allow(dead_code)]
+
+use core::panic::PanicInfo;
+use crate::graphics::driver::framebuffer::{Color, Console};
+use crate::arch::halt::halt_loop;
+use crate::process::ProcessState;
+use crate::util::fmt::{fmt_u32, fmt_hex};
+
+// Saved CS from the most recent exception. Updated by ISR macros in isr.asm.
+#[no_mangle]
+// [E3b] `exception_cs` vive en `PerCpu` (+48); lo escriben las macros ISR_* por `gs:`.
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CRASH FRAME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+pub struct CrashFrame {
+    pub rip:    u64,  // +0
+    pub rsp:    u64,  // +8
+    pub rflags: u64,  // +16
+    pub cr3:    u64,  // +24
+    pub rax:    u64,  // +32
+    pub rbx:    u64,  // +40
+    pub rcx:    u64,  // +48
+    pub rdx:    u64,  // +56
+    pub rsi:    u64,  // +64
+    pub rdi:    u64,  // +72
+    pub r8:     u64,  // +80
+    pub r9:     u64,  // +88
+    pub r10:    u64,  // +96
+    pub r11:    u64,  // +104
+    pub r12:    u64,  // +112
+    pub r13:    u64,  // +120
+    pub r14:    u64,  // +128
+    pub r15:    u64,  // +136
+    pub rbp:    u64,  // +144
+    pub valid:  u8,   // +152
+}
+
+#[no_mangle]
+pub static mut crash_frame: CrashFrame = CrashFrame {
+    rip: 0, rsp: 0, rflags: 0, cr3: 0,
+    rax: 0, rbx: 0, rcx: 0, rdx: 0,
+    rsi: 0, rdi: 0,
+    r8: 0, r9: 0, r10: 0, r11: 0,
+    r12: 0, r13: 0, r14: 0, r15: 0,
+    rbp: 0, valid: 0,
+};
+
+/// [E3d] Frame de la excepción de ESTA CPU (por `gs:`; ver `percpu::OFF_CRASH_FRAME`).
+fn frame() -> &'static CrashFrame {
+    unsafe { &*(crate::arch::percpu::actual().crash_frame.as_ptr() as *const CrashFrame) }
+}
+fn frame_mut_ptr() -> *mut CrashFrame {
+    crate::arch::percpu::actual().crash_frame.as_ptr() as *mut CrashFrame
+}
+
+/// [FIX-REG-EXHAUSTION] Captura registros usando un único puntero de entrada.
+/// Todo el trabajo se hace dentro del asm con MOVs directos a memoria.
+/// El compilador solo necesita asignar UN registro para `ptr`.
+///
+/// [FIX-GP-DF] RFLAGS se captura con lahf+seto en lugar de pushfq/pop para
+/// no añadir presión adicional al stack en el momento del crash. Los bits
+/// reconstruidos cubren SF/ZF/AF/PF/CF (lahf) y OF (seto al).
+#[inline(never)]
+unsafe fn inline_capture_frame() {
+    let ptr = frame_mut_ptr() as u64;
+    core::arch::asm!(
+        // GPRs (excepto rax que usamos de scratch)
+        "mov [{p} + 40],  rbx",
+        "mov [{p} + 48],  rcx",
+        "mov [{p} + 56],  rdx",
+        "mov [{p} + 64],  rsi",
+        "mov [{p} + 72],  rdi",
+        "mov [{p} + 80],  r8",
+        "mov [{p} + 88],  r9",
+        "mov [{p} + 96],  r10",
+        "mov [{p} + 104], r11",
+        "mov [{p} + 112], r12",
+        "mov [{p} + 120], r13",
+        "mov [{p} + 128], r14",
+        "mov [{p} + 136], r15",
+        "mov [{p} + 144], rbp",
+        // RAX (se guarda al final para no pisarlo mientras se usa como scratch)
+        "mov [{p} + 32],  rax",
+        // RSP actual
+        "mov rax, rsp",
+        "mov [{p} + 8], rax",
+        // [FIX-GP-DF] RFLAGS sin pushfq/pop: reconstruir desde lahf + seto
+        // lahf copia SF/ZF/0/AF/0/PF/1/CF a AH
+        // seto AL pone 1 si OF estaba activo
+        "lahf",
+        "seto al",
+        // Construir RFLAGS parcial: AH contiene bits 15:8, AL contiene OF (bit 11 del EFLAGS)
+        // Shifteamos AH a la posición alta y metemos OF en bit 11
+        "movzx rax, ax",          // cero-extend AX -> RAX
+        "mov [{p} + 16], rax",    // guardar RFLAGS reconstruido (aproximado, sin IF/TF/DF)
+        // CR3
+        "mov rax, cr3",
+        "mov [{p} + 24], rax",
+        // RIP via LEA relativa
+        "lea rax, [rip]",
+        "mov [{p} + 0], rax",
+        // valid = 1
+        "mov byte ptr [{p} + 152], 1",
+        p = in(reg) ptr,
+        out("rax") _,
+        options(nostack),
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FALLBACK VGA TEXT MODE  [FIX-GP-DF]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Escribe un mensaje de error directamente en VGA text buffer 0xB8000.
+/// Se usa cuando crash_frame.valid == 0 (framebuffer no disponible / stack
+/// potencialmente corrupto). No depende del heap ni del framebuffer gráfico.
+/// Atributo: fondo rojo (0x4F = blanco sobre rojo para línea de título,
+///           0x4E = amarillo sobre rojo para detalles).
+unsafe fn vga_error(title: &[u8], detail: &[u8]) {
+    let vga = 0xB8000usize as *mut u16;
+    // Limpiar las primeras 4 líneas (80 cols × 4 filas = 320 words)
+    for i in 0..320usize {
+        core::ptr::write_volatile(vga.add(i), 0x4F20);
+    }
+    // Línea 0: título (blanco sobre rojo)
+    for (i, &b) in title.iter().enumerate().take(80) {
+        core::ptr::write_volatile(vga.add(i), 0x4F00 | b as u16);
+    }
+    // Línea 1: detalle (amarillo sobre rojo)
+    for (i, &b) in detail.iter().enumerate().take(80) {
+        core::ptr::write_volatile(vga.add(80 + i), 0x4E00 | b as u16);
+    }
+    // Línea 3: instrucción fija
+    let hint = b"  Reinicia el sistema. crash_frame.valid = 0 (framebuffer no disponible).";
+    for (i, &b) in hint.iter().enumerate().take(80) {
+        core::ptr::write_volatile(vga.add(240 + i), 0x4E00 | b as u16);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PALETAS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod pal {
+    use crate::graphics::driver::framebuffer::Color;
+    pub const PANIC_BG:      Color = Color::new(0x0A, 0x00, 0x00);
+    pub const PANIC_BG2:     Color = Color::new(0x18, 0x00, 0x02);
+    pub const PANIC_RED:     Color = Color::new(0xBB, 0x00, 0x10);
+    pub const PANIC_CRIMSON: Color = Color::new(0xFF, 0x20, 0x20);
+    pub const PANIC_ORANGE:  Color = Color::new(0xFF, 0x88, 0x00);
+    pub const PANIC_DIM:     Color = Color::new(0x28, 0x00, 0x05);
+    pub const PANIC_PANEL:   Color = Color::new(0x14, 0x00, 0x02);
+    pub const PANIC_HINT:    Color = Color::new(0xFF, 0xCC, 0x88);
+    pub const PF_BG_L:       Color = Color::new(0x00, 0x04, 0x16);
+    pub const PF_BG_R:       Color = Color::new(0x02, 0x07, 0x1E);
+    pub const PF_GOLD:       Color = Color::new(0xFF, 0xD7, 0x00);
+    pub const PF_GOLD_DIM:   Color = Color::new(0x60, 0x50, 0x00);
+    pub const PF_OUTLINE:    Color = Color::new(0x06, 0x1A, 0x55);
+    pub const PF_GRID:       Color = Color::new(0x04, 0x0E, 0x30);
+    pub const PF_GREEN:      Color = Color::new(0x00, 0xFF, 0x88);
+    pub const PF_GRAY:       Color = Color::new(0x22, 0x30, 0x40);
+    pub const PF_BLUE:       Color = Color::new(0x44, 0xAA, 0xFF);
+    pub const GP_BG:         Color = Color::new(0x08, 0x00, 0x14);
+    pub const GP_BG2:        Color = Color::new(0x10, 0x00, 0x22);
+    pub const GP_VIOLET:     Color = Color::new(0xAA, 0x00, 0xFF);
+    pub const GP_MAGENTA:    Color = Color::new(0xFF, 0x00, 0xCC);
+    pub const GP_PINK:       Color = Color::new(0xFF, 0x88, 0xEE);
+    pub const GP_DIM:        Color = Color::new(0x22, 0x00, 0x38);
+    pub const GP_YELLOW:     Color = Color::new(0xFF, 0xEE, 0x00);
+    pub const DF_BG:         Color = Color::new(0x00, 0x06, 0x01);
+    pub const DF_GREEN:      Color = Color::new(0x00, 0xFF, 0x44);
+    pub const WHITE:         Color = Color::WHITE;
+    pub const LIGHT:         Color = Color::new(0xCC, 0xDD, 0xEE);
+    pub const MID:           Color = Color::new(0x66, 0x77, 0x88);
+    pub const AMBER:         Color = Color::new(0xFF, 0xAA, 0x00);
+    pub const REG_BG:        Color = Color::new(0x08, 0x08, 0x12);
+    pub const REG_BORDER:    Color = Color::new(0x22, 0x22, 0x36);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PRIMITIVAS GRÁFICAS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn grad_v(c: &mut Console, top: Color, bot: Color) {
+    let (w, h) = (c.width(), c.height());
+    for y in 0..h {
+        let t = (y as u32 * 255 / h.max(1) as u32) as u8;
+        c.fill_rect(0, y, w, 1, top.blend(bot, 255 - t));
+    }
+}
+
+fn grad_h_bar(c: &mut Console, x: usize, y: usize, w: usize, h: usize, l: Color, r: Color) {
+    for i in 0..w {
+        let t = (i as u32 * 255 / w.max(1) as u32) as u8;
+        c.fill_rect(x + i, y, 1, h, l.blend(r, 255 - t));
+    }
+}
+
+fn dot_grid(c: &mut Console, sx: usize, sy: usize, ex: usize, ey: usize, step: usize, col: Color) {
+    let mut y = sy;
+    while y < ey {
+        let mut x = sx;
+        while x < ex { c.fill_rect(x, y, 1, 1, col); x += step; }
+        y += step;
+    }
+}
+
+fn watermark(c: &mut Console, s: &str, col: Color) {
+    let (w, h) = (c.width(), c.height());
+    let sw = s.len() * 9 + 40;
+    let mut row = 0usize;
+    let mut base_y = 0i32;
+    while base_y < h as i32 {
+        let ox = if row % 2 == 0 { 0 } else { (sw / 2) as i32 };
+        let mut x = ox;
+        while x < w as i32 {
+            if x >= 0 { c.write_at(s, x as usize, base_y as usize, col); }
+            x += sw as i32;
+        }
+        base_y += 32; row += 1;
+    }
+}
+
+fn panel(c: &mut Console, x: usize, y: usize, w: usize, h: usize, bg: Color, border: Color) {
+    c.fill_rect(x, y, w, h, bg);
+    c.fill_rect(x, y, w, 1, border);
+    c.fill_rect(x, y + h - 1, w, 1, border);
+    c.fill_rect(x, y, 1, h, border);
+    c.fill_rect(x + w - 1, y, 1, h, border);
+}
+
+fn accent_bar(c: &mut Console, x: usize, y: usize, h: usize, col: Color) {
+    c.fill_rect(x, y, 2, h, col);
+    c.fill_rect(x + 2, y, 1, h, col.dim(80));
+}
+
+fn badge(c: &mut Console, s: &str, x: usize, y: usize, fg: Color, bg: Color) {
+    let bw = s.len() * 9 + 14;
+    c.fill_rounded(x, y, bw, 16, 3, bg);
+    c.write_at(s, x + 7, y + 4, fg);
+}
+
+fn write_glow(c: &mut Console, s: &str, x: usize, y: usize, fg: Color, glow: Color) {
+    for dy in 0usize..=2 { for dx in 0usize..=2 {
+        if dx == 1 && dy == 1 { continue; }
+        c.write_at(s, x.saturating_add(dx).saturating_sub(1),
+                      y.saturating_add(dy).saturating_sub(1), glow);
+    }}
+    c.write_at(s, x, y, fg);
+}
+
+fn write_glow_tall(c: &mut Console, s: &str, x: usize, y: usize, fg: Color, glow: Color) {
+    for dy in 0usize..=4 { for dx in 0usize..=4 {
+        if dx == 2 && dy == 2 { continue; }
+        c.write_at_tall(s, x.saturating_add(dx).saturating_sub(2),
+                           y.saturating_add(dy).saturating_sub(2), glow);
+    }}
+    c.write_at_tall(s, x, y, fg);
+}
+
+fn diamond_sep(c: &mut Console, y: usize, col: Color) {
+    let w = c.width();
+    c.fill_rect(0, y, w, 1, col.dim(40));
+    let mut x = 20usize;
+    while x + 5 < w {
+        c.fill_rect(x+2, y.saturating_sub(2), 1, 1, col.dim(180));
+        c.fill_rect(x+1, y.saturating_sub(1), 3, 1, col.dim(180));
+        c.fill_rect(x,   y,                   5, 1, col);
+        c.fill_rect(x+1, y+1,                 3, 1, col.dim(180));
+        c.fill_rect(x+2, y+2,                 1, 1, col.dim(180));
+        x += 48;
+    }
+}
+
+fn energy_bars(c: &mut Console, x: usize, y: usize, col: Color) {
+    let widths = [220usize, 160, 100, 55, 24];
+    for (i, &w) in widths.iter().enumerate() {
+        let by = y + i * 7;
+        c.fill_rect(x, by, w, 4, col.dim(20));
+        for px in 0..w {
+            let a = 230u8.saturating_sub((px as u32 * 190 / w.max(1) as u32) as u8);
+            c.fill_rect(x + px, by, 1, 4, col.dim(a));
+        }
+    }
+}
+
+fn section_title(c: &mut Console, s: &str, x: usize, y: usize, col: Color) {
+    c.write_at(s, x, y, col);
+    c.fill_rect(x, y + 11, s.len() * 9 + 16, 1, col.dim(55));
+}
+
+fn reg_row_w(c: &mut Console, reg: &str, val: u64,
+             x: usize, y: usize, col_w: usize, ph: usize,
+             accent: Color, label_col: Color, val_col: Color) {
+    c.fill_rect(x, y, col_w, ph, pal::REG_BG);
+    c.fill_rect(x, y, col_w, 1, pal::REG_BORDER);
+    c.fill_rect(x, y + ph - 1, col_w, 1, pal::REG_BORDER);
+    accent_bar(c, x, y, ph, accent);
+    c.write_at(reg, x + 6, y + 2, label_col);
+    let mut buf = [0u8; 18];
+    c.write_at(fmt_hex(val, &mut buf), x + 46, y + 2, val_col);
+}
+
+fn reg_grid_ncol(c: &mut Console, regs: &[(&str, u64)],
+                 x: usize, y: usize, cols: usize,
+                 col_w: usize, row_h: usize, accent: Color) {
+    let ph = row_h - 2;
+    for (i, (name, val)) in regs.iter().enumerate() {
+        reg_row_w(c, name, *val,
+                  x + (i % cols) * (col_w + 4), y + (i / cols) * row_h,
+                  col_w, ph, accent, pal::MID, pal::WHITE);
+    }
+}
+
+fn draw_top_bar(c: &mut Console, l: Color, r: Color) {
+    let w = c.width();
+    grad_h_bar(c, 0, 0, w, 6, l, r);
+    grad_h_bar(c, 0, 6, w, 2, l.dim(100), Color::new(0,0,0));
+    grad_h_bar(c, 0, 8, w, 1, l.dim(35),  Color::new(0,0,0));
+}
+
+fn draw_bottom_bar(c: &mut Console, l: Color, r: Color, label: &str) {
+    let (w, h) = (c.width(), c.height());
+    let by = h.saturating_sub(20);
+    c.fill_rect(0, by, w, 20, Color::new(0x04, 0x04, 0x07));
+    c.fill_rect(0, by, w, 1, l.dim(60));
+    c.fill_rect(8,  by + 6, 7, 7, l);
+    c.fill_rect(20, by + 6, 7, 7, r.dim(160));
+    c.fill_rect(32, by + 6, 7, 7, pal::MID);
+    c.write_at(label, 48, by + 6, pal::MID);
+    c.write_at("PORTIX-OS  v1.0.0", w.saturating_sub(155), by + 6, pal::MID.dim(90));
+}
+
+fn draw_corner_rip(c: &mut Console, rip: u64, valid: u8) {
+    let w = c.width();
+    let col = if valid != 0 { pal::PANIC_CRIMSON } else { pal::MID };
+    c.write_at("RIP", w.saturating_sub(155), 12, col.dim(140));
+    let mut buf = [0u8; 18];
+    c.write_at(fmt_hex(rip, &mut buf), w.saturating_sub(120), 12, col);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  KERNEL PANIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    use crate::drivers::serial;
+    serial::write_str("\n\n=== KERNEL PANIC ===\n");
+    if let Some(loc) = info.location() {
+        serial::write_str("  at ");
+        serial::write_str(loc.file());
+        serial::write_byte(b':');
+        serial::write_usize(loc.line() as usize);
+        serial::write_byte(b':');
+        serial::write_usize(loc.column() as usize);
+        serial::write_byte(b'\n');
+    }
+    struct SerialWriter;
+    impl core::fmt::Write for SerialWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            crate::drivers::serial::write_str(s);
+            Ok(())
+        }
+    }
+    use core::fmt::Write;
+    let _ = write!(SerialWriter, "  msg: {}\n", info.message());
+    serial::write_str("=====================\n");
+
+    unsafe { inline_capture_frame(); }
+    let f = frame();
+    let gpr = [
+        f.rax, f.rbx, f.rcx, f.rdx,
+        f.rsi, f.rdi, f.rbp,
+        f.r8, f.r9, f.r10, f.r11,
+        f.r12, f.r13, f.r14, f.r15,
+    ];
+    serial::dump_regs("PANIC", f.rip, f.rsp, f.cr3, &gpr);
+    serial::write_str("RFLAGS=");
+    serial::write_hex(f.rflags as usize);
+    serial::write_str("\n");
+
+    // [FIX-GP-DF] El panic handler siempre tiene un contexto válido de Rust
+    // (no viene de un ISR en cascada), así que puede llamar Console::new()
+    // directamente. Aun así comprobamos valid como medida de seguridad.
+if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #GP GENERAL PROTECTION FAULT  |  Sistema detenido",
+                b"  (crash_frame.valid=0 - ISR sin frame capturado). EC puede ser 0.",
+            );
+        }
+        halt_loop()
+    }
+
+    let mut c = Console::new();
+    let (w, h) = (c.width(), c.height());
+
+    grad_v(&mut c, pal::PANIC_BG, pal::PANIC_BG2);
+    watermark(&mut c, "PORTIX  PANIC", Color::new(0x1C, 0x00, 0x03));
+    dot_grid(&mut c, 0, 0, w, h, 22, Color::new(0x22, 0x00, 0x05));
+    draw_top_bar(&mut c, pal::PANIC_CRIMSON, pal::PANIC_RED);
+    draw_corner_rip(&mut c, f.rip, f.valid);
+
+    // Triángulo de alerta
+    let ix = 44usize; let iy = 36usize;
+    for row in 0..22usize {
+        let half = (row / 2 + 1).min(11);
+        let cx = ix + 11;
+        c.fill_rect(cx.saturating_sub(half), iy + row, half * 2, 1,
+                   pal::PANIC_ORANGE.dim((70 + row as u32 * 8).min(255) as u8));
+    }
+    c.fill_rect(ix + 10, iy + 5,  2, 10, Color::new(0x10, 0x00, 0x00));
+    c.fill_rect(ix + 10, iy + 16, 2, 3,  Color::new(0x10, 0x00, 0x00));
+
+    let tx = 80usize; let ty = 34usize;
+    write_glow_tall(&mut c, "KERNEL  PANIC", tx, ty, pal::PANIC_CRIMSON, pal::PANIC_RED.dim(35));
+    badge(&mut c, "EXCEPCION NO RECUPERABLE", tx, ty + 30, pal::WHITE, pal::PANIC_DIM);
+    diamond_sep(&mut c, ty + 52, pal::PANIC_RED);
+
+    // ── Mensaje ───────────────────────────────────────────────────────────────
+    let msg_y = ty + 62;
+    section_title(&mut c, "MENSAJE DEL PANIC", 44, msg_y, pal::PANIC_ORANGE.dim(190));
+
+    let mut msg_buf = [0u8; 192];
+    let mut msg_len = 0usize;
+    {
+        struct BufWriter<'a> { buf: &'a mut [u8], pos: &'a mut usize }
+        impl<'a> core::fmt::Write for BufWriter<'a> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for b in s.bytes() {
+                    if *self.pos < self.buf.len() {
+                        self.buf[*self.pos] = if b > 31 && b < 128 { b } else { b'?' };
+                        *self.pos += 1;
+                    }
+                }
+                Ok(())
+            }
+        }
+        use core::fmt::Write;
+        let mut bw = BufWriter { buf: &mut msg_buf, pos: &mut msg_len };
+        let _ = write!(bw, "{}", info.message());
+    }
+    let msg_str = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("(no disponible)");
+    let line1 = if msg_str.len() > 90 { &msg_str[..90] } else { msg_str };
+    let line2 = if msg_str.len() > 90 { &msg_str[90..msg_str.len().min(180)] } else { "" };
+
+    let mp_y = msg_y + 16;
+    let mp_h = if line2.is_empty() { 22usize } else { 38 };
+    c.fill_rect(44, mp_y, w.saturating_sub(90), mp_h, Color::new(0x18, 0x00, 0x03));
+    accent_bar(&mut c, 44, mp_y, mp_h, pal::PANIC_CRIMSON);
+    c.write_at_tall(line1, 54, mp_y + 2, pal::WHITE);
+    if !line2.is_empty() { c.write_at(line2, 54, mp_y + 24, pal::LIGHT); }
+
+    // ── Paneles: ubicación + CPU ───────────────────────────────────────────────
+    let panels_y = mp_y + mp_h + 12;
+    let panel_h  = 92usize;
+    let lw = (w / 2).saturating_sub(54);
+    let rx = 44 + lw + 14;
+    let rw = w.saturating_sub(rx + 20);
+
+    panel(&mut c, 44, panels_y, lw, panel_h, pal::PANIC_PANEL, pal::PANIC_RED.dim(70));
+    accent_bar(&mut c, 44, panels_y, panel_h, pal::PANIC_ORANGE);
+    section_title(&mut c, "UBICACION DEL PANIC", 54, panels_y + 8, pal::PANIC_ORANGE.dim(200));
+
+    if let Some(loc) = info.location() {
+        let file = loc.file();
+        let fd = if file.len() > 46 { &file[file.len()-46..] } else { file };
+        c.write_at("ARCHIVO:", 54, panels_y + 28, pal::MID);
+        c.write_at(fd,        130, panels_y + 28, pal::PANIC_ORANGE);
+        let mut lb = [0u8;16]; let mut cb = [0u8;16];
+        c.write_at("LINEA:", 54, panels_y + 46, pal::MID);
+        c.write_at(fmt_u32(loc.line(), &mut lb),   110, panels_y + 46, pal::PANIC_CRIMSON);
+        c.write_at("COLUMNA:",   54, panels_y + 62, pal::MID);
+        c.write_at(fmt_u32(loc.column(), &mut cb), 130, panels_y + 62, pal::PANIC_CRIMSON);
+    } else {
+        c.write_at("(ubicacion no disponible)", 54, panels_y + 38, pal::MID);
+    }
+
+    panel(&mut c, rx, panels_y, rw, panel_h, pal::PANIC_PANEL, pal::PANIC_RED.dim(70));
+    accent_bar(&mut c, rx, panels_y, panel_h, pal::PANIC_CRIMSON);
+    section_title(&mut c, "CPU AL MOMENTO DEL PANIC", rx + 10, panels_y + 8, pal::PANIC_ORANGE.dim(200));
+
+    let cw2 = (rw.saturating_sub(30)) / 2;
+    let crit: &[(&str, u64)] = &[
+        ("RIP ", f.rip),   ("RSP ", f.rsp),
+        ("RFLG", f.rflags),("CR3 ", f.cr3),
+    ];
+    for (i, (name, val)) in crit.iter().enumerate() {
+        reg_row_w(&mut c, name, *val,
+                  rx + 10 + (i % 2) * (cw2 + 4), panels_y + 26 + (i / 2) * 18,
+                  cw2, 15, pal::PANIC_RED, pal::MID, pal::WHITE);
+    }
+
+    // ── GPR 3 columnas ────────────────────────────────────────────────────────
+    let gpr_y = panels_y + panel_h + 14;
+    section_title(&mut c, "REGISTROS DE PROPOSITO GENERAL", 44, gpr_y, pal::MID.dim(180));
+
+    let all_regs: &[(&str, u64)] = &[
+        ("RAX", f.rax), ("RBX", f.rbx), ("RCX", f.rcx),
+        ("RDX", f.rdx), ("RSI", f.rsi), ("RDI", f.rdi),
+        ("RBP", f.rbp), ("R8 ", f.r8),  ("R9 ", f.r9),
+        ("R10", f.r10), ("R11", f.r11), ("R12", f.r12),
+        ("R13", f.r13), ("R14", f.r14), ("R15", f.r15),
+    ];
+    let col_w3 = (w.saturating_sub(88 + 16)) / 3;
+    reg_grid_ncol(&mut c, all_regs, 44, gpr_y + 16, 3, col_w3, 16, pal::PANIC_RED.dim(120));
+
+    // ── Hints dinámicos ───────────────────────────────────────────────────────
+    let rows_3 = (all_regs.len() + 2) / 3;
+    let hint_y = gpr_y + 16 + rows_3 * 16 + 10;
+    if hint_y + 38 < h.saturating_sub(26) {
+        section_title(&mut c, "POSIBLES CAUSAS", 44, hint_y, pal::PANIC_HINT.dim(150));
+        let (h1, h2) = if msg_str.contains("zero") {
+            ("►  Division por cero: el divisor era 0 en DIV/IDIV o en Rust /",
+             "►  Verificar denominadores antes de dividir (if divisor != 0)")
+        } else if msg_str.contains("index") || msg_str.contains("out of bounds") {
+            ("►  Indice fuera de rango: acceso a slice/array mas alla de su longitud",
+             "►  Verificar .len() antes de indexar, o usar .get() con Option")
+        } else if msg_str.contains("unwrap") || msg_str.contains("None") {
+            ("►  unwrap() sobre None: la Option estaba vacia inesperadamente",
+             "►  Usar if let / match en lugar de unwrap(); revisar flujo de datos")
+        } else if msg_str.contains("overflow") || msg_str.contains("arithmetic") {
+            ("►  Desbordamiento aritmetico (debug): operacion supero el tipo",
+             "►  Usar wrapping_add/sub/mul o checked_* para evitar panics")
+        } else {
+            ("►  unwrap()/expect() sobre None/Err    ►  assert!() fallido",
+             "►  Desbordamiento aritmetico (debug)   ►  Indice fuera de rango")
+        };
+        c.write_at(h1, 44, hint_y + 16, pal::PANIC_HINT.dim(120));
+        c.write_at(h2, 44, hint_y + 28, pal::PANIC_HINT.dim(100));
+    }
+
+    energy_bars(&mut c, 44, h.saturating_sub(56), pal::PANIC_RED);
+    draw_bottom_bar(&mut c, pal::PANIC_CRIMSON, pal::PANIC_RED,
+                   "KERNEL PANIC  |  INTERRUPTS DISABLED  |  SISTEMA DETENIDO");
+    c.present();
+    halt_loop()
+}
+
+// ── Helpers para ring-3 exception recovery ───────────────────────────────
+
+/// Check if the most recent exception came from ring 3.
+/// The value is set by the ISR macros in isr.asm before calling the Rust handler.
+fn is_from_ring3() -> bool {
+    let user_cs = (crate::arch::idt::USER_CS as u64) | 3;
+    crate::arch::percpu::exception_cs_actual() == user_cs
+}
+
+/// Kill the current running process due to an exception from ring 3.
+/// Never returns — either switches to the next process or halts.
+fn kill_current_process(reason: &str, ec: u64) -> ! {
+    let pid = crate::process::current_process()
+        .map(|p| p.pid)
+        .unwrap_or(0);
+
+    crate::drivers::serial::write_str("[R3-KILL] PID=");
+    crate::drivers::serial::write_usize(pid as usize);
+    crate::drivers::serial::write_str(" reason=");
+    crate::drivers::serial::write_str(reason);
+    crate::drivers::serial::write_str(" EC=");
+    crate::drivers::serial::write_hex(ec as usize);
+    crate::drivers::serial::write_str("\n");
+
+    crate::arch::bkl::tomar(); // [E3d] (reentrante: el #PF ya pudo tomarlo)
+    crate::process::matar_grupo_por_senal(pid, -1, 11); // [T-005] la excepción de un hilo mata al grupo
+    crate::process::process_exit(pid, -1);
+    crate::arch::bkl::soltar_todo(); // este contexto se abandona
+    {   // [E3d] mismo motivo que en process_exit_trampoline: no quedarse sobre el CR3 del muerto
+        let kcr3 = crate::mem::paging::cr3_consola();
+        if kcr3 != 0 && crate::mem::paging::read_cr3() != kcr3 { crate::mem::paging::write_cr3(kcr3); }
+    }
+
+    unsafe {
+        let next = crate::process::pick_next_ready();
+        if !next.is_null() {
+            // [E3c] misma preparación que el planificador (PID por CPU incluido:
+            // antes aquí no se fijaba y el siguiente corría con el PID del muerto).
+            crate::process::preparar_cpu_para(next);
+            // [T-025 E3a] la salida a Ring 3 pasa por `switch_to_process_asm`,
+            // que hace el `swapgs` condicional; un `iretq` crudo dejaba al
+            // siguiente proceso con el GS del nucleo.
+            extern "C" { fn switch_to_process_asm(rsp: u64) -> !; }
+            switch_to_process_asm((*next).kernel_rsp);
+        }
+    }
+    // [E3c] En un AP: de vuelta al bucle ocioso; el BSP se detiene como antes.
+    if !crate::arch::smp::is_bsp() { crate::arch::smp::ap_ir_a_ocioso(); }
+    unsafe { loop { core::arch::asm!("hlt"); } }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  [ÉPICA 58] Entrega de SIGSEGV / SIGFPE desde excepciones de CPU
+// ─────────────────────────────────────────────────────────────────────────────
+/// Reencauza el contexto de Ring 3 hacia el manejador de señales registrado
+/// (si existe). Devuelve `true` si el proceso dispone de manejador de usuario
+/// y el frame fue modificado: en ese caso el stub de excepción debe reanudar
+/// con `iretq` (retorno 0) y el flujo del proceso continuará en el manejador.
+fn deliver_signal_from_exception(sig: u32, reason: &str, fallo: crate::process::signals::InfoFallo) -> bool {
+    if !is_from_ring3() {
+        return false;
+    }
+    let f = frame();
+    if f.valid == 0 {
+        return false;
+    }
+    let handled = crate::process::signals::deliver_from_exception(
+        sig,
+        f.rip,       // RIP de la instrucción que provocó el fallo
+        f.rsp,       // RSP de usuario en el momento del fallo
+        f.rflags,
+        f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi,
+        f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15, f.rbp,
+        fallo,
+    );
+    if handled {
+        // [T-020] Contador por proceso; a partir de la 4ª entrega se calla.
+        let (pid, n) = match crate::process::current_process() {
+            Some(p) => { p.senales_excepcion = p.senales_excepcion.saturating_add(1); (p.pid, p.senales_excepcion) }
+            None => (0, 1),
+        };
+        if n > 3 { return handled; }
+        crate::drivers::serial::write_str("[SIG] ");
+        crate::drivers::serial::write_str(crate::process::signals::signal_name(sig));
+        crate::drivers::serial::write_str(" entregado a manejador de usuario PID=");
+        crate::drivers::serial::write_usize(pid as usize);
+        crate::drivers::serial::write_str(" (");
+        crate::drivers::serial::write_str(reason);
+        crate::drivers::serial::write_str(") RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        // [T-020] Con la línea `[EXCEPTION]` silenciada, la dirección del fallo
+        // y el código de error viajan aquí (diagnóstico de los hs_err de la JVM).
+        crate::drivers::serial::write_str(" CR2=");
+        crate::drivers::serial::write_hex(fallo.addr as usize);
+        crate::drivers::serial::write_str(" EC=");
+        crate::drivers::serial::write_hex(fallo.err as usize);
+        if fallo.trapno == 14 {
+            // Estado de la PTE de la dirección fallida (0 = sin tabla hoja / página grande).
+            crate::drivers::serial::write_str(" PTE=");
+            crate::drivers::serial::write_hex(crate::mem::paging::pte_cruda(crate::mem::paging::read_cr3(), fallo.addr as usize).unwrap_or(0) as usize);
+        }
+        crate::drivers::serial::write_str("\n");
+    }
+    handled
+}
+
+/// Atiende el trampolín de retorno de manejador de señales: cuando el
+/// manejador de usuario ejecuta `ret`, el programa salta a
+/// `SIGRETURN_TRAMPOLINE`, dirección deliberadamente no mapeada. El #PF
+/// resultante se traduce aquí en `rt_sigreturn`.
+fn try_sigreturn_trampoline(cr2: u64) -> bool {
+    if cr2 != crate::process::signals::SIGRETURN_TRAMPOLINE || !is_from_ring3() {
+        return false;
+    }
+    let f = frame();
+    // Tras `ret` el puntero de pila apunta al inicio del SigFrame.
+    match crate::process::signals::sigreturn_restore(f.rsp) {
+        Ok(()) => {
+            crate::process::signals::note_trap_sigreturn();
+            crate::drivers::serial::write_str("[SIG] rt_sigreturn via trampolin: contexto de usuario restaurado (RIP=");
+            crate::drivers::serial::write_hex(f.rip as usize);
+            crate::drivers::serial::write_str(")\n");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  [CICLO v6.x] #DB (registros de depuración) y #BP (INT3 del depurador)
+// ─────────────────────────────────────────────────────────────────────────────
+/// Trampa de depuración. `ajustar_rip` se usa para el `INT3`, cuya semántica
+/// exige que el proceso reanude *después* del byte 0xCC (el depurador de Ring 3
+/// no dispone de `ucontext` para corregir el RIP por sí mismo).
+///
+/// Devuelve 0 si el proceso reanuda con el frame modificado, o el nuevo RSP del
+/// siguiente proceso si la señal no tenía manejador (acción por defecto).
+fn handle_debug_trap(reason: &str, ajustar_rip: bool) -> u64 {
+    // Lectura y limpieza del estado del #DB: obligatorio antes de reanudar.
+    let dr6 = crate::arch::debug_regs::clear_dr6();
+
+    if !is_from_ring3() {
+        // #DB en Ring 0 (p. ej. el kernel toca una dirección vigilada de otro
+        // proceso): se ignora y se reanuda la instrucción siguiente del kernel.
+        crate::drivers::serial::write_str("[DBG] #DB en Ring 0 ignorado (DR6=");
+        crate::drivers::serial::write_hex(dr6 as usize);
+        crate::drivers::serial::write_str(")\n");
+        return 0;
+    }
+
+    let f = frame();
+    if f.valid == 0 { return 0; }
+
+    // Si el origen es un trap de paso a paso (TF) se limpia la bandera en el
+    // contexto que va a reanudarse, o el proceso volvería a trap infinitamente.
+    if f.rflags & 0x100 != 0 {
+        if let Some(base) = crate::process::signals::current_saved_frame() {
+            unsafe {
+                let slot = (base + crate::process::signals::FRAME_RFLAGS as u64) as *mut u64;
+                let rf = core::ptr::read_unaligned(slot) & !0x100u64;
+                core::ptr::write_unaligned(slot, rf);
+            }
+        }
+    }
+
+    // [CICLO v6.x] Auto-continúo de un punto de parada condicional: durante la
+    // instrucción "pisada" la ranura del hardware estuvo desactivada; este trap
+    // es el paso de ESA instrucción, así que primero se vuelve a armar el punto
+    // de parada y después se consume el evento en silencio (el trazador sigue
+    // bloqueado en `waitpid`, exactamente como si el punto no hubiera existido).
+    let pid_rearm = crate::process::current_pid();
+    if let Some(slot) = crate::process::tomar_rearmado(pid_rearm) {
+        crate::drivers::serial::write_str("[BPCOND] PID=");
+        crate::drivers::serial::write_usize(pid_rearm as usize);
+        crate::drivers::serial::write_str(" ranura ");
+        crate::drivers::serial::write_usize(slot);
+        crate::drivers::serial::write_str(" re-armada tras el auto-contin\u{f3}o (RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        crate::drivers::serial::write_str(")\n");
+        return 0;
+    }
+
+    let pid = crate::process::current_pid();
+    // [FIX] Tras un #BP el propio procesador deja en el frame la dirección
+    // SIGUIENTE al byte 0xCC, así que el RIP del frame ya es el de reanudación.
+    // Sumar 1 saltaba un byte de código y desalineaba la ejecución (visible en
+    // la sesión de depuración: el paso a paso avanzaba el doble de lo debido).
+    let rip = f.rip;
+    let _ = ajustar_rip;
+    let (kind, extra) = if ajustar_rip {
+        // #BP: la parada se produce justo después del byte 0xCC
+        ("BREAKPOINT", crate::process::signals::SIGTRAP)
+    } else if crate::arch::debug_regs::dr6_is_data_breakpoint(dr6) {
+        if crate::process::bp_trap_es_ejecucion(pid, dr6) {
+            ("BREAKPOINT-HW", crate::process::signals::SIGTRAP)
+        } else {
+            ("WATCHPOINT", crate::process::signals::SIGTRAP)
+        }
+    } else {
+        ("SINGLE-STEP", crate::process::signals::SIGTRAP)
+    };
+    crate::drivers::serial::write_str("[");
+    crate::drivers::serial::write_str(kind);
+    crate::drivers::serial::write_str("] PID=");
+    crate::drivers::serial::write_usize(pid as usize);
+    crate::drivers::serial::write_str(" RIP=");
+    crate::drivers::serial::write_hex(f.rip as usize);
+    if let Some(sym) = crate::system::symbols::resolve_text(pid, f.rip) {
+        crate::drivers::serial::write_str(" (");
+        crate::drivers::serial::write_str(&sym);
+        crate::drivers::serial::write_str(")");
+    }
+    crate::drivers::serial::write_str(" DR6=");
+    crate::drivers::serial::write_hex(dr6 as usize);
+    // [FRENTE C] Atribución de la ranura: con un búfer repartido entre DR0-DR3,
+    // el bit Bn de DR6 dice qué trozo del búfer fue tocado.
+    if crate::arch::debug_regs::dr6_is_data_breakpoint(dr6) {
+        if let Some(slot) = crate::arch::debug_regs::fired_slot(dr6) {
+            crate::drivers::serial::write_str(" ranura=DR");
+            crate::drivers::serial::write_usize(slot);
+            let vig = crate::process::bp_trap_addr(pid, f.rip, false, dr6);
+            crate::drivers::serial::write_str(" vigilada=");
+            crate::drivers::serial::write_hex(vig as usize);
+        }
+    }
+    crate::drivers::serial::write_str("\n");
+    crate::process::anotar_dr6(pid, dr6);
+
+    // [CICLO v6.x] Depuración interactiva: si el proceso está bajo la
+    // supervisión de un trazador, el evento de depuración NO se entrega al
+    // propio proceso. El objetivo queda DETENIDO conservando su contexto y el
+    // trazador lo recibe con `waitpid` (WIFSTOPPED). El RIP ya corregido se
+    // graba en el frame de retorno, de modo que al reanudar (`PTRACE_CONT`)
+    // la ejecución continúe en la instrucción correcta.
+    if crate::process::is_process_actively_traced(pid) {
+        // [CICLO v6.x] Breakpoints condicionales: la condición se evalúa en el
+        // KERNEL, con los registros reales del frame, y decide si el trazador
+        // llega a enterarse. Si no se cumple, el objetivo continúa solo: ésa es
+        // la semántica de `break ... if` de un depurador real.
+        let dir_bp = crate::process::bp_trap_addr(pid, f.rip, ajustar_rip, dr6);
+        if let crate::process::CondEval::Falsa = crate::process::eval_bp_cond(pid, dir_bp, f) {
+            // El objetivo debe ejecutar la instrucción que quedó detenida sin que
+            // el hardware vuelva a disparar en el mismo punto: se pisa el punto
+            // de parada de ejecución durante UNA instrucción (Trap Flag) y se
+            // re-arma en el trap siguiente. Con puntos de parada por SOFTWARE el
+            // frame ya apunta a la instrucción siguiente y basta con reanudar.
+            if crate::process::bp_trap_es_ejecucion(pid, dr6) {
+                if let Some(slot) = crate::arch::debug_regs::fired_slot(dr6) {
+                    crate::arch::debug_regs::disable_slot(slot);
+                    crate::process::marcar_rearmado(pid, slot);
+                    if let Some(base) = crate::process::signals::current_saved_frame() {
+                        unsafe {
+                            let slot_rf = (base + crate::process::signals::FRAME_RFLAGS as u64) as *mut u64;
+                            let rf = core::ptr::read_unaligned(slot_rf) | 0x100;
+                            core::ptr::write_unaligned(slot_rf, rf);
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+        if let Some(base) = crate::process::signals::current_saved_frame() {
+            unsafe {
+                let slot = (base + crate::process::signals::FRAME_RIP as u64) as *mut u64;
+                core::ptr::write_unaligned(slot, rip);
+            }
+        }
+        crate::process::stop_for_tracer(pid, crate::process::signals::SIGTRAP as u8, f.rip);
+        crate::drivers::serial::write_str("[TRAP-STOP] PID=");
+        crate::drivers::serial::write_usize(pid as usize);
+        crate::drivers::serial::write_str(" motivo=");
+        crate::drivers::serial::write_str(kind);
+        crate::drivers::serial::write_str(" RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        crate::drivers::serial::write_str(" -> detenido, trazador notificado\n");
+        // [85ª, defecto 22] Si no hay nadie listo (el trazador corre en la otra
+        // CPU) se espera a que lo reanude; antes este AP moría en `halt_loop`.
+        return crate::process::esperar_mientras_detenido();
+    }
+
+    // [CICLO v6.x] Auto-observación: el proceso pidió un paso a paso sobre sí
+    // mismo. El evento ya se cumplió, así que se consume (no se entrega SIGTRAP
+    // a quien no lo espera) y la ejecución continúa con normalidad.
+    if !ajustar_rip && !crate::arch::debug_regs::dr6_is_data_breakpoint(dr6)
+        && crate::process::consume_self_singlestep(pid)
+    {
+        crate::drivers::serial::write_str("[SINGLE-STEP] PID=");
+        crate::drivers::serial::write_usize(pid as usize);
+        crate::drivers::serial::write_str(" RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        crate::drivers::serial::write_str(" -> paso consumido (auto-observaci\u{f3}n)\n");
+        return 0;
+    }
+
+    // [CICLO v6.x] Auto-observación: el proceso pidió un paso a paso sobre sí
+    // mismo. El evento ya se cumplió, así que se consume (no se entrega SIGTRAP
+    // a quien no lo espera) y la ejecución continúa con normalidad.
+    if !ajustar_rip && !crate::arch::debug_regs::dr6_is_data_breakpoint(dr6)
+        && crate::process::consume_self_singlestep(pid)
+    {
+        crate::drivers::serial::write_str("[SINGLE-STEP] PID=");
+        crate::drivers::serial::write_usize(pid as usize);
+        crate::drivers::serial::write_str(" RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        crate::drivers::serial::write_str(" -> paso consumido (auto-observaci\u{f3}n)\n");
+        return 0;
+    }
+
+    let handled = crate::process::signals::deliver_from_exception(
+        extra,
+        rip, f.rsp, f.rflags,
+        f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi,
+        f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15, f.rbp,
+        // SIGTRAP: si_code TRAP_BRKPT (1) / TRAP_TRACE (2), si_addr = RIP; trapno 3 / 1
+        crate::process::signals::InfoFallo { code: if ajustar_rip { 1 } else { 2 }, addr: rip, err: 0, trapno: if ajustar_rip { 3 } else { 1 } },
+    );
+    if handled {
+        crate::drivers::serial::write_str("[SIG] SIGTRAP entregado a manejador de usuario PID=");
+        crate::drivers::serial::write_usize(pid as usize);
+        crate::drivers::serial::write_str(" (");
+        crate::drivers::serial::write_str(reason);
+        crate::drivers::serial::write_str(")\n");
+        return 0;
+    }
+    // Sin manejador: acción por defecto (terminar el proceso) y cambio de contexto.
+    crate::process::clear_watchpoints(pid);
+    try_recover_ring3(reason, dr6)
+}
+
+#[no_mangle]
+extern "C" fn isr_dbg_handler() -> u64 {
+    handle_debug_trap("debug_exception", false)
+}
+
+#[no_mangle]
+extern "C" fn isr_bp_handler() -> u64 {
+    handle_debug_trap("breakpoint_int3", true)
+}
+
+/// Attempt to recover from a ring-3 exception. Returns the new RSP if a
+/// process switch happened, or 0 if the exception was not from ring 3.
+fn try_recover_ring3(reason: &str, ec: u64) -> u64 {
+    if !is_from_ring3() {
+        // [E3d] Excepción en modo núcleo: antes se dibujaba la pantalla de
+        // pánico y se detenía la CPU sin escribir NADA en el serie (en un AP
+        // era invisible: sólo se notaba porque "desaparecían" procesos).
+        let f = frame();
+        crate::drivers::serial::write_str("[EXCEPTION-K] ");
+        crate::drivers::serial::write_str(reason);
+        crate::drivers::serial::write_str(" cpu=");
+        crate::drivers::serial::write_usize(crate::arch::percpu::indice_actual());
+        crate::drivers::serial::write_str(" pid=");
+        crate::drivers::serial::write_usize(crate::arch::percpu::pid_actual() as usize);
+        crate::drivers::serial::write_str(" RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        crate::drivers::serial::write_str(" RSP=");
+        crate::drivers::serial::write_hex(f.rsp as usize);
+        crate::drivers::serial::write_str(" EC=");
+        crate::drivers::serial::write_hex(ec as usize);
+        crate::drivers::serial::write_str(" CR3=");
+        crate::drivers::serial::write_hex(crate::mem::paging::read_cr3() as usize);
+        crate::drivers::serial::write_str("\n");
+        return 0;
+    }
+    let f = frame();
+
+    // Print diagnostic and kill the process
+    crate::drivers::serial::write_str("[R3-EXC] ");
+    crate::drivers::serial::write_str(reason);
+    if let Some(proc) = crate::process::current_process() {
+        crate::drivers::serial::write_str(" PID=");
+        crate::drivers::serial::write_usize(proc.pid as usize);
+        crate::drivers::serial::write_str(" '");
+        crate::drivers::serial::write_str(proc.name_str());
+        crate::drivers::serial::write_str("' RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        crate::drivers::serial::write_str(" RSP=");
+        crate::drivers::serial::write_hex(f.rsp as usize);
+        crate::drivers::serial::write_str(" EC=");
+        crate::drivers::serial::write_hex(ec as usize);
+        crate::drivers::serial::write_str("\n");
+        let pid = proc.pid;
+        crate::process::process_exit(pid, -1);
+    }
+
+    // Pick next ready process
+    unsafe {
+        let next = crate::process::pick_next_ready();
+        if !next.is_null() {
+            (*next).state = ProcessState::Running;
+            crate::process::set_tss_rsp0((*next).kernel_stack_top as u64);
+            let current_cr3 = crate::mem::paging::read_cr3();
+            if (*next).cr3 != current_cr3 {
+                crate::mem::paging::write_cr3((*next).cr3);
+            }
+            return (*next).kernel_rsp;
+        }
+    }
+    halt_loop()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PAGE FAULT  #PF
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[no_mangle]
+extern "C" fn isr_page_fault(ec: u64) -> u64 {
+    let cr2: u64;
+    unsafe { core::arch::asm!("mov {r}, cr2", r = out(reg) cr2, options(nostack, preserves_flags)); }
+
+    // [ÉPICA 58] Trampolín de retorno de manejador de señales (rt_sigreturn).
+    // Se resuelve antes de cualquier otra estrategia de paginación: la página
+    // del trampolín nunca debe mapearse ni resolverse por demanda.
+    if try_sigreturn_trampoline(cr2) {
+        return 0;
+    }
+    // [T-025 E3d] COW, páginas perezosas (también las respaldadas por fichero),
+    // crecimiento de pila y señales tocan tablas y VFS: bajo el cerrojo grande.
+    let _cgn = crate::arch::bkl::Guard::tomar();
+
+    // [b191 / T-014] Reserva perezosa (mmap anónimo sin marco): se materializa en
+    // silencio, es el camino normal de la memoria, no una excepción que registrar.
+    // [T-035] La misma ruta restaura una página protegida CON marco cuando la
+    // protección permite el acceso: sin asignar memoria y conservando el
+    // contenido; si no lo permite, devuelve false y acaba en señal.
+    if ec & 1 == 0 && ec & 4 != 0 {
+        if crate::mem::paging::materializar_perezosa(crate::mem::paging::read_cr3(), cr2 as usize, ec & 2 != 0) {
+            return 0;
+        }
+    }
+    // [T-005b, defecto 28] El NÚCLEO toca memoria de usuario en nombre del proceso
+    // (memcpy de una syscall sobre un búfer que el programa reservó con mmap y aún
+    // no había tocado): la reserva perezosa también se materializa desde Ring 0.
+    // rustc moría con `[EXCEPTION-K] page_fault` en `memcpy` (CR2 dentro de un
+    // mmap anónimo recién pedido). Sólo direcciones de usuario y con proceso actual.
+    if ec & 1 == 0 && ec & 4 == 0 && (cr2 as usize) < 0x0000_8000_0000_0000 && crate::process::current_process().is_some() {
+        if crate::mem::paging::materializar_perezosa(crate::mem::paging::read_cr3(), cr2 as usize, ec & 2 != 0) {
+            return 0;
+        }
+    }
+    // [T-025 E3d] Fallo espurio (otra CPU ya resolvió la página mientras esta
+    // esperaba el cerrojo grande): purgar TLB y reintentar, no es un error.
+    if ec & 4 != 0 && crate::mem::paging::fallo_espurio(crate::mem::paging::read_cr3(), cr2 as usize, ec & 2 != 0, ec & 16 != 0) {
+        return 0;
+    }
+
+    let f = frame();
+    // [T-020] La línea `[EXCEPTION] #PF …` sólo se escribe cuando el fallo NO es
+    // memoria virtual normal (COW, pila, swap) ni una señal con manejador que ya
+    // se contó: 7 691 líneas por sonda de la JVM eran ruido. El escáner de la
+    // suite sigue exigiendo que todo `#PF CR2=` que aparezca tenga su resolución.
+    let linea_pf = |etiqueta: &str| {
+        crate::drivers::serial::write_str(etiqueta);
+        crate::drivers::serial::write_str(" #PF CR2=");
+        crate::drivers::serial::write_hex(cr2 as usize);
+        crate::drivers::serial::write_str(" EC=");
+        crate::drivers::serial::write_hex(ec as usize);
+        crate::drivers::serial::write_str(" RIP=");
+        crate::drivers::serial::write_hex(f.rip as usize);
+        if let Some(p) = crate::process::current_process() {
+            crate::drivers::serial::write_str(" PID=");
+            crate::drivers::serial::write_usize(p.pid as usize);
+            crate::drivers::serial::write_str(" '");
+            crate::drivers::serial::write_str(p.name_str());
+            crate::drivers::serial::write_str("'");
+        }
+    };
+
+    // Manejo transparente de Memoria Virtual Avanzada (COW, Demand Paging y Swap-In)
+    let current_cr3 = crate::mem::paging::read_cr3();
+    if (ec & 2 != 0) && (ec & 4 != 0) { // User write access -> COW
+        if crate::mem::paging::handle_cow_fault(current_cr3, cr2 as usize) {
+            linea_pf("[COW]");
+            crate::drivers::serial::write_str(" Page Fault resuelto exitosamente via Copy-On-Write\n");
+            return 0;
+        }
+    }
+    // [T-040] Sólo crece la pila sobre un HUECO genuino. Una reserva perezosa
+    // explícita (PROT_NONE incluida) dentro de la ventana de pila es una VMA del
+    // proceso: no puede convertirse en pila escribible. Si la reserva permite el
+    // acceso ya la habrán materializado los intentos anteriores; si no, este
+    // fallo debe llegar a la señal, no a `crecer_pila`.
+    // [T-035] Una página protegida con marco tampoco es un hueco: crecer la
+    // pila encima de ella la haría escribible y perdería su contenido.
+    let hueco_de_verdad = crate::mem::paging::pte_cruda(current_cr3, cr2 as usize)
+        .map_or(true, |pte| pte == 0);
+    if ec & 1 == 0 && ec & 4 != 0 && hueco_de_verdad { // [T-004] pila de usuario extensible (8 MiB)
+        if crate::mem::paging::crecer_pila(current_cr3, cr2 as usize) {
+            linea_pf("[PILA]");
+            crate::drivers::serial::write_str(" pagina de pila extendida mapeada\n");
+            return 0;
+        }
+    }
+    if ec & 1 == 0 { // Page not present -> Demand Paging o Swap-In
+        if crate::mem::paging::swap_page_in(current_cr3, cr2 as usize).is_ok() {
+            linea_pf("[SWAP]");
+            crate::drivers::serial::write_str(" Page Fault resuelto exitosamente via Swap-In\n");
+            return 0;
+        }
+    }
+    // Señal con manejador: la entrega se registra en `deliver_signal_from_exception`
+    // (3 primeras por proceso + total al salir). Sin manejador: línea completa y muerte.
+    let con_manejador = is_from_ring3() && crate::process::signals::tiene_manejador(crate::process::signals::SIGSEGV);
+    if !con_manejador {
+        linea_pf("[EXCEPTION]");
+        crate::drivers::serial::write_str("\n");
+    }
+
+    // [ÉPICA 58] SIGSEGV: si el proceso instaló manejador, se le entrega el
+    // fallo en lugar de terminar el proceso de inmediato.
+    // [T-035c] El bit P de hardware no distingue una dirección no mapeada de
+    // una reserva PROT_NONE: ambas usan una PTE no presente. Linux informa
+    // ACCERR para la reserva (existe, pero el acceso está prohibido), y MAPERR
+    // para un hueco. Sólo se reclasifica la reserva perezosa de protección cero;
+    // no se atribuyen a permisos otros fallos, p. ej. falta de memoria.
+    // [T-035] Una página PROTEGIDA con marco es una dirección que existe y cuyo
+    // acceso está prohibido: ACCERR, igual que la reserva perezosa sin acceso.
+    let reserva_sin_acceso = ec & 4 != 0 &&
+        crate::mem::paging::pte_cruda(current_cr3, cr2 as usize).map_or(false, |pte| {
+            crate::mem::paging::es_protegida(pte)
+                || (crate::mem::paging::es_perezosa(pte) && crate::mem::paging::prot_perezosa(pte) == 0)
+        });
+    let fallo = crate::process::signals::InfoFallo {
+        code: if ec & 1 != 0 || reserva_sin_acceso { crate::process::signals::SEGV_ACCERR } else { crate::process::signals::SEGV_MAPERR },
+        addr: cr2, err: ec, trapno: 14,
+    };
+    if deliver_signal_from_exception(crate::process::signals::SIGSEGV, "page_fault", fallo) {
+        return 0;
+    }
+
+    // Try ring-3 recovery first
+    let recovered = try_recover_ring3("page_fault", ec);
+    if recovered != 0 {
+        return recovered;
+    }
+
+    if crate::mem::paging::is_expecting_user_fault() {
+        crate::mem::paging::clear_expect_user_fault();
+        crate::drivers::serial::write_str("#PF recovered (expected user fault)\n");
+        return 0;
+    }
+
+    let f = frame();
+
+    // [FIX-GP-DF] Si valid == 0 el framebuffer puede no estar mapeado.
+    // Caer al VGA text buffer evita la cascada #PF → #GP → #GP → #DF.
+    if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #PF PAGE FAULT  |  Sistema detenido             ",
+                b"  CR2 no disponible (crash_frame.valid=0). Reinicia el sistema.",
+            );
+        }
+        halt_loop()
+    }
+
+    let mut c = Console::new();
+    let (w, h) = (c.width(), c.height());
+    let split = w * 2 / 5;
+
+    for y in 0..h {
+        let t = (y as u32 * 50 / h.max(1) as u32) as u8;
+        c.fill_rect(0,     y, split,     1, pal::PF_BG_L.blend(Color::new(0x00, 0x07, 0x28), t));
+        c.fill_rect(split, y, w - split, 1, pal::PF_BG_R.blend(Color::new(0x02, 0x06, 0x1C), t));
+    }
+    dot_grid(&mut c, 0, 0, split, h, 22, pal::PF_GRID);
+    for dx in 0..4usize {
+        c.fill_rect(split + dx, 0, 1, h, pal::PF_GOLD.dim([255,140,60,20][dx]));
+    }
+    draw_top_bar(&mut c, pal::PF_GOLD, pal::PF_BLUE);
+    draw_corner_rip(&mut c, f.rip, f.valid);
+
+    let lp = 32usize;
+    c.write_at_tall("#PF", lp+3, 46, pal::PF_OUTLINE);
+    c.write_at_tall("#PF", lp+1, 44, pal::PF_GOLD_DIM);
+    c.write_at_tall("#PF", lp,   43, pal::PF_GOLD);
+    write_glow(&mut c, "PAGE  FAULT", lp, 69, pal::WHITE, pal::PF_OUTLINE);
+    c.write_at("Acceso a memoria no mapeada o protegida.", lp, 86, pal::LIGHT);
+    c.fill_rect(lp, 100, split - lp*2, 1, pal::PF_GOLD.dim(45));
+
+    let bw = (split - lp*2).min(280);
+    c.fill_rect(lp, 106, bw, 44, Color::new(0x14,0x10,0x00));
+    c.fill_rect(lp, 106, bw, 2,  pal::PF_GOLD.dim(180));
+    c.fill_rect(lp, 148, bw, 1,  pal::PF_GOLD.dim(55));
+    c.write_at("DIRECCION FAULTING (CR2)", lp+8, 111, pal::MID);
+    { let mut buf=[0u8;18]; write_glow(&mut c, fmt_hex(cr2,&mut buf), lp+8, 124, pal::PF_GOLD, pal::PF_GOLD_DIM.dim(55)); }
+
+    let cause = if cr2 < 0x1000 { "Null pointer / acceso a pagina 0" }
+                else if cr2 > 0xFFFF_8000_0000_0000 { "Acceso a espacio de kernel desde usuario" }
+                else if cr2 == f.rip { "Instruccion no ejecutable (NX bit activo)" }
+                else { "Pagina no presente o sin permisos de acceso" };
+    c.write_at("CAUSA PROBABLE", lp, 158, pal::MID);
+    c.write_at(cause, lp, 172, pal::PF_BLUE);
+    c.write_at("VECTOR   0x0E  (#PF)", lp, 192, pal::MID);
+    { let mut buf=[0u8;18]; c.write_at("RIP", lp, 208, pal::MID); c.write_at(fmt_hex(f.rip,&mut buf), lp+36, 208, pal::PF_BLUE); }
+
+    let rx = split + 18;
+    let rw = w.saturating_sub(rx + 14);
+    section_title(&mut c, "ERROR CODE", rx, 28, pal::PF_GOLD.dim(200));
+    { let mut buf=[0u8;18]; c.write_at(fmt_hex(ec,&mut buf), rx+110, 28, pal::PF_GOLD); }
+
+    let bits: &[(&str, &str, u64)] = &[
+        ("P",  "Presente en tabla",    1<<0), ("W",   "Operacion escritura",   1<<1),
+        ("U",  "Modo usuario (CPL=3)", 1<<2), ("R",   "Reserved write",        1<<3),
+        ("I",  "Inst. fetch (NX/XD)", 1<<4),  ("PK",  "Prot. key (MPK)",       1<<5),
+        ("SS", "Shadow stack (CET)",  1<<6),  ("SGX", "SGX access control",   1<<15),
+    ];
+    for (i, (name, desc, mask)) in bits.iter().enumerate() {
+        let by = 46 + i * 20;
+        let set = (ec & mask) != 0;
+        let ic = if set { pal::PF_GREEN } else { pal::PF_GRAY };
+        c.fill_rect(rx, by+1, 12, 12, ic.dim(if set{200}else{50}));
+        if set { c.fill_rect(rx+3, by+4, 6, 6, ic); }
+        c.write_at(name, rx+16, by+2, ic);
+        c.write_at(desc, rx+44, by+2, if set{pal::WHITE}else{pal::MID});
+    }
+
+    let sep_y = 46 + bits.len() * 20 + 8;
+    c.fill_rect(rx, sep_y, rw, 1, pal::PF_GOLD.dim(35));
+    section_title(&mut c, "CONTEXTO DE CPU", rx, sep_y+10, pal::PF_GOLD.dim(200));
+    let regs: &[(&str,u64)] = &[
+        ("CR2 ",cr2),("EC  ",ec),("RIP ",f.rip),("RSP ",f.rsp),
+        ("RFLG",f.rflags),("CR3 ",f.cr3),("RAX ",f.rax),("RBX ",f.rbx),
+        ("RCX ",f.rcx),("RDX ",f.rdx),
+    ];
+    reg_grid_ncol(&mut c, regs, rx, sep_y+24, 2, (rw.saturating_sub(12))/2, 16, pal::PF_GOLD.dim(110));
+
+    draw_bottom_bar(&mut c, pal::PF_GOLD, pal::PF_BLUE, "#PF PAGE FAULT  |  SISTEMA DETENIDO");
+    c.present(); halt_loop()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GENERAL PROTECTION FAULT  #GP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[no_mangle]
+extern "C" fn isr_gp_handler(ec: u64) -> u64 {
+    crate::drivers::serial::write_str("[EXCEPTION] #GP EC=");
+    crate::drivers::serial::write_hex(ec as usize);
+    let f = frame();
+    // [E3d] Datos mínimos por serie (la pantalla de pánico no llega al log de la suite).
+    crate::drivers::serial::write_str(" RIP=");
+    crate::drivers::serial::write_hex(f.rip as usize);
+    crate::drivers::serial::write_str(" RSP=");
+    crate::drivers::serial::write_hex(f.rsp as usize);
+    crate::drivers::serial::write_str(" cpu=");
+    crate::drivers::serial::write_usize(crate::arch::percpu::indice_actual());
+    crate::drivers::serial::write_str(" pid=");
+    crate::drivers::serial::write_usize(crate::arch::percpu::pid_actual() as usize);
+    crate::drivers::serial::write_str(" valid=");
+    crate::drivers::serial::write_usize(f.valid as usize);
+    crate::drivers::serial::write_str("\n");
+
+    let recovered = try_recover_ring3("general_protection", ec);
+    if recovered != 0 {
+        return recovered;
+    }
+
+    if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #GP GENERAL PROTECTION FAULT  |  Sistema detenido",
+                b"  (crash_frame.valid=0 - ISR sin frame capturado). EC puede ser 0.",
+            );
+        }
+        halt_loop()
+    }
+
+    let mut c = Console::new();
+    let (w, h) = (c.width(), c.height());
+
+    grad_v(&mut c, pal::GP_BG, pal::GP_BG2);
+    watermark(&mut c, "PORTIX  #GP", Color::new(0x14, 0x00, 0x28));
+    dot_grid(&mut c, 0, 0, w, h, 20, Color::new(0x18, 0x00, 0x30));
+    draw_top_bar(&mut c, pal::GP_VIOLET, pal::GP_MAGENTA);
+    draw_corner_rip(&mut c, f.rip, f.valid);
+
+    let ix=42usize; let iy=38usize;
+    for dy in 0..4usize {
+        for dx in 0..dy*2+1 {
+            c.fill_rect(ix+11-dy+dx, iy+dy*4, 1, 4, pal::GP_VIOLET);
+        }
+    }
+    c.fill_rect(ix+8, iy+18, 7, 10, pal::GP_VIOLET);
+    c.fill_rect(ix+10, iy+18, 3, 12, Color::new(0x18,0,0x30));
+
+    let tx=78usize; let ty=36usize;
+    write_glow_tall(&mut c, "#GP GENERAL PROTECTION FAULT", tx, ty, pal::GP_VIOLET, pal::GP_DIM);
+    badge(&mut c, "EXCEPCION DE PROTECCION GENERAL", tx, ty+30, pal::WHITE, pal::GP_DIM);
+    diamond_sep(&mut c, ty+52, pal::GP_VIOLET);
+
+    let d_y=ty+60;
+    section_title(&mut c, "CAUSAS COMUNES", tx, d_y, pal::GP_VIOLET.dim(200));
+    c.write_at("►  Acceso a memoria con alineacion incorrecta (SSE: movaps, movdqa)", tx, d_y+16, pal::GP_PINK.dim(180));
+    c.write_at("►  Segmento de codigo/datos con permisos insuficientes",            tx, d_y+28, pal::GP_PINK.dim(180));
+    c.write_at("►  MSR invalido: escritura WRMSR a MSR reservado",                tx, d_y+40, pal::GP_PINK.dim(180));
+    c.write_at("►  Instruccion privilegiada ejecutada en ring 3 (CPL>0)",          tx, d_y+52, pal::GP_PINK.dim(180));
+
+    let err_y=d_y+68;
+    section_title(&mut c, "ERROR CODE", tx, err_y, pal::GP_VIOLET.dim(200));
+    { let mut buf=[0u8;18]; c.write_at(fmt_hex(ec, &mut buf), tx+110, err_y, pal::GP_YELLOW); }
+
+    let reg_y=err_y+28;
+    section_title(&mut c, "CONTEXTO DE CPU", tx, reg_y, pal::MID);
+    let regs: &[(&str,u64)] = &[
+        ("EC  ",ec),("RIP ",f.rip),("RSP ",f.rsp),("RFLG",f.rflags),
+        ("RAX ",f.rax),("RBX ",f.rbx),("RCX ",f.rcx),("RDX ",f.rdx),
+    ];
+    reg_grid_ncol(&mut c, regs, tx, reg_y+16, 2, 200, 16, pal::GP_VIOLET.dim(130));
+
+    draw_bottom_bar(&mut c, pal::GP_VIOLET, pal::GP_MAGENTA,
+                   "#GP GENERAL PROTECTION FAULT  |  SISTEMA DETENIDO");
+    c.present(); halt_loop()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DOUBLE FAULT  #DF
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[no_mangle]
+extern "C" fn isr_double_fault(_ec: u64) {
+    let f = frame();
+    if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #DF  DOUBLE FAULT  |  Sistema detenido             ",
+                b"  (crash_frame.valid=0 - framebuffer no disponible). EC=0.",
+            );
+        }
+        halt_loop()
+    }
+    unsafe {
+        let v = 0xB8000usize as *mut u16;
+        for i in 0..160usize { core::ptr::write_volatile(v.add(i), 0x4F20); }
+        let msg  = b"  PORTIX-OS  #DF  DOUBLE FAULT  |  SISTEMA DETENIDO  ";
+        let msg2 = b"  Excepcion doble -- Stack o IDT corrompidos. IST1 activo.";
+        for (i,&b) in msg.iter().enumerate()  { core::ptr::write_volatile(v.add(i),   0x4F00|b as u16); }
+        for (i,&b) in msg2.iter().enumerate() { if i<80{core::ptr::write_volatile(v.add(80+i), 0x4E00|b as u16);} }
+    }
+
+    let mut c = Console::new();
+    let (w, h) = (c.width(), c.height());
+    grad_v(&mut c, pal::DF_BG, Color::new(0,2,0));
+
+    let crt_w=w.min(720); let crt_h=h.min(360);
+    let crt_x=(w-crt_w)/2; let crt_y=(h-crt_h)/2;
+    c.fill_rect(crt_x.saturating_sub(12),crt_y.saturating_sub(12),crt_w+24,crt_h+24,Color::new(0x10,0x10,0x10));
+    c.fill_rounded(crt_x.saturating_sub(6),crt_y.saturating_sub(6),crt_w+12,crt_h+12,10,Color::new(0x1A,0x1A,0x1A));
+    c.fill_rect(crt_x,crt_y,crt_w,crt_h,Color::new(0xAA,0,0));
+
+    let cw=8usize; let ch=14usize;
+    let wy=|r:usize| crt_y+r*ch+ch;
+    fn crt_cx(crt_x:usize,crt_w:usize,cw:usize,s:&str)->usize{ crt_x+(crt_w.saturating_sub(s.len()*cw))/2 }
+
+    c.fill_rect(crt_x,crt_y+ch,crt_w,ch+4,Color::new(0xFF,0xFF,0xFF));
+    let t="  PORTIX  #DF  DOUBLE FAULT  |  SISTEMA DETENIDO  ";
+    c.write_at(t,crt_cx(crt_x,crt_w,cw,t),crt_y+ch+2,Color::new(0xAA,0,0));
+    c.fill_rect(crt_x+10,wy(2),crt_w-20,1,Color::new(0xFF,0x88,0x88));
+
+    let lines: &[(&str,Color)] = &[
+        ("Excepcion doble -- #DF ocurre cuando un handler falla.", Color::new(0xFF,0xEE,0xEE)),
+        ("Causas comunes:", Color::new(0xFF,0xDD,0xDD)),
+        ("  - Stack overflow (kernel stack agotado)",  Color::new(0xFF,0xCC,0xCC)),
+        ("  - IDT corrompida o descriptor invalido",   Color::new(0xFF,0xCC,0xCC)),
+        ("  - Doble excepcion en el primer handler",   Color::new(0xFF,0xCC,0xCC)),
+        ("",Color::new(0,0,0)),
+        ("Este handler usa IST1 (stack dedicado 16KB).",Color::new(0xFF,0xBB,0x88)),
+        ("Reinicia el sistema. PORTIX-OS termina aqui.",Color::new(0xFF,0xBB,0x88)),
+    ];
+    for (i,(t,col)) in lines.iter().enumerate() {
+        if t.is_empty(){continue;} c.write_at(t,crt_cx(crt_x,crt_w,cw,t),wy(3+i),*col);
+    }
+    c.fill_rect(crt_x+10,wy(3+lines.len())+ch-3,cw,2,pal::WHITE);
+    let mut sy=crt_y; while sy<crt_y+crt_h{c.fill_rect(crt_x,sy,crt_w,1,Color::new(0x44,0,0));sy+=2;}
+    for i in 0..16usize {
+        let d=(16-i) as u8*14;
+        c.fill_rect(crt_x+i,crt_y,1,crt_h,Color::new(0,0,0).dim(d));
+        c.fill_rect(crt_x+crt_w-1-i,crt_y,1,crt_h,Color::new(0,0,0).dim(d));
+        c.fill_rect(crt_x,crt_y+i,crt_w,1,Color::new(0,0,0).dim(d));
+        c.fill_rect(crt_x,crt_y+crt_h-1-i,crt_w,1,Color::new(0,0,0).dim(d));
+    }
+    c.write_at("PORTIX CRT TERMINAL  80 x 25",crt_x+(crt_w-25*9)/2,crt_y+crt_h+12,Color::new(0x28,0x28,0x28));
+    badge(&mut c,"IST1  16KB  DEDICATED STACK",w/2-134,crt_y+crt_h+28,pal::DF_GREEN.dim(180),Color::new(0,0x12,4));
+    draw_bottom_bar(&mut c,pal::DF_GREEN,Color::new(0,0,0),"#DF DOUBLE FAULT  |  IST1  |  SISTEMA DETENIDO");
+    c.present(); halt_loop()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DIVIDE BY ZERO  #DE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[no_mangle]
+extern "C" fn isr_divide_by_zero() -> u64 {
+    // [ÉPICA 58] SIGFPE: el proceso puede capturar la división por cero
+    let fallo = crate::process::signals::InfoFallo {
+        code: crate::process::signals::FPE_INTDIV, addr: frame().rip, err: 0, trapno: 0,
+    };
+    if deliver_signal_from_exception(crate::process::signals::SIGFPE, "divide_by_zero", fallo) {
+        return 0;
+    }
+    let recovered = try_recover_ring3("divide_by_zero", 0);
+    if recovered != 0 {
+        return recovered;
+    }
+
+    let f = frame();
+
+    // [FIX-GP-DF] Misma guardia: sin valid no accedemos al framebuffer.
+    if f.valid == 0 {
+        unsafe { vga_error(b"  PORTIX-OS  #DE DIVIDE BY ZERO  |  Sistema detenido         ",
+                           b"  (crash_frame.valid=0)                                       "); }
+        halt_loop()
+    }
+
+    let mut c = Console::new();
+    let (w, h) = (c.width(), c.height());
+
+    grad_v(&mut c, Color::new(0x0E,0x05,0), Color::new(0x18,0x08,0));
+    dot_grid(&mut c, 0, 0, w, h, 20, Color::new(0x26,0x0C,0));
+    draw_top_bar(&mut c, pal::PANIC_ORANGE, pal::PANIC_RED);
+    draw_corner_rip(&mut c, f.rip, f.valid);
+
+    let ix=46usize; let iy=40usize;
+    c.fill_rounded(ix+6,iy,12,12,6,pal::PANIC_ORANGE);
+    c.fill_rect(ix,iy+16,24,6,pal::PANIC_ORANGE);
+    c.fill_rounded(ix+6,iy+26,12,12,6,pal::PANIC_ORANGE);
+
+    let tx=80usize; let ty=40usize;
+    write_glow_tall(&mut c,"#DE  DIVIDE  BY  ZERO",tx,ty,pal::PANIC_ORANGE,Color::new(0x2E,0x0C,0));
+    c.fill_rect(tx,ty+30,w-tx-44,1,pal::PANIC_ORANGE.dim(45));
+    c.write_at("Division entre cero o desbordamiento en instruccion DIV/IDIV.",tx,ty+38,pal::LIGHT);
+
+    let d_y=ty+58;
+    section_title(&mut c,"DIAGNOSTICO",tx,d_y,pal::PANIC_ORANGE.dim(180));
+    c.write_at("►  Divisor (RCX/RBX/otro) vale 0 en el momento del fallo",tx,d_y+16,pal::AMBER.dim(180));
+    c.write_at("►  IDIV con resultado fuera de rango del registro destino",tx,d_y+28,pal::AMBER.dim(180));
+
+    let reg_y=d_y+48;
+    section_title(&mut c,"REGISTROS AL MOMENTO DEL FALLO",tx,reg_y,pal::MID);
+    let regs: &[(&str,u64)] = &[
+        ("RIP ",f.rip),("RAX ",f.rax),("RDX ",f.rdx),
+        ("RCX ",f.rcx),("RBX ",f.rbx),("RSP ",f.rsp),
+    ];
+    reg_grid_ncol(&mut c,regs,tx,reg_y+16,3,(w.saturating_sub(tx+44))/3,16,pal::PANIC_ORANGE.dim(130));
+
+    draw_bottom_bar(&mut c,pal::PANIC_ORANGE,pal::PANIC_RED,"#DE DIVIDE BY ZERO  |  SISTEMA DETENIDO");
+    c.present(); halt_loop()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BOUND RANGE  #BR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[no_mangle]
+extern "C" fn isr_bound_range() -> u64 {
+    let recovered = try_recover_ring3("bound_range", 0);
+    if recovered != 0 {
+        return recovered;
+    }
+
+    let f = frame();
+    if f.valid == 0 {
+        unsafe { vga_error(b"  PORTIX-OS  #BR BOUND RANGE  |  Sistema detenido            ",
+                           b"  (crash_frame.valid=0)                                       "); }
+        halt_loop()
+    }
+    let mut c = Console::new();
+    let (w, h) = (c.width(), c.height());
+
+    grad_v(&mut c,Color::new(0,8,0x10),Color::new(0,4,0x0C));
+    dot_grid(&mut c,0,0,w,h,20,Color::new(0,0x14,0x20));
+    draw_top_bar(&mut c,pal::PF_BLUE,Color::new(0,0x44,0x88));
+    draw_corner_rip(&mut c,f.rip,f.valid);
+
+    let tx=52usize; let ty=40usize;
+    write_glow_tall(&mut c,"#BR  BOUND  RANGE",tx,ty,pal::PF_BLUE,Color::new(0,0x14,0x2A));
+    c.fill_rect(tx,ty+30,w-tx-44,1,pal::PF_BLUE.dim(45));
+    c.write_at("Indice fuera del rango definido por la instruccion BOUND.",tx,ty+38,pal::LIGHT);
+    c.write_at("VECTOR  0x05  (#BR)",tx,ty+52,pal::MID);
+
+    let d_y=ty+70;
+    section_title(&mut c,"REGISTROS",tx,d_y,pal::MID);
+    let regs: &[(&str,u64)] = &[("RIP ",f.rip),("RAX ",f.rax),("RCX ",f.rcx),("RSP ",f.rsp)];
+    reg_grid_ncol(&mut c,regs,tx,d_y+16,2,200,16,pal::PF_BLUE.dim(130));
+
+    draw_bottom_bar(&mut c,pal::PF_BLUE,Color::new(0,0x44,0x88),"#BR BOUND RANGE  |  SISTEMA DETENIDO");
+    c.present(); halt_loop()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INVALID OPCODE  #UD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[no_mangle]
+extern "C" fn isr_ud_handler() -> u64 {
+    let recovered = try_recover_ring3("invalid_opcode", 0);
+    if recovered != 0 {
+        return recovered;
+    }
+
+    // Si viene de ring 0, es un bug del kernel — no podemos continuar.
+    // Avanzar RIP no es seguro sin saber el tamaño de la instrucción.
+    // Mostrar pantalla y halt.
+    let f = frame();
+    if f.valid == 0 {
+        unsafe {
+            vga_error(
+                b"  PORTIX-OS  #UD INVALID OPCODE  |  Sistema detenido         ",
+                b"  (crash_frame.valid=0)                                       ",
+            );
+        }
+        halt_loop()  // ← nunca retorna, correcto
+    }
+
+
+    // Mostrar pantalla de error y detener — igual que antes pero
+    // asegurándonos que halt_loop() se llama SIEMPRE al final
+    let mut c = Console::new();
+        let (w, h) = (c.width(), c.height());
+
+    grad_v(&mut c,Color::new(7,0,0x12),Color::new(3,0,0x0A));
+    dot_grid(&mut c,0,0,w,h,20,Color::new(0x12,0,0x20));
+    draw_top_bar(&mut c,pal::GP_VIOLET,pal::GP_MAGENTA);
+    draw_corner_rip(&mut c,f.rip,f.valid);
+
+    let tx=52usize; let ty=40usize;
+    write_glow_tall(&mut c,"#UD  INVALID  OPCODE",tx,ty,pal::GP_VIOLET,Color::new(0x18,0,0x2E));
+    c.fill_rect(tx,ty+30,w-tx-44,1,pal::GP_VIOLET.dim(45));
+    c.write_at("La CPU encontro una instruccion no definida, UD2, o LOCK invalido.",tx,ty+38,pal::LIGHT);
+    c.write_at("VECTOR  0x06  (#UD)",tx,ty+52,pal::MID);
+
+    let d_y=ty+68;
+    section_title(&mut c,"CAUSAS COMUNES",tx,d_y,pal::GP_VIOLET.dim(180));
+    c.write_at("►  UD2 ejecutada intencionalmente (assert de CPU)",tx,d_y+16,pal::GP_PINK.dim(180));
+    c.write_at("►  Binario para ISA superior (SSE4/AVX en CPU sin soporte)",tx,d_y+28,pal::GP_PINK.dim(180));
+    c.write_at("►  Puntero de funcion invalido / salto a datos corrompidos",tx,d_y+40,pal::GP_PINK.dim(180));
+
+    let reg_y=d_y+58;
+    section_title(&mut c,"CONTEXTO AL MOMENTO DEL FALLO",tx,reg_y,pal::MID);
+    let regs: &[(&str,u64)] = &[("RIP ",f.rip),("RSP ",f.rsp),("RAX ",f.rax),("RBX ",f.rbx)];
+    reg_grid_ncol(&mut c,regs,tx,reg_y+16,2,200,16,pal::GP_VIOLET.dim(130));
+
+    draw_bottom_bar(&mut c,pal::GP_VIOLET,pal::GP_MAGENTA,"#UD INVALID OPCODE  |  SISTEMA DETENIDO");
+    c.present();
+    halt_loop()  // ← asegúrate que está aquí y no falta
+    }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  HANDLER GENÉRICO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[no_mangle]
+extern "C" fn isr_generic_handler() -> u64 {
+    let recovered = try_recover_ring3("generic_exception", 0);
+    if recovered != 0 {
+        return recovered;
+    }
+
+    let f = frame();
+    if f.valid == 0 {
+        unsafe { vga_error(b"  PORTIX-OS  CPU EXCEPTION  |  Sistema detenido              ",
+                           b"  (crash_frame.valid=0)                                       "); }
+        halt_loop()
+    }
+    let mut c = Console::new();
+    let (w, h) = (c.width(), c.height());
+
+    grad_v(&mut c,Color::new(5,6,8),Color::new(2,3,5));
+    dot_grid(&mut c,0,0,w,h,16,Color::new(0x0E,0x10,0x14));
+    draw_top_bar(&mut c,pal::AMBER,pal::MID);
+    draw_corner_rip(&mut c,f.rip,f.valid);
+
+    let tx=52usize; let ty=40usize;
+    write_glow_tall(&mut c,"CPU  EXCEPTION",tx,ty,pal::AMBER,Color::new(0x22,0x16,0));
+    c.fill_rect(tx,ty+30,w-tx-44,1,pal::AMBER.dim(45));
+    c.write_at("Excepcion de CPU no manejada especificamente por este kernel.",tx,ty+38,pal::LIGHT);
+
+    let reg_y=ty+56;
+    section_title(&mut c,"CONTEXTO COMPLETO DE CPU",tx,reg_y,pal::MID);
+    let regs: &[(&str,u64)] = &[
+        ("RIP ",f.rip),("RSP ",f.rsp),("RFLG",f.rflags),("CR3 ",f.cr3),
+        ("RAX ",f.rax),("RBX ",f.rbx),("RCX ",f.rcx),("RDX ",f.rdx),
+        ("RSI ",f.rsi),("RDI ",f.rdi),("R8  ",f.r8),("R9  ",f.r9),
+        ("R10 ",f.r10),("R11 ",f.r11),("R12 ",f.r12),("R13 ",f.r13),
+        ("R14 ",f.r14),("R15 ",f.r15),
+    ];
+    reg_grid_ncol(&mut c,regs,tx,reg_y+16,3,(w.saturating_sub(tx+44))/3,16,pal::AMBER.dim(130));
+
+    draw_bottom_bar(&mut c,pal::AMBER,pal::MID,"CPU EXCEPTION  |  SISTEMA DETENIDO");
+    c.present(); halt_loop()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INTRÍNSECOS DE MEMORIA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[no_mangle]
+#[allow(suspicious_runtime_symbol_definitions)]
+// [T-026] `rep stosq`/`rep movsq` en vez de un bucle de bytes `volatile`: el
+// perfil de `marcos::asignar` (/proc/smp `marcos_perfil_mciclos`) daba ~78 000
+// ciclos por poner a cero un marco de 4 KiB (14 009 Mciclos en una pasada de la
+// JVM), diez veces más que copiar el mismo marco. Todo el núcleo pasa por aquí
+// (`write_bytes`, `copy_nonoverlapping`, `vec![0; n]`). Inline asm: el
+// compilador no puede reconocer el bucle y volver a llamar a `memset` (recursión).
+// DF=0 por ABI SysV; no se toca.
+pub unsafe extern "C" fn memset(s: *mut u8, cv: i32, n: usize) -> *mut u8 {
+    let patron = (cv as u8 as u64).wrapping_mul(0x0101_0101_0101_0101);
+    core::arch::asm!(
+        "rep stosq",
+        "mov rcx, {cola}",
+        "rep stosb",
+        cola = in(reg) n & 7,
+        inout("rcx") n >> 3 => _,
+        inout("rdi") s => _,
+        in("rax") patron,
+        options(nostack, preserves_flags)
+    );
+    s
+}
+#[no_mangle]
+#[allow(suspicious_runtime_symbol_definitions)]
+pub unsafe extern "C" fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
+    core::arch::asm!(
+        "rep movsq",
+        "mov rcx, {cola}",
+        "rep movsb",
+        cola = in(reg) n & 7,
+        inout("rcx") n >> 3 => _,
+        inout("rdi") d => _,
+        inout("rsi") s => _,
+        options(nostack, preserves_flags)
+    );
+    d
+}
+
+// ── Input ring buffers ─────────────────────────────────────────────────────
+// SCANCODE_BUF  → kernel UI (main loop)
+// RING3_SCANCODE_BUF → ring-3 stdin (syscall)
+// MOUSE_BUF     → mouse bytes via IRQ12
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+pub const SCANCODE_BUF_SIZE: usize = 1024;
+pub const RING3_BUF_SIZE: usize = 256;
+pub const MOUSE_BUF_SIZE: usize = 128;
+
+static mut SCANCODE_BUF: [u8; SCANCODE_BUF_SIZE] = [0u8; SCANCODE_BUF_SIZE];
+static SCANCODE_HEAD: AtomicU32 = AtomicU32::new(0);
+static SCANCODE_TAIL: AtomicU32 = AtomicU32::new(0);
+
+static mut RING3_SCANCODE_BUF: [u8; RING3_BUF_SIZE] = [0u8; RING3_BUF_SIZE];
+static RING3_HEAD: AtomicU32 = AtomicU32::new(0);
+static RING3_TAIL: AtomicU32 = AtomicU32::new(0);
+
+static mut MOUSE_BUF: [u8; MOUSE_BUF_SIZE] = [0u8; MOUSE_BUF_SIZE];
+static MOUSE_HEAD: AtomicU32 = AtomicU32::new(0);
+static MOUSE_TAIL: AtomicU32 = AtomicU32::new(0);
+
+fn push_ring(buf: &mut [u8], head: &AtomicU32, tail: &AtomicU32, size: u32, byte: u8) {
+    let h = head.load(Ordering::Relaxed);
+    let t = tail.load(Ordering::Relaxed);
+    let next = (h + 1) % size;
+    if next == t {
+        tail.store((t + 1) % size, Ordering::Relaxed);
+    }
+    buf[h as usize] = byte;
+    head.store(next, Ordering::Relaxed);
+}
+
+fn pop_ring(head: &AtomicU32, tail: &AtomicU32, buf: &[u8], size: u32) -> Option<u8> {
+    let h = head.load(Ordering::Relaxed);
+    let t = tail.load(Ordering::Relaxed);
+    if h == t { return None; }
+    let byte = unsafe { *buf.as_ptr().add(t as usize) };
+    tail.store((t + 1) % size, Ordering::Relaxed);
+    Some(byte)
+}
+
+pub fn push_scancode(sc: u8) {
+    unsafe {
+        push_ring(&mut SCANCODE_BUF, &SCANCODE_HEAD, &SCANCODE_TAIL, SCANCODE_BUF_SIZE as u32, sc);
+        push_ring(&mut RING3_SCANCODE_BUF, &RING3_HEAD, &RING3_TAIL, RING3_BUF_SIZE as u32, sc);
+    }
+}
+
+pub fn pop_scancode() -> Option<u8> {
+    pop_ring(&SCANCODE_HEAD, &SCANCODE_TAIL, unsafe { &SCANCODE_BUF }, SCANCODE_BUF_SIZE as u32)
+}
+
+pub fn pop_ring3_scancode() -> Option<u8> {
+    pop_ring(&RING3_HEAD, &RING3_TAIL, unsafe { &RING3_SCANCODE_BUF }, RING3_BUF_SIZE as u32)
+}
+
+pub fn push_mouse_byte(byte: u8) {
+    unsafe {
+        push_ring(&mut MOUSE_BUF, &MOUSE_HEAD, &MOUSE_TAIL, MOUSE_BUF_SIZE as u32, byte);
+    }
+}
+
+pub fn pop_mouse_byte() -> Option<u8> {
+    pop_ring(&MOUSE_HEAD, &MOUSE_TAIL, unsafe { &MOUSE_BUF }, MOUSE_BUF_SIZE as u32)
+}
+
+// Process blocked on stdin — AtomicU64 para acceso seguro desde IRQ1
+static BLOCKED_STDIN_PID: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_stdin_blocked(pid: u64) {
+    BLOCKED_STDIN_PID.store(pid, Ordering::Release);
+}
+
+pub fn clear_stdin_blocked() {
+    BLOCKED_STDIN_PID.store(0, Ordering::Release);
+}
+
+/// PID bloqueado en stdin (0 = ninguno), para despertarlo sin tomar cerrojos bloqueantes.
+pub fn stdin_blocked_pid() -> u64 { BLOCKED_STDIN_PID.load(Ordering::Acquire) }
+
+pub fn wake_stdin_blocked() {
+    let pid = BLOCKED_STDIN_PID.load(Ordering::Acquire);
+    if pid == 0 { return; }
+    if let Some(proc) = crate::process::process_by_pid(pid) {
+        if proc.state == crate::process::ProcessState::Blocked {
+            proc.state = crate::process::ProcessState::Ready;
+            proc.sleep_until = 0;
+            clear_stdin_blocked();
+        }
+    }
+}
+
+#[no_mangle]
+extern "C" fn irq1_handler_rust(scancode: u8) {
+    if crate::ipc::is_irq_routed(1) != 0 {
+        crate::ipc::notify_irq(1);
+    }
+    push_scancode(scancode);
+    wake_stdin_blocked();
+}
+
+static IRQ12_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Tick when IRQ12 last fired (for polling timeout in main loop).
+static IRQ12_LAST_TICK: AtomicU64 = AtomicU64::new(0);
+pub fn mouse_irq_count() -> u64 { IRQ12_COUNT.load(core::sync::atomic::Ordering::Relaxed) }
+pub fn mouse_last_irq_tick() -> u64 { IRQ12_LAST_TICK.load(core::sync::atomic::Ordering::Relaxed) }
+
+#[no_mangle]
+extern "C" fn irq12_handler_rust(byte: u8) {
+    IRQ12_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    IRQ12_LAST_TICK.store(crate::time::pit::ticks(), core::sync::atomic::Ordering::Relaxed);
+    if crate::ipc::is_irq_routed(12) != 0 {
+        crate::ipc::notify_irq(12);
+    }
+    push_mouse_byte(byte);
+}
+
+#[no_mangle]
+#[allow(suspicious_runtime_symbol_definitions)]
+pub unsafe extern "C" fn memmove(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
+    if (d as usize) <= (s as usize) { memcpy(d, s, n) }
+    else { let mut i=n; while i>0 { i-=1; core::ptr::write_volatile(d.add(i), core::ptr::read_volatile(s.add(i))); } d }
+}
+#[no_mangle]
+#[allow(suspicious_runtime_symbol_definitions)]
+pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    for i in 0..n { let d=*a.add(i) as i32 - *b.add(i) as i32; if d!=0{return d;} } 0
+}

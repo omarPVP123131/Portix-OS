@@ -108,6 +108,19 @@ pub unsafe fn pci_read32(bus: u8, dev: u8, func: u8, reg: u8) -> u32 {
     inl(PCI_DATA)
 }
 
+pub unsafe fn pci_write32(bus: u8, dev: u8, func: u8, reg: u8, val: u32) {
+    outl(PCI_ADDR, make_addr(bus, dev, func, reg));
+    outl(PCI_DATA, val);
+}
+
+pub unsafe fn pci_write16(bus: u8, dev: u8, func: u8, reg: u8, val: u16) {
+    let addr = make_addr(bus, dev, func, reg);
+    outl(PCI_ADDR, addr);
+    let shift = (reg & 2) * 8;
+    let old = inl(PCI_DATA) & !(0xFFFF << shift);
+    outl(PCI_DATA, old | ((val as u32) << shift));
+}
+
 pub unsafe fn pci_read8(bus: u8, dev: u8, func: u8, reg: u8) -> u8 {
     let v = pci_read32(bus, dev, func, reg & !3);
     (v >> ((reg & 3) * 8)) as u8
@@ -133,15 +146,14 @@ unsafe fn pci_read_bar_base(bus: u8, dev: u8, func: u8, reg: u8) -> u64 {
 /// Usado como fallback cuando VESA/legacy no provee framebuffer.
 pub fn pci_find_vga_framebuffer() -> u64 {
     unsafe {
-        for b in 0u8..=255u8 {
+        for b in 0u8..=7u8 {
             for d in 0u8..32u8 {
-                let id = pci_read32(b, d, 0, 0);
-                let vendor = (id & 0xFFFF) as u16;
-                if vendor == 0xFFFF { continue; }
-                let header = pci_read8(b, d, 0, 0x0E);
-                let max_func: u8 = if header & 0x80 != 0 { 8 } else { 1 };
+                let f0_id = pci_read32(b, d, 0, 0);
+                if (f0_id & 0xFFFF) as u16 == 0xFFFF { continue; }
+                let f0_hdr = pci_read8(b, d, 0, 0x0E);
+                let max_func = if (f0_hdr & 0x80) != 0 { 8u8 } else { 1u8 };
                 for f in 0u8..max_func {
-                    let fid = pci_read32(b, d, f, 0);
+                    let fid = if f == 0 { f0_id } else { pci_read32(b, d, f, 0) };
                     if (fid & 0xFFFF) as u16 == 0xFFFF { continue; }
                     let cls = pci_read32(b, d, f, 0x08);
                     if (cls >> 24) as u8 != 0x03 || ((cls >> 16) & 0xFF) as u8 != 0x00 {
@@ -171,17 +183,18 @@ impl PciBus {
             count: 0,
         };
         unsafe {
-            'outer: for b in 0u8..=255u8 {
+            'outer: for b in 0u8..=7u8 {
                 for d in 0u8..32u8 {
-                    let id = pci_read32(b, d, 0, 0);
-                    let vendor = (id & 0xFFFF) as u16;
-                    if vendor == 0xFFFF { continue; }
+                    let f0_id = pci_read32(b, d, 0, 0);
+                    let f0_vendor = (f0_id & 0xFFFF) as u16;
+                    if f0_vendor == 0xFFFF { continue; }
 
-                    let header = pci_read8(b, d, 0, 0x0E);
-                    let max_func: u8 = if header & 0x80 != 0 { 8 } else { 1 };
+                    let f0_hdr = pci_read8(b, d, 0, 0x0E);
+                    let is_multi = (f0_hdr & 0x80) != 0;
+                    let max_func = if is_multi { 8u8 } else { 1u8 };
 
                     for f in 0u8..max_func {
-                        let fid = pci_read32(b, d, f, 0);
+                        let fid = if f == 0 { f0_id } else { pci_read32(b, d, f, 0) };
                         let fvendor = (fid & 0xFFFF) as u16;
                         if fvendor == 0xFFFF { continue; }
 
@@ -195,7 +208,7 @@ impl PciBus {
                             class_code: (cls >> 24) as u8,
                             subclass:   (cls >> 16) as u8,
                             prog_if:    (cls >>  8) as u8,
-                            header_type: pci_read8(b, d, f, 0x0E),
+                            header_type: if f == 0 { f0_hdr } else { pci_read8(b, d, f, 0x0E) },
                             irq_line:   (irqr & 0xFF) as u8,
                         };
                         bus.count += 1;

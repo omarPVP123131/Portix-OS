@@ -54,7 +54,7 @@ pub fn cmd_ascii_art(t: &mut Terminal) {
     t.write_empty();
     t.write_line("    .--------.", LineColor::Header);
     t.write_line("    | PORTIX |   .-------------.", LineColor::Header);
-    t.write_line("    |  v0.7  |   |   x86_64    |", LineColor::Header);
+    t.write_line("    | v1.0.0 |   |   x86_64    |", LineColor::Header);
     t.write_line("    |        |   | bare-metal   |", LineColor::Header);
     t.write_line("    '--------'   | Doble Buffer |", LineColor::Header);
     t.write_line("        ||       '-------------'", LineColor::Header);

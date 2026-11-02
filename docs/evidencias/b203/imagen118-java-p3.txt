@@ -1,0 +1,2 @@
+build/dist/pruebas/run/portix-run-12515-qp606v56.img P3=dfada4c85ba62663d84a7dcb9fc29fe1b76ac195b044ab30f3cae1debac948f2
+build/dist/pruebas/portix-java-kernel118.img P3=dfada4c85ba62663d84a7dcb9fc29fe1b76ac195b044ab30f3cae1debac948f2

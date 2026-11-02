@@ -1,4 +1,11 @@
+pub mod mmio;
+pub mod silicon;
 pub mod input;
 pub mod bus;
 pub mod serial;
 pub mod storage;
+pub mod net;
+pub mod audio;
+pub mod gpu;
+pub mod cpu;
+pub mod sandbox;

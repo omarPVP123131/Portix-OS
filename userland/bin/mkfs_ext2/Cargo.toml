@@ -1,0 +1,7 @@
+[package]
+name = "mkfs_ext2"
+version = "1.47.0"
+edition = "2021"
+
+[dependencies]
+portix-rt = { path = "../../crates/portix-rt" }

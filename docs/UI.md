@@ -1,5 +1,6 @@
 # Portix OS — Interfaz de Usuario
 
+
 ## Layout
 
 Toda la geometría se calcula a partir de las dimensiones del framebuffer
@@ -37,6 +38,7 @@ Layout {
 | F3    | Dispositivos | Árbol de dispositivos PCI, unidades ATA, estado del ratón         |
 | F4    | IDE        | Editor de código/texto integrado con soporte de ratón              |
 | F5    | Explorador | Navegador de archivos FAT32                                         |
+| F6    | Escritorio | Escritorio grafico de ventanas flotantes interactivas (Compositor)  |
 | Tab   | Ciclar     | Siguiente pestaña (sin Ctrl)                                        |
 
 ---
@@ -131,6 +133,51 @@ El cursor parpadea a ~1 Hz (toggle cada 50 ticks a 100 Hz del PIT).
 
 ---
 
+## Gestor de Ventanas y Escritorio Interactivo (F6 / Tab::Desktop)
+
+El sistema incorpora un entorno de ventanas flotantes con compositor desacoplado e interacción completa:
+
+### 1. Ventana de Terminal POSIX (`/bin/sh`)
+- **Interacción**: Soporta entrada directa desde el teclado cuando está enfocada, con cursor parpadeante, eliminación con Backspace y ejecución con Enter.
+- **Botones Rápidos**: Barra superior interactiva con acceso mediante click de ratón para comandos esenciales (`uname`, `uptime`, `free`, `ps`, `ls`, `help`, `clear`).
+
+### 2. Monitor del Sistema en Tiempo Real
+- **Navegación por Pestañas**: Permite conmutar vistas interactivamente con click de ratón:
+  - `[Sistema]`: Especificaciones de CPU, extensiones ISA, uptime y almacenamiento ATA.
+  - `[Memoria]`: Estadísticas del Buddy Allocator (total, libre, ocupada) y barra gráfica de uso de RAM.
+  - `[Procesos]`: Tabla de procesos activos en el planificador (PID, Ring, memoria, binario).
+  - `[Red e1000]`: Parámetros del controlador Intel 82540EM (IPv4, máscara, gateway, MAC, MTU).
+- **Botón `[Refrescar]`**: Actualiza las métricas del sistema en tiempo real.
+
+### 3. Calculadora Rápida
+- **Pantalla LCD Digital**: Visualizador dinámico de operandos y resultados.
+- **Teclado Matricial 4x4**: Botones accionables por ratón (`7`, `8`, `9`, `/`, `4`, `5`, `6`, `*`, `1`, `2`, `3`, `-`, `C`, `0`, `=`, `+`).
+- **Motor Aritmético**: Evaluación en punto entero con manejo de desbordamiento seguro.
+
+### 4. Barra de Tareas (Dock) y Control de Ventanas
+- **Menú Inicio `[PORTIX]`**: Desplegable interactivo para control del sistema.
+- **Pestañas de Ventana**: Conmutación de visibilidad (minimizar/restaurar) y enfoque al frente (`bring_to_front`) con gestión de orden Z (`z_order`).
+- **Arrastre y Cierre**: Arrastre fluido de ventanas sujetándolas por la barra de título y botón de cierre `[X]`.
+
+---
+
+## Componentes Gráficos Avanzados (v0.9.5)
+
+- **Compositor Wayland Nativo (`xdg-shell`)**: Gestión de superficies de aplicación, buffers de memoria compartida `wl_shm` y socket proxy X11 XWayland.
+- **Efectos Visuales en Tiempo Real (`wayland_effects`)**:
+  - Desenfoque Gaussiano 1D separable (kernel 5x5, 2 pasadas) para fondos translúcidos.
+  - Sombras proyectadas paramétricas (*Drop Shadows*) con atenuación de opacidad alfa en bordes de ventana.
+  - Animaciones fluidas a 60 FPS con curva de interpolación cúbica *ease-in-out* ($B(t) = 3t^2 - 2t^3$).
+- **Gestor Tiling Dinámico BSP (Sway/i3)**:
+  - Partición espacial binaria sin solapamiento (*zero overlap*).
+  - Modos de división Horizontal y Vertical.
+  - Soporte de espacios de trabajo (Workspaces 1 a 4) y barra integrada *Portix-Bar* (Waybar-style).
+- **Motor de Fuentes Vectoriales TrueType**: Curvas de Bézier cuadráticas y rasterizador antialiased.
+- **Toolkit Adwaita-Rust**: Botones reactivos, campos de texto, scrollbars, diálogos modales y portapapeles global `/dev/clipboard`.
+- **Aceleración 3D**: Driver VirtIO-GPU Virgl/DRM/KMS y capa Vulkan 1.3 ICD con validador de shaders SPIR-V.
+
+---
+
 ## Paleta de colores
 
 | Constante       | Hex       | Uso                          |
@@ -144,14 +191,3 @@ El cursor parpadea a ~1 Hz (toggle cada 50 ticks a 100 Hz del PIT).
 | `RED`           | `#EE2222` | Error                        |
 | `BLUE`          | `#0055FF` | Información                  |
 | `YELLOW`        | `#FFFF00` | Advertencia                  |
-
----
-
-## Trabajo futuro
-
-- Escalado de fuente (8×8 → 16×16, TrueType)
-- Gestor de ventanas (mover/redimensionar)
-- Renderizado acelerado por GPU (virtio-gpu, VMware SVGA)
-- Transiciones animadas entre pestañas
-- Soporte de portapapeles
-- Soporte USB (teclado/ratón HID)

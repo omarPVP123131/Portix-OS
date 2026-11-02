@@ -1,0 +1,5 @@
+97c028e8d907ab566a5e008b56f52c6eb37380e2b67f6ef479c8d07bc71d3cd8  build/kernel.bin
+01185b28e619a93ffb06ac3b77d8b8199ad952331a87b8a3ed4be7d430372f09  kernel/src/process/signals.rs
+e98a6be3cdee2a1c9f4bbfcf094623c8a84b38915a04588ad8c851faccbe8c3e  kernel/src/process/exit_status.rs
+f27cc57be237e835be0a918664f9d26e87bffac1eccb0bdbb577789ef0c50cb3  kernel/src/process/mod.rs
+7e87b83859abd92531382fcb5a03c05f9ac1cf14463b79266a1640668978ad99  kernel/src/syscall/mod.rs

@@ -1,17 +1,18 @@
-# 🌌 Portix OS
+# Portix OS
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/versión-0.8.0-blueviolet?style=for-the-badge)
-![Rust](https://img.shields.io/badge/Rust-nightly-orange?style=for-the-badge&logo=rust)
-![Arch](https://img.shields.io/badge/arch-x86__64-blue?style=for-the-badge)
-![License](https://img.shields.io/badge/licencia-GPL--v3-green?style=for-the-badge)
-![Status](https://img.shields.io/badge/estado-en%20desarrollo%20activo-brightgreen?style=for-the-badge)
+![Versión](https://img.shields.io/badge/versión-1.0.0-8A2BE2?style=for-the-badge&logo=rocket)
+![Rust](https://img.shields.io/badge/Rust-nightly%20100%25%20(no__std)-orange?style=for-the-badge&logo=rust)
+![Arquitectura](https://img.shields.io/badge/arch-x86__64%20%7C%20aarch64-blue?style=for-the-badge)
+![Licencia](https://img.shields.io/badge/licencia-GPL--v3-green?style=for-the-badge)
 
-**Un kernel x86_64 escrito en Rust desde cero — sin libc, sin GRUB, sin Nada Todo Construido Desde 0.**
+**Sistema operativo soberano de 64 bits, escrito 100% en Rust (`no_std`) desde cero.**
+*Sin Linux. Sin libc. Sin GRUB. Cero dependencias externas en el núcleo.*
 
-*Arranca en BIOS y UEFI. Gestiona memoria, drivers y una UI propia.*  
-*Construido con curiosidad, mantenido con obsesión.*
+**Autor:** Omar Palomares Velasco
+
+[📋 Auditoría Técnica](docs/PORTIX_STATUS_REAL_VERIFICADO.md) • [📜 Changelog](CHANGELOG.md) • [🛠️ Bitácora](AGENTS.md) • [🐛 Tickets](docs/TICKETS.md)
 
 </div>
 
@@ -19,286 +20,223 @@
 
 ## Tabla de contenidos
 
-- [🌌 Portix OS](#-portix-os)
-  - [Tabla de contenidos](#tabla-de-contenidos)
-  - [🌌 ¿Qué es Portix?](#-qué-es-portix)
-  - [👨‍💻 Cómo inició](#-cómo-inició)
-  - [🏛️ Arquitectura técnica](#️-arquitectura-técnica)
-    - [Flujo de arranque](#flujo-de-arranque)
-    - [Mapa de memoria (en ejecución)](#mapa-de-memoria-en-ejecución)
-    - [GOP / VBE Fallback](#gop--vbe-fallback)
-    - [IDT / GDT / ISR](#idt--gdt--isr)
-  - [🛠️ Características actuales](#️-características-actuales)
-    - [Gestión de memoria](#gestión-de-memoria)
-    - [Drivers](#drivers)
-    - [Gráficos y UI](#gráficos-y-ui)
-  - [📁 Estructura del proyecto](#-estructura-del-proyecto)
-  - [💾 Soporte de arranque y virtualización](#-soporte-de-arranque-y-virtualización)
-  - [🚀 Guía de ejecución (QEMU)](#-guía-de-ejecución-qemu)
-  - [📸 Screenshots](#-screenshots)
-  - [🤝 Contribuir](#-contribuir)
-  - [👤 Autor](#-autor)
-  - [📄 Licencia](#-licencia)
+- [¿Qué es Portix OS?](#qué-es-portix-os)
+- [Arquitectura](#arquitectura)
+- [Estructura del repositorio](#estructura-del-repositorio)
+- [Subsistemas del núcleo](#subsistemas-del-núcleo)
+- [Utilidades Ring 3](#utilidades-ring-3)
+- [Requisitos del anfitrión](#requisitos-del-anfitrión)
+- [Compilación](#compilación)
+- [Ejecución en QEMU](#ejecución-en-qemu)
+- [Pruebas automatizadas](#pruebas-automatizadas)
+- [Documentación](#documentación)
+- [Licencia](#licencia)
 
 ---
 
-## 🌌 ¿Qué es Portix?
+## Captura del sistema
 
-Portix es un sistema operativo experimental de **64 bits** escrito completamente en **Rust freestanding** (`no_std`).
+### Antes y después
 
-No usa Linux, no usa libc, no usa ningún bootloader de terceros.  
-Cada pieza — desde el MBR hasta la UI — existe porque fue escrita para este proyecto.
+![Portix OS - Antes y después](public/img/2.jpeg)
 
-| Propiedad | Valor |
-|-----------|-------|
-| Arquitectura objetivo | x86\_64 |
-| Lenguaje principal | Rust (nightly) |
-| Bootloader | Custom (ASM propio) |
-| Modo de CPU | Long Mode (64-bit) |
-| Boot targets | BIOS Legacy + UEFI |
-| Interfaz | Framebuffer, 5 pestañas |
+![Portix OS Desktop](public/img/desktop.png)
 
----
+## ¿Qué es Portix OS?
 
-## 👨‍💻 Cómo inició
+Portix OS es un sistema operativo de 64 bits (x86_64) desarrollado desde cero en Rust freestanding
+(`#![no_std]`). No se basa en Linux, no usa GRUB ni libc: implementa su propio cargador BIOS
+(Stage 2 en ensamblador) y un cargador UEFI nativo (`BOOTX64.EFI`, en Rust puro).
 
-Portix no comenzó con la idea de crear un sistema operativo completo.
+El núcleo no tiene dependencias externas (`[dependencies]` vacío en `kernel/Cargo.toml`).
 
-El objetivo inicial era uno solo: compilar un binario que mostrara **"Hola Mundo"** en VGA usando ASM y Rust, entender el proceso de booteo desde cero, y ver código propio ejecutándose directamente sobre el hardware.
+### Características verificadas
 
-Cuatro preguntas lo desencadenaron todo:
+- **Microkernel modular**: Ring 0 / Ring 3 con Fast-IPC en registros y VMOs en memoria compartida.
+- **Gestión de memoria**: Buddy allocator (64 MiB, órdenes 0-11), paginación de 4 niveles x86_64, COW en `fork` con conteo de referencias por marco físico, asignador de marcos físicos a partir del mapa del firmware.
+- **Compatibilidad binaria Linux**: 452 syscalls traducidas del ABI Linux x86_64 (verificable con `/bin/abi-linux` y `/proc/abi`).
+- **Sistemas de archivos**: FAT32 (arranque/datos), ext2 RW (raíz `/`), ramfs (`/tmp`, `/dev/shm`), procfs (`/proc`), FIFOs en ext2.
+- **Red**: pila TCP/IP propia sobre Intel e1000 (Ethernet, ARP, IPv4, ICMP, UDP, TCP, DNS, DHCP), IPv6 (SLAAC, NDP, ICMPv6, TCP/UDP sobre IPv6), TLS 1.3 real en Ring 3 (X25519, HKDF, ChaCha20-Poly1305, RSA, X.509).
+- **SMP real**: segundo núcleo arranca y planifica (AP con GDT/TSS/LAPIC propios).
+- **Señales POSIX**: SIG_DFL/SIG_IGN, sigaction, sigprocmask, entrega desde excepciones, SIGPIPE, SIGCHLD, SIGALRM.
+- **Hilos reales**: clone(CLONE_VM|CLONE_THREAD), futex con cola de espera, TLS por hilo.
+- **Entorno gráfico**: compositor Wayland en Ring 3 (`portix-wm`) con tiling y workspaces.
+- **Shell POSIX**: `/bin/sh` con tuberías, redirección, control de trabajos (`&`, `jobs`, `fg`, `bg`, `wait`).
+- **Toolchain propio**: `portix-cc` (compilador de C real), `portix-bench`, `dbg` (depurador con breakpoints por hardware).
+- **Gestor de paquetes**: `pkg` (`.apk` de Alpine, `.deb` de Debian) con verificación SHA-256/RSA/OpenPGP.
+- **Drivers bare-metal**: NVMe, AHCI/SATA, xHCI/USB, HDA/audio (verificados sobre QEMU con medidas reales).
 
-- ¿Cómo pasa la CPU de Real Mode a Long Mode?
-- ¿Cómo se escribe texto directamente en memoria VGA?
-- ¿Cómo se enlaza ASM con Rust en `no_std`?
-- ¿Cómo se genera un binario arrancable sin GRUB?
-
-Lo que empezó como un experimento terminó en una arquitectura completa.  
-El principio que guía cada decisión sigue siendo el mismo: **pureza técnica, cero capas innecesarias**.
-
----
-
-## 🏛️ Arquitectura técnica
-
-### Flujo de arranque
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  BIOS (Legacy)                                                   │
-│                                                                  │
-│  MBR (512 B)  →  stage2.asm (32 KB)  →  VESA 1024×768           │
-│                                      →  kernel ELF @ 0x200000   │
-└──────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────┐
-│  UEFI                                                            │
-│                                                                  │
-│  GPT ESP  →  BOOTX64.EFI (Rust puro, extern "efiapi")           │
-│           →  Block I/O + FAT32  →  PortixBootInfo               │
-│           →  ExitBootServices   →  kernel ELF @ 0x200000        │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-> El loader UEFI usa `extern "efiapi"` (convención Microsoft x64: RCX, RDX, R8, R9)  
-> sin ningún crate externo — llamadas directas a la UEFI boot table.
-
-### Mapa de memoria (en ejecución)
-
-```
-0x000000 ── 0x0FFFFF   Primer megabyte (BIOS, VGA, reservado)
-0x100000 ── 0x1FFFFF   Backbuffer de video (doble buffer)
-0x200000 ──            Kernel (código + datos + heap)
-```
-
-### GOP / VBE Fallback
-
-OVMF (UEFI en Windows) no siempre expone el protocolo GOP.  
-Portix maneja esto en dos capas para que el display **siempre funcione**:
-
-```
-Loader UEFI
-  │
-  ├── GOP disponible?  →  fb_ok = true  →  framebuffer directo
-  │
-  └── GOP no disponible?  →  fb_ok = false
-        │
-        └── Kernel detecta lfb == 0
-              │
-              └── Escaneo PCI  →  VBE activo?
-                    ├── Sí  →  usar framebuffer existente
-                    └── No  →  init VBE a 1024×768×32
-```
-
-### IDT / GDT / ISR
-
-Manejo robusto de excepciones del CPU con IDT completa.  
-Cada ISR imprime el registro de contexto vía serial antes de haltear.
+Consulte la [auditoría técnica honesta](docs/PORTIX_STATUS_REAL_VERIFICADO.md) para detalles de lo probado frente a lo emulado.
 
 ---
 
-## 🛠️ Características actuales
+## Arquitectura
 
-### Gestión de memoria
-
-- **Buddy System Allocator** con listas intrusivas — asignación dinámica de bloques, fragmentación externa mínima
-- Monitoreo de heap en tiempo real desde la pestaña **System**
-- Identity map del bootloader (paginación virtual: roadmap)
-
-### Drivers
-
-| Driver | Estado | Detalles |
-|--------|--------|----------|
-| ATA PIO | ✅ | LBA48, caché de sectores para evitar resets de bus |
-| FAT32 | ✅ | Read/write, cluster chain completo |
-| VFS | ✅ | Capa unificada que abstrae los filesystems |
-| PCI | ✅ | Escaneo completo del bus |
-| PS/2 Teclado | ✅ | IRQ1 |
-| PS/2 Mouse | ✅ | IRQ12 |
-| PIT | ✅ | 100 Hz tick |
-| Serial | ✅ | COM1 38400 8N1, niveles de log, volcado hex, self-test |
-
-### Gráficos y UI
-
-- Framebuffer vía VESA, GOP, o PCI+VBE fallback
-- Doble buffer con dirty region blit (backbuffer @ `0x100000`)
-- Alpha blending para rectángulos
-- Layout proporcional — sin coordenadas hardcodeadas
-
-**5 pestañas de interfaz:**
-
-| Pestaña | Función |
-|---------|---------|
-| System | Telemetría de heap, CPU, memoria |
-| Terminal | Consola interactiva + comandos de disco |
-| Devices | Listado de dispositivos PCI / ATA detectados |
-| IDE | Editor de texto integrado (estilo nano) |
-| Explorer | Navegador de archivos FAT32 |
-
----
-
-## 📁 Estructura del proyecto
-
-```text
-portix/
-├── boot/                        # Stack de arranque custom
-│   ├── boot.asm                 # MBR — primera etapa (512 B)
-│   ├── stage2.asm               # Segunda etapa — Long Mode + VESA
-│   └── efi/                     # Loader UEFI en Rust puro
-│       └── src/main.rs
-│
-├── kernel/
-│   ├── Cargo.toml
-│   ├── linker.ld                # Linker script custom
-│   └── src/
-│       ├── arch/                # IDT, GDT, ISR — puente con el hardware
-│       ├── console/             # Terminal e intérprete de comandos
-│       │   └── terminal/
-│       │       └── commands/
-│       ├── drivers/
-│       │   ├── bus/             # ACPI, PCI
-│       │   ├── input/           # PS/2 teclado y ratón
-│       │   └── storage/         # ATA, FAT32, VFS, mkfs
-│       ├── graphics/
-│       │   ├── driver/          # VESA, VGA, framebuffer
-│       │   └── render/          # Fuentes, tipografía, alpha blend
-│       ├── mem/                 # Buddy Allocator, heap
-│       ├── time/                # PIT, temporizadores
-│       ├── ui/                  # Chrome de UI, sistema de pestañas
-│       └── util/                # Utilidades y formateo
-│
-├── scripts/
-│   └── build.py                 # Script de build y lanzamiento QEMU
-│
-└── main.rs
+```
+kernel/
+├── src/
+│   ├── arch/          # CPU, IDT/ISR, paginación 4 niveles, SMP, per-CPU, MMIO, aarch64
+│   ├── compat/        # i18n (ES/EN/JA/DE)
+│   ├── console/       # Terminal del núcleo y comandos
+│   ├── containers/    # OCI / sandbox
+│   ├── crypto/        # Primitivas criptográficas del núcleo
+│   ├── dev/           # Dispositivos
+│   ├── drivers/       # ATA, FAT32, NVMe, e1000, xHCI, HDA, storage, mmio, silicon, bus
+│   ├── fs/            # Contrato VFS + adaptadores (ext2, ramfs, FAT)
+│   ├── graphics/      # Framebuffer, raytracing
+│   ├── lkm/           # Módulos cargables
+│   ├── mem/           # Buddy allocator, paging, marcos físicos
+│   ├── microkernel/   # eBPF
+│   ├── net/           # Pila de red (TCP/IP, ARP, ICMP, DHCP, DNS, IPv6)
+│   ├── power/         # ACPI
+│   ├── process/       # Procesos, señales, scheduler, futex, IPC
+│   ├── security/      # TPM, sandbox
+│   ├── syscall/       # Despachador nativo + traductor ABI Linux
+│   ├── system/        # devsuite, consagración, profiler, symbols
+│   ├── time/          # PIT, RTC
+│   ├── ui/            # Compositor de ventanas, terminal gráfica
+│   ├── util/          # Formateo
+│   └── wasm/          # WASM/WASI
+├── x86_64-portix.json # target spec para cargo
+└── Cargo.toml         # sin dependencias externas
+userland/
+├── bin/               # ~70 utilidades en Rust (no_std)
+└── crates/portix-rt/  # runtime compartido (syscalls, TLS 1.3, VFS, allocator)
+scripts/                # build.py, headless_runner.py, recertify.py, sondas
+boot/                   # stage2.asm, cargador EFI
+docs/                   # Documentación y bitácora
 ```
 
 ---
 
-## 💾 Soporte de arranque y virtualización
+## Subsistemas del núcleo
 
-Portix genera imágenes en múltiples formatos para distintos entornos:
-
-| Formato | Descripción | Comando |
-|---------|-------------|---------|
-| UEFI | GPT + ESP, requiere OVMF | `--mode=uefi` |
-| Dual | BIOS + UEFI en un artefacto | `--mode=dual` |
-| RAW | Imagen de disco crudo | `--mode=raw` |
-| VMDK | Compatible con VMware | `--mode=vmdk` |
-| VMI | Virtual Machine Image | `--mode=vmi` |
-
-Compatible con **QEMU**, **VMware**, y cualquier hipervisor que soporte VMDK o ISO.
+| Subsistema | Módulo | Estado |
+|---|---|---|
+| Memoria (buddy + marcos) | `mem/` | Real y verificado |
+| Paginación 4 niveles | `mem/paging.rs` | Real y verificado |
+| Procesos / scheduler / SMP | `process/`, `arch/smp.rs` | Real y verificado (2 núcleos) |
+| Señales POSIX | `process/signals.rs` | Real y verificado |
+| Futex / hilos | `syscall/futex.rs` | Real y verificado |
+| VFS (FAT32/ext2/ramfs/procfs) | `fs/`, `drivers/storage/` | Real y verificado |
+| Red (TCP/IP, IPv6, TLS) | `net/`, `portix-rt/tls13/` | Real y verificado |
+| Drivers bare-metal (NVMe, AHCI, xHCI, HDA) | `drivers/` | Real sobre QEMU |
+| Compositor Wayland | `ui/`, `portix-wm` | Real |
+| eBPF | `microkernel/ebpf.rs` | Implementado |
+| WASM/WASI | `wasm/` | Implementado |
+| Raytracing (Vulkan) | `graphics/raytracing.rs` | Implementado |
+| AArch64 HAL | `arch/aarch64/` | Implementado (no verificado en silicio) |
 
 ---
 
-## 🚀 Guía de ejecución (QEMU)
+## Estructura del repositorio
 
-```sh
-# Limpiar artefactos anteriores
-python scripts/build.py --clean
+| Directorio | Contenido |
+|---|---|
+| `kernel/` | Núcleo Rust `no_std` |
+| `userland/` | Utilidades y runtime Ring 3 |
+| `boot/` | Cargador BIOS (stage2) y UEFI (BOOTX64.EFI) |
+| `scripts/` | Build, suites de prueba, sondas, verificación |
+| `docs/` | Bitácora, tickets, roadmap, auditoría |
+| `modules/` | Módulos cargables de ejemplo |
 
-# Modo BIOS — ISO El Torito
-python scripts/build.py --mode=bios ---format=iso
+---
 
-# Modo UEFI — GPT + ESP (requiere OVMF + pyfatfs)
-python scripts/build.py --mode=uefi ---format=iso
+## Requisitos del anfitrión
 
-# Ambos modos
-python scripts/build.py --mode=dual
+**Obligatorios**
+
+- `rustc` + `cargo` nightly con `rust-src` (`rustup component add rust-src --toolchain nightly`)
+- `nasm`
+- `python3` (>= 3.10)
+- `qemu-system-x86_64` y `qemu-img`
+
+**Para imágenes ISO**
+
+- `xorriso` (o `mkisofs`/`genisoimage`)
+
+**Para verificación ext2 del host**
+
+- `mke2fs` (e2fsprogs) — el build usa el de Android SDK si está disponible
+- `e2fsck`, `debugfs` (opcionales)
+
+**Para FAT32 (pyfatfs)**
+
+- `pyfatfs` (`pip install pyfatfs`)
+
+**Para UEFI**
+
+- `OVMF` / `edk2-x86_64-code.fd`
+
+En Windows (MSYS2) instale: `xorriso`, `mtools`, `dosfstools` vía pacman. `e2fsprogs` no está en MSYS2; el build usa `mke2fs` del Android SDK como fallback.
+
+---
+
+## Compilación
+
+```bash
+# Construcción completa (kernel + userland + imágenes)
+python3 scripts/build.py
+
+# Sólo kernel y stage2 (más rápido)
+python3 scripts/build.py --no-run --no-vm --no-iso
+
+# Reconstrucción limpia
+python3 scripts/build.py --clean
 ```
 
-> La salida serial de debug aparece directamente en la terminal via `-serial stdio`.  
-> Para instalar las dependencias necesarias consulta [`PREREQUISITES.md`](PREREQUISITES.md).
+Artefactos generados en `build/dist/`:
+
+- `portix.iso` — ISO dual BIOS+UEFI
+- `portix.img` — imagen raw BIOS (72 MB)
+- `portix-uefi.img` — disco GPT completo (UEFI)
+- `portix-dual.img` — imagen BIOS legacy
+- `portix.vdi`, `portix.vmdk` — para VirtualBox/VMware
 
 ---
 
-## 📸 Screenshots
+## Ejecución en QEMU
 
-| Terminal | System |
-|----------|--------|
-| ![Terminal](public/img/1.jpeg) | ![System](public/img/2.jpeg) |
+```bash
+# BIOS
+qemu-system-x86_64 -cdrom build/dist/portix.iso -m 512 -smp 2
 
----
-
-## 🤝 Contribuir
-
-Las contribuciones son bienvenidas. Antes de enviar un PR, revisa [`CONTRIBUTING.md`](CONTRIBUTING.md) donde se detallan:
-
-- Estándares de código y convenciones de commits
-- Flujo de Pull Requests
-- Reglas de arquitectura del kernel
-- Buenas prácticas para desarrollo en `no_std`
-
-Si tienes dudas, abre un **Issue** primero. El proyecto está en fase activa y a veces inestable — las discusiones técnicas son más que bienvenidas.
+# UEFI
+qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -cdrom build/dist/portix.iso -m 512 -smp 2
+```
 
 ---
 
-## 👤 Autor
+## Pruebas automatizadas
 
-<div align="center">
+```bash
+# Suite headless completa
+python3 scripts/headless_runner.py
 
-**Omar Palomares Velasco**
+# Suite interactiva (escritorio real)
+python3 scripts/interactive_runner.py
 
-Portix es la prueba de que con curiosidad y disciplina  
-se pueden alcanzar niveles de ingeniería profesional construyendo desde cero.
+# Recertificación (sin reconstruir)
+python3 scripts/recertify.py --no-build
 
-> *"Tardará lo que tenga que tardar, pero la 1.0 será perfecta."*
+# Pipeline completo (Windows)
+.\scripts\run_pipeline.ps1 -Mode all
+```
 
-</div>
-
----
-
-## 📄 Licencia
-
-Portix OS se distribuye bajo la licencia **GNU General Public License v3.0**.
-
-Puedes usar, modificar y distribuir este software siempre que las obras derivadas  
-se publiquen bajo la misma licencia.  
-Consulta el archivo [`LICENSE`](LICENSE) para los términos completos.
+La suite exige dos pasadas consecutivas con 0 fallos + recertificación para cerrar un ciclo.
 
 ---
 
-<div align="center">
+## Documentación
 
-*Construido con Rust, ASM, y demasiadas horas frente al debugger serial.*
+- [Auditoría técnica honesta](docs/PORTIX_STATUS_REAL_VERIFICADO.md)
+- [Tickets abiertos y cerrados](docs/TICKETS.md)
+- [Arquitectura](docs/ARCHITECTURE.md) · [Compilación](docs/BUILD.md) · [Memoria](docs/MEMORY.md) · [Almacenamiento](docs/STORAGE.md) · [Arranque](docs/BOOT.md) · [Interfaz de usuario](docs/UI.md) · [Estándares de código](docs/CODING_STANDARDS.md)
+- [Bitácora de desarrollo](AGENTS.md)
+- [Historial de cambios](CHANGELOG.md)
 
-</div>
+---
+
+## Licencia
+
+GPL v3. Ver [LICENSE](LICENSE).

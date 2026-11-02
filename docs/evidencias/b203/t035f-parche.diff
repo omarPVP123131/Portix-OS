@@ -1,0 +1,18 @@
+--- docs/evidencias/b203/t035d-isr.rs	2026-10-31 15:09:10.681548658 +0000
++++ kernel/src/arch/isr_handlers.rs	2026-10-31 15:41:13.255409168 +0000
+@@ -1056,7 +1056,14 @@
+             return 0;
+         }
+     }
+-    if ec & 1 == 0 && ec & 4 != 0 { // [T-004] pila de usuario extensible (8 MiB)
++    // [T-040] Sólo crece la pila sobre un HUECO genuino. Una reserva perezosa
++    // explícita (PROT_NONE incluida) dentro de la ventana de pila es una VMA del
++    // proceso: no puede convertirse en pila escribible. Si la reserva permite el
++    // acceso ya la habrán materializado los intentos anteriores; si no, este
++    // fallo debe llegar a la señal, no a `crecer_pila`.
++    let hueco_de_verdad = crate::mem::paging::pte_cruda(current_cr3, cr2 as usize)
++        .map_or(true, |pte| !crate::mem::paging::es_perezosa(pte));
++    if ec & 1 == 0 && ec & 4 != 0 && hueco_de_verdad { // [T-004] pila de usuario extensible (8 MiB)
+         if crate::mem::paging::crecer_pila(current_cr3, cr2 as usize) {
+             linea_pf("[PILA]");
+             crate::drivers::serial::write_str(" pagina de pila extendida mapeada\n");

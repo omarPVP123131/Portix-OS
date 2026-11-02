@@ -66,6 +66,8 @@
 #![allow(dead_code)]
 
 use core::fmt;
+use crate::arch::Spinlock;
+use crate::drivers::serial;
 use crate::drivers::storage::traits::BlockDevice;
 
 // ── Puertos ATA ────────────────────────────────────────────────────────────────
@@ -259,29 +261,46 @@ impl Channel {
         }
     }
 
+    /// [b190] Diagnóstico: qué decía el dispositivo cuando se agotó el plazo.
+    pub(crate) unsafe fn volcar_estado_timeout(&self) {
+        let st = self.ctrl_inb();
+        crate::drivers::serial::write_str("[ATA] TIMEOUT con estado alternativo=");
+        crate::drivers::serial::write_hex(st as usize);
+        crate::drivers::serial::write_str(" error=");
+        crate::drivers::serial::write_hex(self.inb(reg::ERROR) as usize);
+        crate::drivers::serial::write_str(" base=");
+        crate::drivers::serial::write_hex(self.base as usize);
+        crate::drivers::serial::write_str("\n");
+    }
+
     pub(crate) unsafe fn wait_not_busy(&self) -> AtaResult<u8> {
-        for _ in 0..100_000u32 {
+        let mut plazo = PlazoAta::nuevo("BSY=0");
+        while plazo.sigue() {
             let st = self.ctrl_inb();
             if st & status::BSY == 0 {
                 return Ok(self.inb(reg::STATUS));
             }
         }
+        self.volcar_estado_timeout();
         Err(AtaError::Timeout)
     }
 
     pub(crate) unsafe fn wait_ready(&self) -> AtaResult<()> {
-        for _ in 0..100_000u32 {
+        let mut plazo = PlazoAta::nuevo("RDY");
+        while plazo.sigue() {
             let st = self.ctrl_inb();
             if st & status::BSY == 0 && st & status::RDY != 0 {
                 let _ = self.inb(reg::STATUS);
                 return Ok(());
             }
         }
+        self.volcar_estado_timeout();
         Err(AtaError::Timeout)
     }
 
     pub(crate) unsafe fn wait_drq(&self) -> AtaResult<()> {
-        for _ in 0..100_000u32 {
+        let mut plazo = PlazoAta::nuevo("DRQ");
+        while plazo.sigue() {
             let st = self.ctrl_inb();
             if st & status::BSY != 0 { continue; }
             if st & status::ERR != 0 {
@@ -297,6 +316,7 @@ impl Channel {
                 return Ok(());
             }
         }
+        self.volcar_estado_timeout();
         Err(AtaError::Timeout)
     }
 
@@ -308,9 +328,7 @@ impl Channel {
         Ok(())
     }
 
-    unsafe fn identify(&self, is_slave: bool) -> Option<[u16; 256]> {
-        self.reset_and_init();
-
+    unsafe fn identify_no_reset(&self, is_slave: bool) -> Option<[u16; 256]> {
         let head = if is_slave { 0xB0u8 } else { 0xA0u8 };
         self.outb(reg::DRIVE_HEAD, head);
         self.delay400ns();
@@ -337,6 +355,55 @@ impl Channel {
         for w in buf.iter_mut() { *w = self.inw(); }
         self.delay400ns();
         Some(buf)
+    }
+}
+
+/// [b189] Plazo de espera del bus ATA basado en TIEMPO, no en iteraciones.
+/// Antes eran 1 000 000 lecturas del registro de estado (≈1 s bajo TCG): un
+/// disco lento de verdad —o una imagen en un disco del anfitrión saturado de
+/// escrituras pendientes— superaba ese presupuesto y la escritura del
+/// superbloque fallaba por "timeout" en el arranque (raíz ext2 sin montar, modo
+/// degradado, de forma intermitente). Ahora: mínimo el presupuesto antiguo y,
+/// agotado, se sigue esperando hasta ~30·10⁹ ciclos de TSC (10 s a 3 GHz).
+/// Un dispositivo colgado sigue dando `Timeout`: el plazo es finito.
+pub(crate) struct PlazoAta { iter: u32, tsc_ini: u64, etiqueta: &'static str }
+
+impl PlazoAta {
+    const ITER_RAPIDAS: u32 = 1_000_000;
+    const CICLOS_MAX: u64 = 30_000_000_000;
+    #[inline] pub(crate) fn nuevo(etiqueta: &'static str) -> Self { PlazoAta { iter: 0, tsc_ini: 0, etiqueta } }
+    #[inline] pub(crate) fn sigue(&mut self) -> bool {
+        if self.iter < Self::ITER_RAPIDAS { self.iter += 1; return true; }
+        let ahora = unsafe { core::arch::x86_64::_rdtsc() };
+        if self.tsc_ini == 0 {
+            self.tsc_ini = ahora;
+            crate::drivers::serial::write_str("[ATA] el dispositivo tarda mas de lo habitual: se espera hasta 10 s (");
+            crate::drivers::serial::write_str(self.etiqueta);
+            crate::drivers::serial::write_str(")\n");
+            return true;
+        }
+        ahora.wrapping_sub(self.tsc_ini) < Self::CICLOS_MAX
+    }
+}
+
+impl Drop for PlazoAta {
+    /// Telemetría honesta: cuánto duró de verdad una espera larga (en ms,
+    /// con el TSC calibrado si ya lo está; si no, en millones de ciclos).
+    fn drop(&mut self) {
+        if self.tsc_ini == 0 { return; }
+        let ciclos = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(self.tsc_ini);
+        let hz = crate::time::pit::tsc_hz_cacheado();
+        crate::drivers::serial::write_str("[ATA] espera larga terminada (");
+        crate::drivers::serial::write_str(self.etiqueta);
+        crate::drivers::serial::write_str("): ");
+        if hz > 0 {
+            crate::drivers::serial::write_usize((ciclos / (hz / 1000).max(1)) as usize);
+            crate::drivers::serial::write_str(" ms");
+        } else {
+            crate::drivers::serial::write_usize((ciclos / 1_000_000) as usize);
+            crate::drivers::serial::write_str(" Mciclos");
+        }
+        crate::drivers::serial::write_str(if ciclos < Self::CICLOS_MAX { " (completada)\n" } else { " (TIMEOUT)\n" });
     }
 }
 
@@ -386,6 +453,7 @@ impl AtaDrive {
             c.outb(reg::FEATURES, 0);
             c.outb(reg::COMMAND,
                 if self.info.lba48 { cmd::CACHE_FLUSH_EXT } else { cmd::CACHE_FLUSH });
+            c.delay400ns();
             let st = c.wait_not_busy()?;
             if st & status::DF != 0 {
                 return Err(AtaError::DriveFault);
@@ -412,6 +480,7 @@ impl AtaDrive {
             c.delay400ns();
             c.wait_drq()?;
             Self::pio_read_sector(c, buf, s * 512);
+            crate::mem::paging::respirar(); // [T-026] un sector leído: pasan las IRQ pendientes
             let st = c.inb(reg::STATUS);
             if st & status::ERR != 0 {
                 return Err(AtaError::DeviceError(c.inb(reg::ERROR)));
@@ -435,10 +504,15 @@ impl AtaDrive {
             c.outb(reg::LBA_MID,    (cur >>  8) as u8);
             c.outb(reg::LBA_HI,     (cur >> 16) as u8);
             c.outb(reg::COMMAND,     cmd::WRITE_PIO);
+            c.delay400ns();
             c.wait_drq()?;
             Self::pio_write_sector(c, buf, s * 512);
-            self.flush()?;
+            crate::mem::paging::respirar(); // [T-026]
         }
+        // [T-012, 89ª] Sin FLUSH CACHE por cada escritura: era un fsync del fichero
+        // imagen en el anfitrión por cada bloque de 4 KiB (y por cada copia del
+        // superbloque). El vaciado lo ordena quien lo necesita: `fsync`/`sync`,
+        // el volcado diferido del ext2 (≤ 1 s) y la vuelta a la consola tras `run`.
         Ok(())
     }
 
@@ -462,6 +536,7 @@ impl AtaDrive {
             c.delay400ns();
             c.wait_drq()?;
             Self::pio_read_sector(c, buf, s * 512);
+            crate::mem::paging::respirar(); // [T-026] un sector leído: pasan las IRQ pendientes
             let st = c.inb(reg::STATUS);
             if st & status::ERR != 0 {
                 return Err(AtaError::DeviceError(c.inb(reg::ERROR)));
@@ -490,10 +565,15 @@ impl AtaDrive {
             c.outb(reg::LBA_MID,    (cur >>  8) as u8);
             c.outb(reg::LBA_HI,     (cur >> 16) as u8);
             c.outb(reg::COMMAND,     cmd::WRITE_PIO_EXT);
+            c.delay400ns();
             c.wait_drq()?;
             Self::pio_write_sector(c, buf, s * 512);
-            self.flush()?;
+            crate::mem::paging::respirar(); // [T-026]
         }
+        // [T-012, 89ª] Sin FLUSH CACHE por cada escritura: era un fsync del fichero
+        // imagen en el anfitrión por cada bloque de 4 KiB (y por cada copia del
+        // superbloque). El vaciado lo ordena quien lo necesita: `fsync`/`sync`,
+        // el volcado diferido del ext2 (≤ 1 s) y la vuelta a la consola tras `run`.
         Ok(())
     }
 
@@ -583,8 +663,12 @@ impl AtaBus {
         let mut drives = [None; 4];
         let mut count  = 0;
 
+        // Un soft-reset por canal (no por drive) para no matar el bus ATA
+        unsafe { PRIMARY.reset_and_init(); }
+        unsafe { SECONDARY.reset_and_init(); }
+
         for (id, chan, is_slave) in slots {
-            if let Some(words) = unsafe { chan.identify(is_slave) } {
+            if let Some(words) = unsafe { chan.identify_no_reset(is_slave) } {
                 drives[id as usize] = Some(parse_identify(words, id));
                 count += 1;
             }
@@ -646,10 +730,10 @@ const DUMMY_INFO: DriveInfo = DriveInfo {
     serial:        [b' '; 20],
 };
 
-static mut CACHED_DRIVE: CachedDrive = CachedDrive {
+static CACHED_DRIVE: Spinlock<CachedDrive> = Spinlock::new(CachedDrive {
     info:  DUMMY_INFO,
     valid: false,
-};
+});
 
 /// Guarda el DriveInfo del Primary0 en el caché global.
 ///
@@ -665,12 +749,9 @@ static mut CACHED_DRIVE: CachedDrive = CachedDrive {
 /// }
 /// ```
 pub fn store_primary_drive_info(info: DriveInfo) {
-    // SAFETY: kernel bare-metal single-threaded.
-    // Esta función se llama exactamente una vez en boot antes del loop.
-    unsafe {
-        CACHED_DRIVE.info  = info;
-        CACHED_DRIVE.valid = true;
-    }
+    let mut guard = CACHED_DRIVE.lock();
+    guard.info  = info;
+    guard.valid = true;
 }
 
 /// Devuelve el DriveInfo cacheado del Primary0.
@@ -691,13 +772,11 @@ pub fn store_primary_drive_info(info: DriveInfo) {
 /// let vol = Fat32Volume::mount(drive)?;
 /// ```
 pub fn get_cached_drive_info() -> Option<DriveInfo> {
-    // SAFETY: ver store_primary_drive_info.
-    unsafe {
-        if CACHED_DRIVE.valid {
-            Some(CACHED_DRIVE.info)
-        } else {
-            None
-        }
+    let guard = CACHED_DRIVE.lock();
+    if guard.valid {
+        Some(guard.info)
+    } else {
+        None
     }
 }
 
@@ -747,7 +826,6 @@ fn parse_identify(words: [u16; 256], id: DriveId) -> DriveInfo {
 // ── Helpers de log ────────────────────────────────────────────────────────────
 
 pub fn log_drives(bus: &AtaBus) {
-    use crate::drivers::serial;
 
     if bus.count() == 0 {
         serial::log("ATA", "ningun drive detectado");

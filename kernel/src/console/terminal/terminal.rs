@@ -64,6 +64,9 @@ impl Terminal {
     }
 
     pub fn write_bytes(&mut self, s: &[u8], color: LineColor) {
+        crate::drivers::serial::write_bytes_raw(s);
+        crate::drivers::serial::write_str("\r\n");
+
         let mut start = 0;
         loop {
             let end   = (start + TERM_COLS).min(s.len());
@@ -204,7 +207,7 @@ impl Terminal {
             b"neofetch" | b"fetch"
                 => self.cmd_neofetch(hw, pci),
             b"uname"
-                => self.write_line("  PORTIX 0.7 x86_64 bare-metal #1", LineColor::Normal),
+                => self.write_line("  PORTIX 1.0.0 x86_64 bare-metal #1", LineColor::Normal),
             b"whoami"
                 => self.write_line("  root", LineColor::Success),
             b"hostname"
@@ -274,16 +277,80 @@ impl Terminal {
                 crate::drivers::bus::acpi::reboot();
             }
 
-            // ── Comando desconocido ────────────────────────────────────────────
+            b"exec" | b"run" => {
+                if !self.try_run_binary(args, b"") {
+                    self.write_line("  Error: ejecutable no encontrado", LineColor::Error);
+                }
+            }
+
+            // ── Ejecutar como binario ELF o comando desconocido ───────────────
             _ => {
-                let mut buf = [0u8; 80]; let mut pos = 0;
-                for b in b"  Error: comando no encontrado: " { buf[pos]=*b; pos+=1; }
-                let l = cmd.len().min(40);
-                buf[pos..pos+l].copy_from_slice(&cmd[..l]);
-                self.write_bytes(&buf[..pos+l], LineColor::Error);
-                self.write_line("  Escribe 'help' para ver los comandos disponibles.", LineColor::Normal);
+                if !self.try_run_binary(cmd, args) {
+                    let mut buf = [0u8; 80]; let mut pos = 0;
+                    for b in b"  Error: comando no encontrado: " { buf[pos]=*b; pos+=1; }
+                    let l = cmd.len().min(40);
+                    buf[pos..pos+l].copy_from_slice(&cmd[..l]);
+                    self.write_bytes(&buf[..pos+l], LineColor::Error);
+                    self.write_line("  Escribe 'help' para ver los comandos disponibles.", LineColor::Normal);
+                }
             }
         }
+    }
+
+    fn try_run_binary(&mut self, cmd: &[u8], _args: &[u8]) -> bool {
+        let raw_cmd = match core::str::from_utf8(cmd) {
+            Ok(s) => s.trim(),
+            Err(_) => return false,
+        };
+        if raw_cmd.is_empty() { return false; }
+
+        let cmd_str = if let Some(sp) = raw_cmd.find(' ') {
+            &raw_cmd[..sp]
+        } else {
+            raw_cmd
+        };
+
+        let mut path_buf = alloc::string::String::new();
+        if cmd_str.starts_with('/') {
+            path_buf.push_str(cmd_str);
+        } else {
+            path_buf.push_str("/bin/");
+            path_buf.push_str(cmd_str);
+        }
+
+        self.write_line(&alloc::format!("  [EXEC] Buscando binario: {}", path_buf), LineColor::Info);
+
+        if let Some(pid) = crate::elf::elf_load_from_path_and_create_args(&path_buf, cmd_str, raw_cmd) {
+            if let Some(proc) = crate::process::process_by_pid(pid) {
+                proc.state = crate::process::ProcessState::Ready;
+            }
+            self.write_line(&alloc::format!("  [OK] Proceso iniciado con PID {}", pid), LineColor::Success);
+            return true;
+        }
+
+        // Secondary search: check /PORTIX/<cmd> (UEFI path)
+        let alt_path = alloc::format!("/PORTIX/{}", cmd_str);
+        if let Some(pid) = crate::elf::elf_load_from_path_and_create_args(&alt_path, cmd_str, raw_cmd) {
+            if let Some(proc) = crate::process::process_by_pid(pid) {
+                proc.state = crate::process::ProcessState::Ready;
+            }
+            self.write_line(&alloc::format!("  [OK] Proceso iniciado con PID {}", pid), LineColor::Success);
+            return true;
+        }
+
+        // Fallback: embedded hello.elf if cmd is 'hello' or 'sh'
+        if cmd_str == "hello" || cmd_str == "sh" {
+            let hello_elf = include_bytes!("../../../../../build/hello.elf");
+            if let Some(pid) = crate::elf::elf_load_and_create_process_args(hello_elf, cmd_str, raw_cmd) {
+                if let Some(proc) = crate::process::process_by_pid(pid) {
+                    proc.state = crate::process::ProcessState::Ready;
+                }
+                self.write_line(&alloc::format!("  [OK] Binario interno iniciado con PID {}", pid), LineColor::Success);
+                return true;
+            }
+        }
+
+        false
     }
 
     // ══ Helpers de presentación ════════════════════════════════════════════════
@@ -309,7 +376,7 @@ impl Terminal {
     fn cmd_help(&mut self) {
         self.write_empty();
         self.write_line("  +=========================================================+", LineColor::Header);
-        self.write_line("  |       PORTIX v0.7  -  Referencia de Comandos            |", LineColor::Header);
+        self.write_line("  |       PORTIX v0.9.5  -  Referencia de Comandos          |", LineColor::Header);
         self.write_line("  +=========================================================+", LineColor::Header);
         self.write_empty();
 
@@ -373,7 +440,7 @@ impl Terminal {
 
     fn cmd_ver(&mut self) {
         self.separador("VERSION DEL SISTEMA");
-        self.write_line("  PORTIX Kernel v0.7  -  x86_64 bare-metal", LineColor::Success);
+        self.write_line("  PORTIX Kernel v0.9.5  -  x86_64 bare-metal", LineColor::Success);
         self.write_line("  Compilacion: 2026 / Rust nightly (no_std) + NASM", LineColor::Normal);
         self.write_line("  Subsistemas: PIT  Teclado PS/2  Raton PS/2  ATA  VESA  DblBuf", LineColor::Info);
         self.write_line("               PCI  ACPI  Serial COM1  E820  IDT", LineColor::Info);
@@ -398,7 +465,7 @@ impl Terminal {
         self.write_empty();
         self.write_line("    .--------.", LineColor::Header);
         self.write_line("    | PORTIX |   .-------------.", LineColor::Header);
-        self.write_line("    |  v0.7  |   |   x86_64    |", LineColor::Header);
+        self.write_line("    | v0.9.5 |   |   x86_64    |", LineColor::Header);
         self.write_line("    |        |   | bare-metal   |", LineColor::Header);
         self.write_line("    '--------'   | Doble Buffer |", LineColor::Header);
         self.write_line("        ||       '-------------'", LineColor::Header);
@@ -528,7 +595,21 @@ impl Terminal {
         append_u32(&mut buf, &mut pos, (t & 0xFFFF_FFFF) as u32);
         append_str(&mut buf, &mut pos, b")");
         self.write_bytes(&buf[..pos], LineColor::Info);
-        self.write_line("  Nota: sin driver RTC -- tiempo mostrado es desde el arranque.", LineColor::Normal);
+        {
+            // Fecha/hora reales del RTC CMOS (UTC).
+            let e = crate::time::rtc::now_epoch();
+            let (y, mo, d, h, mi, s) = crate::time::rtc::civil_from_epoch(e);
+            let mut b2 = [0u8; 96]; let mut p2 = 0;
+            append_str(&mut b2, &mut p2, b"  Fecha RTC (UTC): ");
+            append_u32(&mut b2, &mut p2, y as u32); append_str(&mut b2, &mut p2, b"-");
+            if mo < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, mo as u32); append_str(&mut b2, &mut p2, b"-");
+            if d < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, d as u32); append_str(&mut b2, &mut p2, b" ");
+            if h < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, h as u32); append_str(&mut b2, &mut p2, b":");
+            if mi < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, mi as u32); append_str(&mut b2, &mut p2, b":");
+            if s < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, s as u32);
+            append_str(&mut b2, &mut p2, b"  (epoch "); append_u32(&mut b2, &mut p2, e as u32); append_str(&mut b2, &mut p2, b")");
+            self.write_bytes(&b2[..p2], LineColor::Normal);
+        }
     }
 
     fn cmd_uptime(&mut self) {
@@ -1128,7 +1209,7 @@ impl Terminal {
             buf[pos..pos+vl].copy_from_slice(&vb[..vl]); pos+=vl;
             il[n]=buf; ils[n]=pos; n+=1;
         }}}
-        iline!(b"SO       ","PORTIX v0.7 bare-metal");
+        iline!(b"SO       ","PORTIX v0.9.5 bare-metal");
         iline!(b"Arq      ","x86_64");
         iline!(b"Kernel   ","Rust nightly (no_std) + NASM");
         iline!(b"Video    ","VESA LFB (doble buffer @ 0x600000)");

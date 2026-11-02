@@ -50,8 +50,9 @@ const ALLOCATE_ADDRESS:        u32 = 2;
 const EFI_LOADER_DATA:         u32 = 2;
 
 const KERNEL_PHYS:   u64 = 0x200000;
-const BOOTINFO_BASE: u64 = 0x600000;
-const BOOTINFO_SIZE: u32 = 0x1A00;
+// [T-025 E3b, Hallazgo 5] Antes 0x600000 (el .bss del núcleo lo alcanzó). Mismo valor que stage2.asm.
+const BOOTINFO_BASE: u64 = 0xE00000;
+const BOOTINFO_SIZE: u32 = 0x1B00; // T-025: incluye las tablas de firmware (0x1A00..0x1A60)
 
 // ── GUID ───────────────────────────────────────────────────────────────────────
 
@@ -223,7 +224,6 @@ struct _GptEntry {
 // ── FAT32 structures ────────────────────────────────────────────────────────────
 
 #[repr(C, packed)]
-#[repr(C, packed)]
 struct FatBpb {
     jump_ins: [u8; 3],
     oem_name: [u8; 8],
@@ -271,7 +271,7 @@ struct LoadedImage {
 const BI_MAGIC_LO: u32 = 0x424F4F54;
 const BI_MAGIC_HI: u32 = 0x50525458;
 const BI_HDR_SIZE: u32 = 0xE0;
-const BI_TOTAL_SIZE: u32 = 0x1A00;
+const BI_TOTAL_SIZE: u32 = 0x1B00; // T-025: antes 0x1A00 == BI_FW_OFF y el nucleo descartaba la RSDP
 const BI_MMAP_OFF: u32 = 0x100;
 const BI_MMAP_ESIZE: u32 = 48;
 const BI_MMAP_MAX: u32 = 128;
@@ -335,7 +335,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
     // Estrategia: LocateHandleBuffer encuentra TODOS los handles GOP,
     //             fallback a ConsoleOutHandle si no se encuentra ninguno.
     let locate_hb_gop: FnLocateHandleBuffer = bs_call(bs, 312);
-    let open_proto_gop: FnOpenProto = bs_call(bs, 288);
+    let open_proto_gop: FnOpenProto = bs_call(bs, 280);
     let free_pool_gop: FnFreePool = bs_call(bs, 72);
 
     let mut candidates: [EfiHandle; 8] = [core::ptr::null_mut(); 8];
@@ -518,7 +518,7 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
         data1: 0x964E5B21, data2: 0x6459, data3: 0x11D2,
         data4: [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
     };
-    let open_proto: FnOpenProto = bs_call(bs, 288);
+    let open_proto: FnOpenProto = bs_call(bs, 280);
     let allocate_pool: FnAllocPool = bs_call(bs, 64);
     let free_pool: FnFreePool = bs_call(bs, 72);
     let allocate_pages: FnAllocPages = bs_call(bs, 40);
@@ -549,14 +549,22 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
         let rb = unsafe { (*bio).read_blocks };
         let mid = unsafe { (*(*bio).media).media_id };
         let bsiz = unsafe { (*(*bio).media).block_size } as usize;
+        unsafe { serial_puts(b"EFI:mid="); hex64(mid as u64); serial_puts(b"EFI:bsiz="); hex64(bsiz as u64); }
 
+        #[allow(unused_macros)]
         macro_rules! rd1 { ($lba:expr, $b:expr) => { rb(bio as *mut c_void, mid, $lba, bsiz, $b.as_mut_ptr() as *mut c_void) == EFI_SUCCESS } }
         macro_rules! rdn { ($lba:expr, $n:expr, $b:expr) => { rb(bio as *mut c_void, mid, $lba, $n * bsiz, $b.as_mut_ptr() as *mut c_void) == EFI_SUCCESS } }
 
         // FAT32 VBR at partition-relative LBA 0
         let mut vbr: [u8; 512] = [0u8; 512];
-        if rd1!(0, vbr) {
+        let vbr_status = rb(bio as *mut c_void, mid, 0, bsiz, vbr.as_mut_ptr() as *mut c_void);
+        unsafe { serial_puts(b"EFI:vbr_st="); hex64(vbr_status as u64); }
+        if vbr_status == EFI_SUCCESS {
             let bpb = unsafe { &*(vbr.as_ptr() as *const FatBpb) };
+            unsafe {
+                serial_puts(b"EFI:bps="); hex64(bpb.bytes_per_sector as u64);
+                serial_puts(b"EFI:spfat="); hex64(bpb.sectors_per_fat_32 as u64);
+            }
             if bpb.bytes_per_sector as usize == bsiz && bpb.sectors_per_fat_32 > 0 {
                 let spc = bpb.sectors_per_cluster as usize;
                 let fat_lba = bpb.reserved_sector_count as u64;
@@ -564,23 +572,43 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
                 let csize = spc * bsiz;
 
                 let mut cbuf: *mut c_void = core::ptr::null_mut();
-                if allocate_pool(EFI_LOADER_DATA, csize, &mut cbuf) == EFI_SUCCESS && !cbuf.is_null() {
+                let ap_st = allocate_pool(EFI_LOADER_DATA, csize, &mut cbuf);
+                unsafe { serial_puts(b"EFI:ap_st="); hex64(ap_st as u64); }
+                if ap_st == EFI_SUCCESS && !cbuf.is_null() {
+                    let mut fat_buf: *mut c_void = core::ptr::null_mut();
+                    let _ = allocate_pool(EFI_LOADER_DATA, 512, &mut fat_buf);
+                    let mut cached_sf = u64::MAX;
+
                     macro_rules! rdcl { ($cl:expr) => { rdn!(data_lba + ($cl as u64 - 2) * spc as u64, spc, core::slice::from_raw_parts_mut(cbuf as *mut u8, csize)) } }
-                    macro_rules! gf { ($cl:expr) => {{
-                        let off = $cl as usize * 4;
-                        let sf = off / bsiz;
-                        let mut fs = [0u8; 512];
-                        if rd1!(fat_lba + sf as u64, fs) {
+                    let mut read_fat_entry = |cl: u32| -> u32 {
+                        let off = cl as usize * 4;
+                        let sf = (off / bsiz) as u64;
+                        if sf != cached_sf && !fat_buf.is_null() {
+                            if rb(bio as *mut c_void, mid, fat_lba + sf, bsiz, fat_buf) == EFI_SUCCESS {
+                                cached_sf = sf;
+                            } else {
+                                return 0x0FFFFFFF;
+                            }
+                        }
+                        if !fat_buf.is_null() {
                             let bo = off % bsiz;
-                            u32::from_le_bytes([fs[bo], fs[bo+1], fs[bo+2], fs[bo+3]]) & 0x0FFFFFFF
-                        } else { 0x0FFFFFFF }
-                    }}}
+                            let ptr = unsafe { (fat_buf as *const u8).add(bo) };
+                            unsafe {
+                                u32::from_le_bytes([*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]) & 0x0FFFFFFF
+                            }
+                        } else {
+                            0x0FFFFFFF
+                        }
+                    };
 
                     // Find PORTIX directory in root
                     let mut portix_cl = 0u32;
                     let mut pc = bpb.root_cluster;
+                    unsafe { serial_puts(b"EFI:root_cl="); hex64(pc as u64); }
                     loop {
-                        if !rdcl!(pc) { break; }
+                        let rdc = rdcl!(pc);
+                        unsafe { serial_puts(b"EFI:rdcl="); hex64(if rdc { 1 } else { 0 }); }
+                        if !rdc { break; }
                         let dirs = unsafe { core::slice::from_raw_parts(cbuf as *const u8, csize) };
                         for i in (0..csize).step_by(32) {
                             let fb = dirs[i];
@@ -597,10 +625,11 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
                         }
                         if portix_cl != 0 { break; }
                         if pc == 0 { break; }
-                        let n = gf!(pc);
+                        let n = read_fat_entry(pc);
                         if n < 2 || n >= 0x0FFFFFF8 { break; }
                         pc = n;
                     }
+                    unsafe { serial_puts(b"EFI:portix_cl="); hex64(portix_cl as u64); }
 
                     // Find KERNEL.BIN in PORTIX
                     let mut kcl = 0u32;
@@ -627,30 +656,36 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
                             }
                             if kcl != 0 { break; }
                             if fc == 0 { break; }
-                            let n = gf!(fc);
+                            let n = read_fat_entry(fc);
                             if n < 2 || n >= 0x0FFFFFF8 { break; }
                             fc = n;
                         }
                     }
 
+                    unsafe {
+                        serial_puts(b"EFI:kcl="); hex64(kcl as u64);
+                        serial_puts(b"EFI:ksz="); hex64(ksz as u64);
+                    }
                     free_pool(cbuf);
 
                     if kcl != 0 && ksz > 0 && ksz < 4 * 1024 * 1024 {
                         kernel_size = ksz as usize;
                         let kpages = (kernel_size + 4095) / 4096;
                         let mut kphys = KERNEL_PHYS;
-                        if allocate_pages(ALLOCATE_ADDRESS, EFI_LOADER_DATA, kpages, &mut kphys) == EFI_SUCCESS && kphys == KERNEL_PHYS {
-                            let mut dst = kphys as *mut u8;
-                            let mut cl = kcl;
-                            loop {
-                                let _ = rdn!(data_lba + (cl as u64 - 2) * spc as u64, spc, core::slice::from_raw_parts_mut(dst, csize));
-                                dst = unsafe { dst.add(csize) };
-                                let n = gf!(cl);
-                                if n < 2 || n >= 0x0FFFFFF8 { break; }
-                                cl = n;
+                        let ap_k_st = allocate_pages(ALLOCATE_ADDRESS, EFI_LOADER_DATA, kpages, &mut kphys);
+                        unsafe { serial_puts(b"EFI:ap_k_st="); hex64(ap_k_st as u64); }
+                        if ap_k_st == EFI_SUCCESS && kphys == KERNEL_PHYS {
+                            let lba0 = data_lba + (kcl as u64 - 2) * spc as u64;
+                            let total_bytes = kpages * 4096;
+                            let rb_st = rb(bio as *mut c_void, mid, lba0, total_bytes, kphys as *mut c_void);
+                            unsafe { serial_puts(b"EFI:rb_st="); hex64(rb_st as u64); }
+                            if rb_st == EFI_SUCCESS {
+                                kernel_data = kphys as *mut u8;
                             }
-                            kernel_data = kphys as *mut u8;
                         }
+                    }
+                    if !fat_buf.is_null() {
+                        free_pool(fat_buf);
                     }
                 }
             }
@@ -664,16 +699,61 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
         return 1;
     }
 
-    // ── 4. Allocate/find BootInfo memory at 0x600000 ─────────────────────
+    // ── 4. Allocate/find BootInfo memory at BOOTINFO_BASE (0xE00000) ─────────────────────
     let pages_info = (BOOTINFO_SIZE as usize + 4095) / 4096;
     let mut bi_phys: u64 = BOOTINFO_BASE;
-    let bi_status = allocate_pages(ALLOCATE_ADDRESS, EFI_LOADER_DATA, pages_info, &mut bi_phys);
+    let mut bi_status = allocate_pages(ALLOCATE_ADDRESS, EFI_LOADER_DATA, pages_info, &mut bi_phys);
     if bi_status != EFI_SUCCESS {
-        return 2;
+        // [T-025 E3b] OVMF puede tener ocupada la dirección fija (en la sonda
+        // UEFI 0xE00000 lo estaba): se pide al firmware cualquier bloque por
+        // debajo de 16 MiB (ALLOCATE_MAX_ADDRESS = 1): por encima de la imagen
+        // del núcleo (0x200000..~0x700000) y por debajo de su montículo
+        // (0x1000000-0x5000000), que lo pisaría. El núcleo recibe la dirección
+        // real en RDI y el rango se declara en el propio bootinfo.
+        bi_phys = 0x0100_0000;
+        bi_status = allocate_pages(1, EFI_LOADER_DATA, pages_info, &mut bi_phys);
+        if bi_status != EFI_SUCCESS {
+            return 2;
+        }
+    }
+    unsafe { serial_puts(b"EFI:bi_phys="); hex64(bi_phys); }
+
+    // ── 4b. Setup clean identity page tables (8 GB) for Portix kernel ───
+    let pt_pages = 10usize; // 1 PML4 + 1 PDPT + 8 PDs = 8 GB identity map
+    // [T-025 E3b] Antes en 0x700000 fijo (a 384 KiB del fin del núcleo, que
+    // crece). Ahora las elige el firmware por debajo de 16 MiB (fuera de la
+    // imagen y del montículo del núcleo); si no hay sitio, por debajo de 4 GiB.
+    let mut pt_phys: u64 = 0x0100_0000;
+    let mut pt_st = allocate_pages(1, EFI_LOADER_DATA, pt_pages, &mut pt_phys); // ALLOCATE_MAX_ADDRESS
+    if pt_st != EFI_SUCCESS {
+        pt_phys = 0xFFFFFFFF;
+        pt_st = allocate_pages(1, EFI_LOADER_DATA, pt_pages, &mut pt_phys); // ALLOCATE_MAX_ADDRESS
+    }
+    if pt_st == EFI_SUCCESS && pt_phys != 0 {
+        let pt_ptr = pt_phys as *mut u8;
+        zero_mem(pt_ptr, pt_pages * 4096);
+        let pml4 = pt_ptr as *mut u64;
+        let pdpt = unsafe { pt_ptr.add(4096) as *mut u64 };
+        let pd_base = unsafe { pt_ptr.add(8192) as *mut u64 };
+
+        unsafe {
+            core::ptr::write_unaligned(pml4, (pt_phys + 4096) | 0x03);
+            for i in 0..8 {
+                let pd_addr = (pt_phys + 8192) + (i as u64 * 4096);
+                core::ptr::write_unaligned(pdpt.add(i), pd_addr | 0x03);
+            }
+            for i in 0..8 {
+                let pd = pd_base.add(i * 512);
+                for j in 0..512 {
+                    let phys_addr = ((i as u64 * 512) + j as u64) * 0x200000;
+                    core::ptr::write_unaligned(pd.add(j), phys_addr | 0x83);
+                }
+            }
+        }
     }
 
-    // ── 5. Build PortixBootInfo at 0x600000 ──────────────────────────────
-    let bi = BOOTINFO_BASE as *mut u8;
+    // ── 5. Build PortixBootInfo at BOOTINFO_BASE ──────────────────────────────
+    let bi = bi_phys as *mut u8;
     zero_mem(bi, BOOTINFO_SIZE as usize);
 
     // Magic
@@ -798,14 +878,14 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
     rc += 1;
 
     // Range 1: BootInfo
-    write_range(rp.add(rc as usize * (BI_RANGE_ESIZE as usize / 4)), BOOTINFO_BASE, BOOTINFO_SIZE as u64, MEM_LOADER_DATA, OWNER_LOADER, RECLAIM_NEVER, CACHE_WB);
+    write_range(rp.add(rc as usize * (BI_RANGE_ESIZE as usize / 4)), bi_phys, BOOTINFO_SIZE as u64, MEM_LOADER_DATA, OWNER_LOADER, RECLAIM_NEVER, CACHE_WB);
     rc += 1;
 
     // Range 2-3: EFI boot services code/data used by our loader
     write_range(rp.add(rc as usize * (BI_RANGE_ESIZE as usize / 4)), 0x100000, 0x2000, MEM_LOADER_DATA, OWNER_LOADER, RECLAIM_AFTER_KERNEL_INIT, CACHE_WB);
     rc += 1;
 
-    write_range(rp.add(rc as usize * (BI_RANGE_ESIZE as usize / 4)), 0x700000, 0x100000, MEM_LOADER_DATA, OWNER_LOADER, RECLAIM_AFTER_KERNEL_INIT, CACHE_WB);
+    write_range(rp.add(rc as usize * (BI_RANGE_ESIZE as usize / 4)), pt_phys, (pt_pages as u64) * 4096, MEM_LOADER_DATA, OWNER_LOADER, RECLAIM_AFTER_KERNEL_INIT, CACHE_WB);
     rc += 1;
 
     core::ptr::write_unaligned(bi.add(0xB8) as *mut u32, rc);
@@ -865,20 +945,38 @@ pub unsafe extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable
         }
     }
 
-    unsafe { serial_puts(b"EFI:jump_kernel\n"); }
+    unsafe {
+        serial_puts(b"EFI:jump_kernel cr3=");
+        hex64(pt_phys);
+    }
 
     // ── 7. Jump to kernel ────────────────────────────────────────────────
     unsafe {
-        core::arch::asm!(
-            "cli",
-            "cld",
-            "mov rdi, {bi}",
-            "mov rax, {kernel}",
-            "jmp rax",
-            bi = in(reg) BOOTINFO_BASE,
-            kernel = in(reg) KERNEL_PHYS,
-            options(noreturn)
-        );
+        if pt_phys != 0 {
+            core::arch::asm!(
+                "mov cr3, {cr3}",
+                "cli",
+                "cld",
+                "mov rdi, {bi}",
+                "mov rax, {kernel}",
+                "jmp rax",
+                cr3 = in(reg) pt_phys,
+                bi = in(reg) bi_phys,
+                kernel = in(reg) KERNEL_PHYS,
+                options(noreturn)
+            );
+        } else {
+            core::arch::asm!(
+                "cli",
+                "cld",
+                "mov rdi, {bi}",
+                "mov rax, {kernel}",
+                "jmp rax",
+                bi = in(reg) bi_phys,
+                kernel = in(reg) KERNEL_PHYS,
+                options(noreturn)
+            );
+        }
     }
 }
 

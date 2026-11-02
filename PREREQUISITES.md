@@ -1,5 +1,6 @@
 # Portix OS — Prerequisites
 
+
 > Dependencias necesarias para compilar y ejecutar Portix OS en cualquier plataforma.
 
 ---

@@ -1,23 +1,19 @@
-// ui/mod.rs — PORTIX Kernel v0.7.4
+// kernel/src/ui/mod.rs — PORTIX Modern Desktop Environment
 
-pub mod chrome;
 pub mod exception;
-pub mod tabs;
 pub mod input;
+pub mod protocol;
+pub mod window;
+pub mod font_ttf;
+pub mod widgets;
+pub mod wayland_server;
+pub mod wayland_effects;
+pub mod wayland_seat;
+pub mod tiling_wm;
+pub mod web_engine;
+pub mod web_accel;
+pub mod portix_ui;
+pub mod commercial_oobe;
 
-// Re-exportamos para facilitar el uso desde main.rs
-pub use chrome::{section_label, draw_chrome};
-pub use tabs::{draw_system_tab, draw_terminal_tab, draw_devices_tab, draw_ide_tab, draw_explorer_tab};
-pub use tabs::terminal::terminal_hist_geometry;
-
-/// Ancho de la barra de scroll en píxeles
-pub const SCROLLBAR_W: usize = 12;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    System   = 0,
-    Terminal = 1,
-    Devices  = 2,
-    Ide      = 3,
-    Explorer = 4,
-}
+pub use window::{WindowManager, Window, WindowKind};
+pub use protocol::{CompositorEvent, EventQueue, PtyStream, WindowSurface, SurfaceId};

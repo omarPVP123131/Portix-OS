@@ -124,6 +124,7 @@ impl InputBox {
             Key::Home  => { self.cursor = 0;            None }
             Key::End   => { self.cursor = self.len;     None }
             Key::Char(c) if c >= 0x20 && c < 0x7F && self.len < INPUT_MAX => {
+                if self.len > INPUT_MAX { self.len = INPUT_MAX; }
                 let pos = self.cursor;
                 self.buf.copy_within(pos..self.len, pos + 1);
                 self.buf[pos] = c;

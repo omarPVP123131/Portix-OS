@@ -1,0 +1,5 @@
+build/dist/portix.img P2=96af3958e0a5682259ccbaf3ab0beedcb04554805ea1c5fa8c8b3c1413d3d3d0
+build/dist/portix.img P3=74754e2e4fbdf204ee1e68d5d6d421d372b2715c1e9533c61625598659e4e54b
+build/dist/pruebas/portix-t034-kernel118.img P2=96af3958e0a5682259ccbaf3ab0beedcb04554805ea1c5fa8c8b3c1413d3d3d0
+build/dist/pruebas/portix-t034-kernel118.img P3=74754e2e4fbdf204ee1e68d5d6d421d372b2715c1e9533c61625598659e4e54b
+[PASS] MBR: tabla y firma idénticas

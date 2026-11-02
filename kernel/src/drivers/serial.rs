@@ -86,11 +86,27 @@ impl Level {
     }
 }
 
-// ── Escritura ─────────────────────────────────────────────────────────────────
+// ── Escritura y Lectura ────────────────────────────────────────────────────────
 
 #[inline(always)]
 fn tx_ready() -> bool {
     unsafe { inb(COM1 + 5) & 0x20 != 0 }
+}
+
+#[inline(always)]
+pub fn rx_ready() -> bool {
+    unsafe { inb(COM1 + 5) & 0x01 != 0 }
+}
+
+pub fn read_byte() -> Option<u8> {
+    if !SERIAL_OK.load(Ordering::Relaxed) {
+        return None;
+    }
+    if rx_ready() {
+        Some(unsafe { inb(COM1) })
+    } else {
+        None
+    }
 }
 
 pub fn write_byte(b: u8) {
@@ -101,10 +117,66 @@ pub fn write_byte(b: u8) {
     while !tx_ready() && limit > 0 {
         limit -= 1;
     }
+    if !tx_ready() { return; }
     unsafe { outb(COM1, b); }
 }
 
+// ── [T-025 E3a] Cerrojo de la consola serie entre CPUs ─────────────────────
+// Dueño = índice de CPU; reentrante en la misma CPU (una ISR o un pánico que
+// escriban mientras el hilo de esa CPU tiene el cerrojo no se bloquean, como
+// hasta ahora). Entre CPUs distintas serializa cada llamada completa, de modo
+// que las líneas no se mezclan byte a byte. Nunca espera más de ~50 ms.
+const SIN_DUENO: u32 = u32::MAX;
+static DUENO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(SIN_DUENO);
+static ANIDAMIENTO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+struct GuardSerie(bool);
+/// [T-045] Si no se consigue el turno se devuelve `None` y **no se escribe**.
+/// Antes se devolvía un guarda «falso» y el llamador escribía igual: cuando otra
+/// CPU sostenía el cerrojo (por ejemplo inundando la consola), las dos series se
+/// entrelazaban byte a byte, se perdían los dígitos de las líneas del depurador
+/// y las pruebas que buscan una cadena literal fallaban por el transporte, no
+/// por el núcleo. Es preferible perder una línea entera (se cuenta y se anuncia)
+/// que corromper las de todo el mundo.
+fn tomar() -> Option<GuardSerie> {
+    let yo = crate::arch::percpu::indice_actual() as u32;
+    if DUENO.load(Ordering::Acquire) == yo {
+        ANIDAMIENTO.fetch_add(1, Ordering::Relaxed);
+        return Some(GuardSerie(false));
+    }
+    let mut intentos = 0u32;
+    while DUENO.compare_exchange_weak(SIN_DUENO, yo, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+        intentos += 1;
+        if intentos > 5_000_000 { return None; } // nunca colgar la consola
+    }
+    Some(GuardSerie(true))
+}
+
+/// Escrituras abandonadas por falta de turno (se anuncian, nunca se ocultan).
+static PERDIDAS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PERDIDAS_ANUNCIADAS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Ya con el turno en la mano: deja constancia de las escrituras perdidas.
+fn anunciar_perdidas() {
+    let p = PERDIDAS.load(Ordering::Relaxed);
+    if p != PERDIDAS_ANUNCIADAS.load(Ordering::Relaxed) {
+        PERDIDAS_ANUNCIADAS.store(p, Ordering::Relaxed);
+        for &b in b"[SERIE-SIN-TURNO] escrituras perdidas=" { write_byte(b); }
+        write_num(p as u64);
+        write_byte(b'\n');
+    }
+}
+impl Drop for GuardSerie {
+    fn drop(&mut self) {
+        if self.0 { DUENO.store(SIN_DUENO, Ordering::Release); }
+        else if ANIDAMIENTO.load(Ordering::Relaxed) > 0 { ANIDAMIENTO.fetch_sub(1, Ordering::Relaxed); }
+    }
+}
+
 pub fn write_str(s: &str) {
+    let _g = match tomar() { Some(g) => g, None => { PERDIDAS.fetch_add(1, Ordering::Relaxed); return; } };
+    anunciar_perdidas();
     for b in s.bytes() {
         if b == b'\n' {
             write_byte(b'\r');
@@ -113,10 +185,42 @@ pub fn write_str(s: &str) {
     }
 }
 
+#[track_caller]
 pub fn write_bytes_raw(s: &[u8]) {
+    // [T-045 DIAGNOSTICO] Cualquier escritura >= 256 B deja su rastro: tamaño,
+    // pid y punto de llamada. Sirve para identificar quién inunda la consola
+    // con memoria cruda (ceros, rodata del núcleo) y rompe las pruebas de texto.
+    if s.len() >= 256 {
+        static VISTOS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if VISTOS.fetch_add(1, Ordering::Relaxed) < 60 {
+            let loc = core::panic::Location::caller();
+            let _g = match tomar() { Some(g) => g, None => GuardSerie(false) };
+            for &b in b"[SERIE-BULTO] n=" { write_byte(b); }
+            write_num(s.len() as u64);
+            for &b in b" pid=" { write_byte(b); }
+            write_num(crate::arch::percpu::pid_actual() as u64);
+            for &b in b" en " { write_byte(b); }
+            for &b in loc.file().as_bytes() { write_byte(b); }
+            write_byte(b':');
+            write_num(loc.line() as u64);
+            write_byte(b'\n');
+        }
+    }
+    let _g = match tomar() { Some(g) => g, None => { PERDIDAS.fetch_add(1, Ordering::Relaxed); return; } };
+    anunciar_perdidas();
     for &b in s {
         write_byte(b);
     }
+}
+
+/// Decimal sin tomar el cerrojo (para diagnósticos que ya lo tienen).
+fn write_num(mut n: u64) {
+    if n == 0 { write_byte(b'0'); return; }
+    let mut buf = [0u8; 20];
+    let mut i = 0usize;
+    while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+    buf[..i].reverse();
+    for &b in &buf[..i] { write_byte(b); }
 }
 
 pub fn write_u32(mut n: u32) {
@@ -136,15 +240,52 @@ pub fn write_u32(mut n: u32) {
 }
 
 pub fn write_usize(n: usize) {
-    write_u32(n as u32); // suficiente para 32-bit; ampliar si se porta a 64-bit
+    if n == 0 {
+        write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0usize;
+    let mut m = n;
+    while m > 0 {
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        i += 1;
+    }
+    buf[..i].reverse();
+    write_bytes_raw(&buf[..i]);
 }
 
-/// Imprime un `usize` como `0xDEADBEEF`.
+/// Imprime un `usize` como `0xDEADBEEF` (64-bit completo en x86_64).
+/// Escribe un carácter ASCII (diagnóstico).
+/// Escribe un entero de 64 bits en decimal (contadores de silicio: bloques,
+/// bytes transferidos, comandos completados).
+pub fn write_u64(mut n: u64) {
+    if n == 0 {
+        write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while n > 0 && i < buf.len() {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        write_byte(buf[i]);
+    }
+}
+
+pub fn write_char(c: char) {
+    write_byte(c as u8);
+}
+
 pub fn write_hex(n: usize) {
     const HEX: &[u8] = b"0123456789ABCDEF";
     write_str("0x");
-    // 8 dígitos para 32-bit
-    for shift in (0..8).rev() {
+    for shift in (0..16).rev() {
         let nibble = (n >> (shift * 4)) & 0xF;
         write_byte(HEX[nibble]);
     }
@@ -169,13 +310,117 @@ pub fn log_level(level: Level, tag: &str, msg: &str) {
     write_byte(b'\n');
 }
 
+/// kprintln! — Log con nivel, tag, y archivo:línea automáticos.
+/// Uso: kprintln!(Info, "TAG", "mensaje {}", arg);
+///      kprintln!(Error, "TAG", "fallo en x={}", val);
 #[macro_export]
-macro_rules! serial_log {
-    ($lvl:ident, $tag:expr, $msg:expr) => {
+macro_rules! kprintln {
+    ($lvl:ident, $tag:expr, $msg:expr $(, $arg:expr)* $(,)?) => {{
         $crate::drivers::serial::log_level(
             $crate::drivers::serial::Level::$lvl,
             $tag,
-            $msg,
-        )
+            core::concat!(
+                $msg,
+                " [",
+                core::file!(),
+                ":",
+                core::stringify!(core::line!()),
+                "]"
+            ),
+        );
+        $( $crate::drivers::serial::write_str("  arg=");
+           $crate::drivers::serial::write_hex($arg as usize);
+           $crate::drivers::serial::write_byte(b'\n'); )*
+    }};
+}
+
+/// kassert! — Assert que logea ubicación antes de panic.
+/// Uso: kassert!(condición, "mensaje opcional");
+#[macro_export]
+macro_rules! kassert {
+    ($cond:expr $(, $msg:expr)? $(,)?) => {
+        if !$cond {
+            $crate::kprintln!(Error, "ASSERT",
+                core::concat!("FAIL: ", core::stringify!($cond) $(, ": ", $msg)?));
+            panic!(core::concat!("ASSERT FAIL: ", core::stringify!($cond)
+                $(, ": ", $msg)?));
+        }
     };
+}
+
+/// kassert_eq! — Assert con igualdad que logea ubicación.
+#[macro_export]
+macro_rules! kassert_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        if $left != $right {
+            $crate::kprintln!(Error, "ASSERT_EQ",
+                core::concat!(
+                    "FAIL: ", core::stringify!($left), " != ", core::stringify!($right)
+                ));
+            panic!(core::concat!(
+                "ASSERT_EQ FAIL: ", core::stringify!($left), " != ", core::stringify!($right)
+            ));
+        }
+    };
+}
+
+/// hexdump — Imprime `len` bytes de `data` en formato hex+ASCII por serial.
+pub fn hexdump(tag: &str, data: &[u8], len: usize) {
+    let n = len.min(data.len());
+    let mut off = 0usize;
+    while off < n {
+        let row_end = (off + 16).min(n);
+        write_str(tag);
+        write_str("  ");
+        write_hex(off);
+        write_str("  ");
+        for i in off..row_end {
+            let b = data[i];
+            const H: &[u8] = b"0123456789ABCDEF";
+            write_byte(H[(b >> 4) as usize]);
+            write_byte(H[(b & 0xF) as usize]);
+            write_byte(b' ');
+        }
+        for _ in row_end..off + 16 { write_str("   "); }
+        write_str(" |");
+        for i in off..row_end {
+            let b = data[i];
+            write_byte(if b >= 0x20 && b < 0x7F { b } else { b'.' });
+        }
+        write_str("|\n");
+        off = row_end;
+    }
+}
+
+/// dump_regs — Imprime registros en formato grid para debugging.
+pub fn dump_regs(tag: &str, rip: u64, rsp: u64, cr3: u64, gpr: &[u64; 15]) {
+    write_str("[ ");
+    write_str(tag);
+    write_str(" ] ");
+    write_str("RIP=");
+    write_hex(rip as usize);
+    write_str("  RSP=");
+    write_hex(rsp as usize);
+    write_str("  CR3=");
+    write_hex(cr3 as usize);
+    write_byte(b'\n');
+    write_str("  RAX="); write_hex(gpr[0] as usize);
+    write_str("  RBX="); write_hex(gpr[1] as usize);
+    write_str("  RCX="); write_hex(gpr[2] as usize);
+    write_str("  RDX="); write_hex(gpr[3] as usize);
+    write_byte(b'\n');
+    write_str("  RSI="); write_hex(gpr[4] as usize);
+    write_str("  RDI="); write_hex(gpr[5] as usize);
+    write_str("  RBP="); write_hex(gpr[6] as usize);
+    write_str("  R08="); write_hex(gpr[7] as usize);
+    write_byte(b'\n');
+    write_str("  R09="); write_hex(gpr[8] as usize);
+    write_str("  R10="); write_hex(gpr[9] as usize);
+    write_str("  R11="); write_hex(gpr[10] as usize);
+    write_str("  R12="); write_hex(gpr[11] as usize);
+    write_byte(b'\n');
+    write_str("  R13="); write_hex(gpr[12] as usize);
+    write_str("  R14="); write_hex(gpr[13] as usize);
+    write_str("  R15="); write_hex(gpr[14] as usize);
+    write_byte(b'\n');
 }

@@ -1,0 +1,7 @@
+traza=t032-qmp-t033e-01-ide.log
+sha256_original=848ee6ae082d799e35f169502268087a18f8d9fc875b40123352517344e24bc9
+sha256_descomprimido=848ee6ae082d799e35f169502268087a18f8d9fc875b40123352517344e24bc9
+0267b9bc8e6c41584f4d95d8a146e60ca7997435658fb3f489a6202c4f5aa8a2  docs/evidencias/b203/t032-qmp-t033e-01-ide.log.gz
+bytes_original=48013902
+bytes_comprimido=234177
+cobertura_reset_primario=verificada por el ejecutor

@@ -1,0 +1,78 @@
+T-028 · EL BARRIDO DE VENCIMIENTOS NO CORRÍA CON EL SISTEMA OCIOSO
+====================================================================
+Fecha: 1 de noviembre de 2026 (ciclo B, intermitentes)
+Sonda: scripts/sonda_reloj_t028.py · Fixture: scripts/sondas/t028_reloj.rs
+Instrumentación nueva: kernel/src/process/scheduler.rs (contadores WAKE_*,
+vigilar_reloj_de_esperas) y /proc/smp línea `reloj: ...`.
+
+PREGUNTA
+--------
+La traza original de T-028 dejó dos plazos independientes sin vencer a la vez:
+`sleep_until` del curl (>144 s con plazo de 1,5 s) y el tope de 1000 ticks de
+`tcp_wait_accept`. Que los dos se queden cortos sólo se explica si lo que no
+avanza es el reloj, o el barrido que despierta a los que duermen.
+
+MÉTODO
+------
+El fixture deja dos hijos durmiendo (procesos Blocked con plazo: el estado del
+curl de T-028) y el padre imprime `ticks` de /proc/smp cada 100 ms durante 30
+iteraciones. El anfitrión pone la hora; el invitado sólo aporta números que
+puede leer de su propio núcleo.
+
+ANTES (imagen 90569defe59a9c77…, sin arreglo)
+---------------------------------------------
+  [INFO] reloj declarado por el invitado: 100 ticks/s
+  [INFO] antes: ticks=1161 barridos=249 sin_cerrojo=0 despertados=1
+  [INFO] muestras=30 sin_avanzar=1 pared=4.12 s
+  [INFO] peor espera de 100 ms medida en ticks = 11 (110 ms a 100 Hz)
+  [INFO] después: ticks=1578 barridos=987 sin_cerrojo=11 despertados=31 atascada=0
+  [INFO] peor racha sin cerrojo=2 ticks; peor hueco entre barridos=150 ticks (1500 ms a 100 Hz)
+  [FAIL] 1 lecturas del reloj sin avanzar; 150 ticks (1500 ms) sin ningún barrido de vencimientos
+
+LECTURA: durante 1,5 s seguidos NO se ejecutó ni un solo barrido de
+vencimientos en un sistema casi ocioso. Mientras no corre el barrido, un
+`sleep_until` vencido no despierta a nadie: el que duerme se queda dormido hasta
+que otra CPU entre a modo usuario o active `preempt_ok`. Es el mecanismo de
+T-028 (y el de T-015 cuando el shell espera al hijo en segundo plano).
+
+CAUSA
+-----
+`schedule_tick` volvía antes de `wake_blocked()`:
+
+    if !in_user && !kernel_preempt { return 0; }   // «si no vengo de modo usuario, no planifico»
+
+y `wake_blocked()` estaba DESPUÉS de ese retorno. Con todas las CPUs ociosas en
+el núcleo (o esperando con `preempt_ok` a false) nadie barría los vencimientos.
+
+ARREGLO
+-------
+`wake_blocked()` se llama en cada tick, ANTES del retorno, venga la CPU de modo
+usuario o esté ociosa; se retira la llamada duplicada posterior. Despertar es
+barato (try_lock + recorrido) y no cambia de contexto: sólo marca `Ready`.
+
+DESPUÉS (imagen b120f6f932b79c68…, con arreglo)
+-----------------------------------------------
+  [INFO] reloj declarado por el invitado: 100 ticks/s
+  [INFO] antes: ticks=1136 barridos=1137 sin_cerrojo=0 despertados=1
+  [INFO] muestras=30 sin_avanzar=1 pared=4.16 s
+  [INFO] peor espera de 100 ms medida en ticks = 11 (110 ms a 100 Hz)
+  [INFO] después: ticks=1558 barridos=1999 sin_cerrojo=6 despertados=31 atascada=0
+  [INFO] peor racha sin cerrojo=1 ticks; peor hueco entre barridos=1 ticks (10 ms a 100 Hz)
+  [FAIL] 1 lecturas del reloj sin avanzar
+
+COMPARACIÓN
+-----------
+  peor hueco entre barridos : 150 ticks (1500 ms)  ->  1 tick (10 ms)   [150x]
+  barridos en la corrida    : 987                  ->  1999
+  peor racha sin cerrojo    : 2                    ->  1
+  despertados por tiempo    : 31                   ->  31 (los mismos, ahora puntuales)
+
+LO QUE SIGUE ABIERTO (medido, no supuesto)
+-------------------------------------------
+- Queda **1 lectura de cada 30** en la que una espera de 100 ms no ve avanzar el
+  reloj ni un tick. Puede ser un `nanosleep` que vuelve antes de tiempo o una
+  lectura de /proc/smp servida del mismo tick; hay que separarlo con una prueba
+  que mida el delta mínimo y cuente los retornos tempranos.
+- El invitado gana ~292 ticks en 4,16 s de pared del anfitrión (≈70 %). El
+  conteo incluye ida y vuelta de consola, así que no se concluye pérdida de
+  tiempo; si se quiere afirmar, hay que medirlo sin consola de por medio.

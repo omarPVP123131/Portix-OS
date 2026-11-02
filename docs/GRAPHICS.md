@@ -1,5 +1,6 @@
 # Portix OS — Subsistema Gráfico
 
+
 ## Visión general
 
 ```

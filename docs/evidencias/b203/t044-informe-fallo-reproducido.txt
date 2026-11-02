@@ -1,0 +1,27 @@
+T-044 · Informe del fallo reproducido en la recertificación final (53/62)
+
+Serie del invitado: 21544688 bytes
+Byte 0x00: 19114163 (88.7 %)  ·  bytes no imprimibles: 20563333 
+
+Marcadores que el probe buscaba y SÍ están en la serie (el invitado hizo su trabajo):
+     3  [SESSION-BUF-PASS]
+     3  [SESSION-BUF-SILENT]
+     4  [WATCH-CLEARED]
+    11  ranura=DR0 vigilada=
+     3  necesita m
+     2  [BREAKPOINT-PASS]
+     4  [SESSION-OR-WAIT]
+
+Marcadores que NO se encuentran, y por qué: todos llevan DÍGITOS en la cadena
+(p. ej. «4 ranuras armadas», «dispararon=4», «atribuidas a la mitad baja=0», «ranuras activas en el CPU=4»).
+El volcado binario del invitado los parte en trozos que no coinciden con la cadena literal.
+
+Primer tramo binario: contexto con punteros 0x7effffff… (pila del objetivo) y un bloque de 4095 ceros.
+
+Diagnóstico propio del ensayo (instalado en este ciclo):
+  [SESSION-OR-WAIT] fase=A-disyuncion hijo=34 r=34 stopped=true vencido=false status=0x057f
+  [SESSION-OR-TIMEOUT] fase=Ã sin parada del hijo Ã tras Ã* ms (parada perdida o objetivo terminado)
+  [SESSION-OR-WAIT] fase=Ã hijo=Ã r=Ã	 stopped=Ã	 vencido=Ã
+  [SESSION-OR-WAIT] fase=Ã hijo=Ã r=Ã	 stopped=Ã	 vencido=Ã
+  [SESSION-OR-TIMEOUT] fase=Ã sin parada del hijo Ã tras Ã* ms (parada perdida o objetivo terminado)
+  [SESSION-OR-TIMEOUT] fase=Ã sin parada del hijo Ã tras Ã* ms (parada perdida o objetivo terminado)

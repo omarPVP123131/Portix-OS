@@ -10,7 +10,7 @@
   "panic-strategy": "abort",
   "disable-redzone": true,
   "relocation-model": "static",
-  "code-model": "small",
+  "code-model": "kernel",
   "pre-link-args": {
     "ld.lld": ["-Tlinker.ld"]
   }

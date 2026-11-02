@@ -10,7 +10,7 @@ use crate::console::terminal::fmt::*;
 pub fn cmd_help(t: &mut Terminal) {
     t.write_empty();
     t.write_line("  +=========================================================+", LineColor::Header);
-    t.write_line("  |       PORTIX v0.7  -  Referencia de Comandos            |", LineColor::Header);
+    t.write_line("  |       PORTIX v1.0.0  -  Referencia de Comandos          |", LineColor::Header);
     t.write_line("  +=========================================================+", LineColor::Header);
     t.write_empty();
 
@@ -86,7 +86,7 @@ pub fn cmd_help(t: &mut Terminal) {
 
 pub fn cmd_ver(t: &mut Terminal) {
     t.separador("VERSION DEL SISTEMA");
-    t.write_line("  PORTIX Kernel v0.7  -  x86_64 bare-metal",                   LineColor::Success);
+    t.write_line("  PORTIX Kernel v1.0.0 'Chronos'  -  x86_64 bare-metal",                 LineColor::Success);
     t.write_line("  Compilacion: 2026 / Rust nightly (no_std) + NASM",           LineColor::Normal);
     t.write_line("  Subsistemas: PIT  Teclado PS/2  Raton PS/2  ATA  VESA  DblBuf", LineColor::Info);
     t.write_line("               PCI  ACPI  Serial COM1  E820  IDT",             LineColor::Info);
@@ -137,7 +137,21 @@ pub fn cmd_fecha(t: &mut Terminal) {
     append_u32(&mut buf, &mut pos, (tick & 0xFFFF_FFFF) as u32);
     append_str(&mut buf, &mut pos, b")");
     t.write_bytes(&buf[..pos], LineColor::Info);
-    t.write_line("  Nota: sin driver RTC -- tiempo mostrado es desde el arranque.", LineColor::Normal);
+    {
+        // Fecha/hora reales del RTC CMOS (UTC).
+        let e = crate::time::rtc::now_epoch();
+        let (y, mo, d, h, mi, s) = crate::time::rtc::civil_from_epoch(e);
+        let mut b2 = [0u8; 96]; let mut p2 = 0;
+        append_str(&mut b2, &mut p2, b"  Fecha RTC (UTC): ");
+        append_u32(&mut b2, &mut p2, y as u32); append_str(&mut b2, &mut p2, b"-");
+        if mo < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, mo as u32); append_str(&mut b2, &mut p2, b"-");
+        if d < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, d as u32); append_str(&mut b2, &mut p2, b" ");
+        if h < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, h as u32); append_str(&mut b2, &mut p2, b":");
+        if mi < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, mi as u32); append_str(&mut b2, &mut p2, b":");
+        if s < 10 { append_str(&mut b2, &mut p2, b"0"); } append_u32(&mut b2, &mut p2, s as u32);
+        append_str(&mut b2, &mut p2, b"  (epoch "); append_u32(&mut b2, &mut p2, e as u32); append_str(&mut b2, &mut p2, b")");
+        t.write_bytes(&b2[..p2], LineColor::Normal);
+    }
 }
 
 pub fn cmd_ticks(t: &mut Terminal) {
@@ -230,6 +244,20 @@ pub fn cmd_mem(t: &mut Terminal, hw: &crate::arch::hardware::HardwareInfo) {
         append_mib(&mut buf, &mut pos, hw.ram.usable_or_default());
         append_str(&mut buf, &mut pos, b"   Entradas: ");
         append_u32(&mut buf, &mut pos, hw.ram.entry_count as u32);
+        t.write_bytes(&buf[..pos], LineColor::Normal);
+    }
+    {
+        // [Fase B.4] asignador de marcos de usuario (independiente del montículo)
+        let (total, libres, pico, respaldo) = crate::mem::marcos::estadisticas();
+        let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+        append_str(&mut buf, &mut pos, b"  Marcos de usuario: total=");
+        append_u32(&mut buf, &mut pos, total as u32);
+        append_str(&mut buf, &mut pos, b" libres=");
+        append_u32(&mut buf, &mut pos, libres as u32);
+        append_str(&mut buf, &mut pos, b" pico=");
+        append_u32(&mut buf, &mut pos, pico as u32);
+        append_str(&mut buf, &mut pos, b" respaldo-monticulo=");
+        append_u32(&mut buf, &mut pos, respaldo as u32);
         t.write_bytes(&buf[..pos], LineColor::Normal);
     }
     t.write_empty();
@@ -393,7 +421,7 @@ pub fn cmd_neofetch(
         }}
     }
 
-    iline!(b"SO       ", "PORTIX v0.7 bare-metal");
+    iline!(b"SO       ", "PORTIX v1.0.0 bare-metal");
     iline!(b"Arq      ", "x86_64");
     iline!(b"Kernel   ", "Rust nightly (no_std) + NASM");
     iline!(b"Video    ", "VESA LFB (doble buffer @ 0x600000)");

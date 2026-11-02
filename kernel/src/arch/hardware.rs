@@ -49,6 +49,7 @@ unsafe fn cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
 }
 
 // ── CPU Info ─────────────────────────────────────────────────────────────────
+#[derive(Clone, Copy)]
 pub struct CpuInfo {
     pub vendor:        [u8; 13],  // "AuthenticAMD\0" / "GenuineIntel\0"
     pub brand:         [u8; 49],  // "AMD Ryzen 7 5600X...\0"
@@ -434,6 +435,7 @@ unsafe fn ata_identify(base: u16, ctrl: u16, drive: u8) -> Option<DiskInfo> {
     Some(d)
 }
 
+#[derive(Clone, Copy)]
 pub struct Disks {
     pub drives: [DiskInfo; MAX_DISKS],
     pub count:  usize,
@@ -469,6 +471,7 @@ impl Disks {
 }
 
 // ── RAM Info (from E820 table written by stage2) ──────────────────────────────
+#[derive(Clone, Copy)]
 pub struct RamInfo {
     pub usable_mb:  u64,   // Type 1 entries
     pub total_mb:   u64,   // All entries (incl. reserved/ACPI)
@@ -522,6 +525,7 @@ impl RamInfo {
 }
 
 // ── Display Info (from VESA data written by stage2) ───────────────────────────
+#[derive(Clone, Copy)]
 pub struct DisplayInfo {
     pub lfb_addr: u64,
     pub width:    u16,
@@ -544,11 +548,11 @@ impl DisplayInfo {
         }
         unsafe {
             DisplayInfo {
-                lfb_addr: core::ptr::read_volatile(0x9004 as *const u32) as u64,
-                width:    core::ptr::read_volatile(0x9008 as *const u16),
-                height:   core::ptr::read_volatile(0x900A as *const u16),
-                pitch:    core::ptr::read_volatile(0x900C as *const u16),
-                bpp:      core::ptr::read_volatile(0x900E as *const u8),
+                lfb_addr: core::ptr::read_volatile(0x5004 as *const u32) as u64,
+                width:    core::ptr::read_volatile(0x5008 as *const u16),
+                height:   core::ptr::read_volatile(0x500A as *const u16),
+                pitch:    core::ptr::read_volatile(0x500C as *const u16),
+                bpp:      core::ptr::read_volatile(0x500E as *const u8),
             }
         }
     }
@@ -559,6 +563,7 @@ impl DisplayInfo {
 }
 
 // ── Full hardware snapshot ────────────────────────────────────────────────────
+#[derive(Clone, Copy)]
 pub struct HardwareInfo {
     pub cpu:     CpuInfo,
     pub ram:     RamInfo,
@@ -566,13 +571,24 @@ pub struct HardwareInfo {
     pub display: DisplayInfo,
 }
 
+/// [b190] Instantánea del hardware tomada UNA vez en el arranque. `Disks::detect()` hace un
+/// soft reset (SRST) de cada canal IDE y deja seleccionado el último dispositivo sondeado
+/// (el esclavo, ausente) con las interrupciones del canal habilitadas; `test_ui` lo
+/// llamaba en cada ejecución MIENTRAS el ext2 raíz usaba ese mismo canal y, una de cada
+/// ~8 veces, la siguiente lectura del disco veía estado 0x00 durante 15 s (TIMEOUT) y
+/// caía al RAMFS. El hardware no cambia en caliente: se detecta una vez y se reutiliza.
+static HW_CACHE: crate::arch::Spinlock<Option<HardwareInfo>> = crate::arch::Spinlock::new(None);
+
 impl HardwareInfo {
     pub fn detect_all() -> Self {
-        HardwareInfo {
+        if let Some(hw) = *HW_CACHE.lock() { return hw; }
+        let hw = HardwareInfo {
             cpu:     CpuInfo::detect(),
             ram:     RamInfo::detect(),
             disks:   Disks::detect(),
             display: DisplayInfo::detect(),
-        }
+        };
+        *HW_CACHE.lock() = Some(hw);
+        hw
     }
 }

@@ -172,7 +172,16 @@ pub struct FirmwareTableEntry {
 }
 
 pub unsafe fn init(ptr: *const PortixBootInfo) {
-    BOOTINFO_PTR.store(ptr as usize, Ordering::Release);
+    // [Fase B.1] El cargador entrega la dirección FÍSICA en RDI (0xE00000 desde E3b; antes 0x600000). Se guarda
+    // su alias alto para que el núcleo nunca dependa de la identidad plana:
+    // todos los accesos (regiones, tablas de firmware, suma de control) son
+    // relativos a este puntero.
+    BOOTINFO_PTR.store(crate::mem::paging::phys_to_virt(ptr as usize), Ordering::Release);
+}
+
+/// Dirección física original de la estructura (para informes).
+pub fn direccion_fisica() -> usize {
+    crate::mem::paging::virt_to_phys(BOOTINFO_PTR.load(Ordering::Acquire))
 }
 
 pub fn get() -> Option<&'static PortixBootInfo> {
@@ -213,6 +222,12 @@ pub fn memory_regions(info: &PortixBootInfo) -> &'static [PortixMemoryRegion] {
     {
         return &[];
     }
+    let end_offset = (info.memory_map_offset as usize)
+        .checked_add(info.memory_map_count as usize * size_of::<PortixMemoryRegion>())
+        .unwrap_or(usize::MAX);
+    if end_offset > info.total_size as usize {
+        return &[];
+    }
     unsafe {
         core::slice::from_raw_parts(
             (info as *const _ as usize + info.memory_map_offset as usize)
@@ -226,6 +241,12 @@ pub fn firmware_tables(info: &PortixBootInfo) -> &'static [FirmwareTableEntry] {
     if info.firmware_tables_offset == 0
         || info.firmware_table_entry_size as usize != size_of::<FirmwareTableEntry>()
     {
+        return &[];
+    }
+    let end_offset = (info.firmware_tables_offset as usize)
+        .checked_add(info.firmware_tables_count as usize * size_of::<FirmwareTableEntry>())
+        .unwrap_or(usize::MAX);
+    if end_offset > info.total_size as usize {
         return &[];
     }
     unsafe {

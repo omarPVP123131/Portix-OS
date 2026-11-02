@@ -35,11 +35,12 @@ fn sync_disks() {
 pub fn poweroff() -> ! {
     sync_disks();
     unsafe {
-        outw(0x4004, 0x3400); // VirtualBox
+        // NOTA: QEMU-only fallback. En hardware real leer FADT para PM1a_CNT_BLK.
+        outw(0x4004, 0x3400); // VirtualBox (QEMU-only)
         for _ in 0..16 { io_wait(); }
-        outw(0x604,  0x2000); // QEMU ≥ 2.x  ACPI PM1a
+        outw(0x604,  0x2000); // QEMU ≥ 2.x  ACPI PM1a (QEMU-only)
         for _ in 0..16 { io_wait(); }
-        outw(0xB004, 0x2000); // Bochs / old QEMU
+        outw(0xB004, 0x2000); // Bochs / old QEMU (QEMU-only)
         for _ in 0..16 { io_wait(); }
         // Last resort: triple-fault via null IDT
         core::arch::asm!(
@@ -62,7 +63,7 @@ pub fn reboot() -> ! {
         core::arch::asm!("cli", options(nostack, nomem));
         // Drain the KBC input buffer
         let mut limit = 100_000u32;
-        while inb(0x64) & 0x02 != 0 && limit > 0 { limit -= 1; }
+        while inb(0x64) & 0x02 != 0 && limit > 0 { limit -= 1; io_wait(); }
         for _ in 0..16 { io_wait(); }
         outb(0x64, 0xFE); // Pulse CPU reset line
         for _ in 0..16 { io_wait(); }

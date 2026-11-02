@@ -1,0 +1,7 @@
+[package]
+name = "git"
+version = "2.44.0"
+edition = "2021"
+
+[dependencies]
+portix-rt = { path = "../../crates/portix-rt" }

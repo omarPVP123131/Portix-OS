@@ -1,5 +1,6 @@
 # Portix OS — Gestión de Memoria
 
+
 ## Regiones de memoria física
 
 Obtenidas de `PortixBootInfo.memory_map`. Cada entrada ocupa 48 bytes:

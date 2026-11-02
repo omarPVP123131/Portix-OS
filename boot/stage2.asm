@@ -64,6 +64,7 @@ ORG 0x8000
 ; ──────────────────────────────────────────────────────────────────────────────
 KERNEL_LOAD_SEG  equ 0x1000
 KERNEL_STAGING   equ 0x10000
+MAX_REAL_SECTORS equ 1152
 KERNEL_PHYS_ADDR equ 0x200000
 VESA_BUF         equ 0x6000
 BASE_LBA_ADDR    equ 0x7E00
@@ -91,7 +92,7 @@ BIT_BOOT_LBA  equ 0x7C0C   ; bi_file  (LBA del boot image en CD)
 BIT_IMAGE_LEN equ 0x7C10   ; bi_length
 BIT_CHECKSUM  equ 0x7C14   ; bi_csum
 
-BINFO_BASE    equ 0x9000
+BINFO_BASE    equ 0x5000
 BINFO_E820CNT equ BINFO_BASE + 0x00
 BINFO_FLAGS   equ BINFO_BASE + 0x02
 BINFO_LFB     equ BINFO_BASE + 0x04
@@ -99,9 +100,13 @@ BINFO_WIDTH   equ BINFO_BASE + 0x08
 BINFO_HEIGHT  equ BINFO_BASE + 0x0A
 BINFO_PITCH   equ BINFO_BASE + 0x0C
 BINFO_BPP     equ BINFO_BASE + 0x0E
-BINFO_E820    equ 0x9100
+BINFO_E820    equ 0x5100
 
-BOOTINFO_BASE            equ 0x600000
+; [T-025 E3b, Hallazgo 5] Antes 0x600000: el .bss del nucleo (cargado en
+; 0x200000) crecio hasta 0x61C000 y lo piso. Ahora en 0xE00000 (14 MiB), bajo
+; el monticulo del nucleo (0x1000000) y lejos de la imagen. El nucleo recibe la
+; direccion en RDI y no la supone.
+BOOTINFO_BASE            equ 0xE00000
 BOOTINFO_HDR_SIZE        equ 0xE0
 BOOTINFO_MEMMAP_OFFSET   equ 0x100
 BOOTINFO_MEMMAP_ENTRY_SIZE equ 48
@@ -154,7 +159,9 @@ PDPT_ADDR     equ 0x2000
 PD_IDENT_ADDR equ 0x3000
 PD_LFB_ADDR   equ 0x4000
 
-BOOT_STACK_TOP equ 0x508000
+; [T-025 E3b] Antes 0x508000: quedaba DENTRO de la imagen del nucleo (.data/.bss
+; en 0x4xxxxx-0x6xxxxx). Ahora 0xF08000, pegada al bootinfo y fuera de la imagen.
+BOOT_STACK_TOP equ 0xF08000
 
 section .text
 
@@ -211,8 +218,18 @@ start2:
     ; Debug: 'O' = E820 done
     mov  al, 'O'
     call print_char
-    ; Debug: 'P' = about to load kernel
+    ; Debug: 'P' = about to set up VESA
     mov  al, 'P'
+    call print_char
+    call setup_vesa
+    ; Debug: 'Q' = VESA done (may display 'D' if failed)
+    mov  al, 'Q'
+    call print_char
+
+    call pci_fallback_fb
+
+    ; Debug: 'R' = about to load kernel
+    mov  al, 'R'
     call print_char
     call load_kernel
     jnc  .kernel_loaded
@@ -237,12 +254,6 @@ start2:
     mov  si, msg_stack_smash
     call print
 .canary_ok:
-
-    call setup_vesa
-    ; Debug: 'Q' = VESA done (may display 'D' if failed)
-    mov  al, 'Q'
-    call print_char
-    call pci_fallback_fb
     call setup_paging
     mov  al, 'G'
     call print_char
@@ -697,30 +708,158 @@ remap_pic:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════════════
-; enter_long_mode
+; enter_long_mode — Salta a Modo Protegido 32-bit (pm32_entry) y luego a Long Mode
 ; ══════════════════════════════════════════════════════════════════════════════
 enter_long_mode:
     lgdt [gdt64_desc]
     lidt [idt_null_desc]
 
+    ; Activar modo protegido (PE = 1)
+    mov  eax, cr0
+    or   eax, 1
+    mov  cr0, eax
+
+    ; Salto directo a código de 32 bits (segmento 0x18)
+    jmp  dword 0x18:pm32_entry
+
+; ══════════════════════════════════════════════════════════════════════════════
+; PROTECTED MODE 32-BIT ENTRY
+; ══════════════════════════════════════════════════════════════════════════════
+BITS 32
+pm32_entry:
+    mov  ax, 0x10
+    mov  ds, ax
+    mov  es, ax
+    mov  ss, ax
+    mov  esp, 0x7C00
+
+    ; Si es CD-ROM, todo se cargó vía DAP en modo real
+    cmp  byte [is_cdrom], 1
+    je   .setup_lm
+
+    ; Si el kernel cupo en fase 1 (<= 1152 sectores), saltear ATA PIO
+    movzx eax, word [part1_sectors]
+    cmp   eax, KERNEL_SECTORS
+    jae   .setup_lm
+
+    ; Cargar parte 2 restante mediante ATA PIO directamente a KERNEL_PHYS_ADDR + part1_bytes
+    mov   ecx, KERNEL_SECTORS
+    sub   ecx, eax               ; ecx = sectores restantes
+    mov   edx, eax
+    shl   edx, 9                 ; edx = part1_sectors * 512
+    add   edx, KERNEL_PHYS_ADDR  ; edx = destino físico final de parte 2 (evita colisión en 0x100000)
+    add   eax, [base_lba]
+    add   eax, KERNEL_LBA        ; eax = LBA inicial de parte 2
+    call  ata_pio_read_32
+
+.setup_lm:
+    ; Configurar paginación y pasar a Long Mode (64 bits)
+    lidt [idt_null_desc]
+
     mov  eax, cr4
-    or   eax, (1 << 5)
+    or   eax, (1 << 5)          ; PAE
     mov  cr4, eax
 
     mov  eax, PML4_ADDR
     mov  cr3, eax
 
-    mov  ecx, 0xC0000080
+    mov  ecx, 0xC0000080        ; EFER MSR
     rdmsr
-    or   eax, (1 << 8)
+    or   eax, (1 << 8)          ; LME (Long Mode Enable)
     xor  edx, edx
     wrmsr
 
     mov  eax, cr0
-    or   eax, (1 << 31) | (1 << 0)
+    or   eax, (1 << 31)         ; PG (Paging Enable)
     mov  cr0, eax
 
-    o32 jmp far [far_jump_ptr]
+    ; Salto directo a 64-bit Long Mode (segmento 0x08)
+    jmp  0x08:long_mode_entry
+
+; ── ATA PIO 32-bit reader ───────────────────────────────────────────────────
+ata_pio_read_32:
+    pushad
+    mov  esi, eax                ; esi = LBA actual
+    mov  ebp, ecx                ; ebp = contador de sectores restantes
+    mov  edi, edx                ; edi = destino fisico (incrementado por rep insw)
+
+.sector_loop:
+    test ebp, ebp
+    jz   .done
+
+    ; Esperar que el controlador este listo (BSY=0, DRDY=1)
+    mov  dx, 0x1F7
+.wait_bsy:
+    in   al, dx
+    test al, 0x80
+    jnz  .wait_bsy
+.wait_drdy:
+    in   al, dx
+    test al, 0x40
+    jz   .wait_drdy
+
+    ; Seleccionar drive Master (0xE0) + bits 24-27 de LBA
+    mov  dx, 0x1F6
+    mov  eax, esi
+    shr  eax, 24
+    and  al, 0x0F
+    or   al, 0xE0
+    out  dx, al
+
+    ; Sector count = 1
+    mov  dx, 0x1F2
+    mov  al, 1
+    out  dx, al
+
+    ; LBA bits 0-7
+    mov  dx, 0x1F3
+    mov  eax, esi
+    out  dx, al
+
+    ; LBA bits 8-15
+    mov  dx, 0x1F4
+    shr  eax, 8
+    out  dx, al
+
+    ; LBA bits 16-23
+    mov  dx, 0x1F5
+    shr  eax, 8
+    out  dx, al
+
+    ; Comando 0x20: READ SECTORS
+    mov  dx, 0x1F7
+    mov  al, 0x20
+    out  dx, al
+
+    ; Esperar DRQ (Data Request)
+.wait_drq:
+    in   al, dx
+    test al, 0x80
+    jnz  .wait_drq
+    test al, 0x01
+    jnz  .err
+    test al, 0x08
+    jz   .wait_drq
+
+    ; Leer 256 words (512 bytes)
+    mov  dx, 0x1F0
+    mov  ecx, 256
+    rep  insw                    ; rep insw lee a [es:edi] e incrementa edi en 512
+
+    inc  esi                     ; LBA++
+    dec  ebp                     ; sectores restantes--
+    jmp  .sector_loop
+
+.done:
+    popad
+    ret
+
+.err:
+    cli
+    hlt
+    jmp  .err
+
+BITS 16
 
 ; ══════════════════════════════════════════════════════════════════════════════
 ; try_lba_on_drive
@@ -1113,7 +1252,14 @@ do_lba_load:
     mov  dword [dap_lba_hi], 0
     mov  word [dap_segment], KERNEL_LOAD_SEG
     mov  word [dap_offset],  0
-    mov  word [lba_remain],  KERNEL_SECTORS
+
+    mov  ax, KERNEL_SECTORS
+    cmp  ax, MAX_REAL_SECTORS
+    jbe  .set_sectors
+    mov  ax, MAX_REAL_SECTORS
+.set_sectors:
+    mov  [part1_sectors], ax
+    mov  word [lba_remain], ax
 
 .block:
     mov  ax, [lba_remain]
@@ -1366,6 +1512,7 @@ is_cdrom        db 0
 bit_valid       db 0
 base_lba        dd 0
 lba_remain      dw 0
+part1_sectors   dw KERNEL_SECTORS
 cd_remain       dw 0
 chs_cur_lba     dw 0
 chs_dest_seg    dw KERNEL_LOAD_SEG
@@ -1400,9 +1547,10 @@ drive_params_buf: times 66 db 0
 
 align 8
 gdt64:
-    dq 0x0000000000000000
-    dq 0x00AF9A000000FFFF
-    dq 0x00CF92000000FFFF
+    dq 0x0000000000000000       ; 0x00 null
+    dq 0x00AF9A000000FFFF       ; 0x08 64-bit code
+    dq 0x00CF92000000FFFF       ; 0x10 32/64-bit data
+    dq 0x00CF9A000000FFFF       ; 0x18 32-bit code
 gdt64_end:
 
 gdt64_desc:
@@ -1436,11 +1584,19 @@ long_mode_entry:
     mov  rsp, BOOT_STACK_TOP
     xor  rbp, rbp
 
+    ; Copiar parte 1 desde KERNEL_STAGING (0x10000) a KERNEL_PHYS_ADDR (0x200000)
     mov  rsi, KERNEL_STAGING
     mov  rdi, KERNEL_PHYS_ADDR
-    mov  rcx, (KERNEL_SECTORS * 512) / 8
+    movzx rax, word [part1_sectors]
+    imul rax, 512
+    mov  rcx, rax
+    shr  rcx, 3
     rep  movsq
 
+    ; Nota: La parte 2 (si existe) ya fue leída directamente por ata_pio_read_32
+    ; a KERNEL_PHYS_ADDR + (part1_sectors * 512) en modo 32-bit sin usar staging.
+
+.copy_done:
     call build_bootinfo
 
     ; Red pixel on LFB to confirm kernel entry

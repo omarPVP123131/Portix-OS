@@ -11,6 +11,7 @@
 use alloc::vec;
 use alloc::boxed::Box;
 use crate::drivers::storage::ata::AtaError;
+use crate::drivers::storage::gpt;
 use crate::drivers::storage::traits::BlockDevice;
 
 // ── Errores ───────────────────────────────────────────────────────────────────
@@ -160,13 +161,14 @@ pub struct Fat32Volume<'a> {
     root_clus:     u32,
     data_start:    u64,
     clus_count:    u32,
+    next_free_clus: u32,
 }
 
 impl<'a> Fat32Volume<'a> {
     pub fn mount(drive: &'a mut dyn BlockDevice) -> FatResult<Self> {
         let mut mbr = [0u8; 512];
         drive.read_sectors(0, 1, &mut mbr).map_err(FatError::Ata)?;
-        let part_lba = Self::find_fat32_partition(&mbr)?;
+        let part_lba = Self::find_fat32_partition(&mbr, drive)?;
 
         let mut vbr = [0u8; 512];
         drive.read_sectors(part_lba, 1, &mut vbr).map_err(FatError::Ata)?;
@@ -174,6 +176,7 @@ impl<'a> Fat32Volume<'a> {
         if vbr[510] != 0x55 || vbr[511] != 0xAA { return Err(FatError::NotFat32); }
 
         let bytes_per_sec = u16::from_le_bytes([vbr[11], vbr[12]]);
+        if bytes_per_sec != 512 { return Err(FatError::NotFat32); }
         let sec_per_clus  = vbr[13] as u32;
         let reserved_secs = u16::from_le_bytes([vbr[14], vbr[15]]) as u32;
         let num_fats      = vbr[16] as u32;
@@ -196,10 +199,19 @@ impl<'a> Fat32Volume<'a> {
             drive, part_lba, bytes_per_sec, sec_per_clus,
             reserved_secs, num_fats, fat_size, root_clus,
             data_start, clus_count,
+            next_free_clus: 2,
         })
     }
 
-    fn find_fat32_partition(mbr: &[u8; 512]) -> FatResult<u64> {
+    fn find_fat32_partition(mbr: &[u8; 512], drive: &mut dyn BlockDevice) -> FatResult<u64> {
+        if gpt::is_gpt_disk(mbr) {
+            crate::drivers::serial::log("FS", "GPT detectado — buscando particion FAT32 en tabla GPT");
+            if let Some(lba) = gpt::find_fat32_partition_gpt(drive) {
+                crate::drivers::serial::log("FS", "Particion FAT32 encontrada via GPT");
+                return Ok(lba);
+            }
+            crate::drivers::serial::log("FS", "GPT sin particion FAT32 — intentando MBR legacy");
+        }
         for i in 0..4usize {
             let off   = 0x1BE + i * 16;
             let ptype = mbr[off + 4];
@@ -252,10 +264,37 @@ impl<'a> Fat32Volume<'a> {
     }
 
     fn alloc_cluster(&mut self) -> FatResult<u32> {
-        for c in 2..self.clus_count + 2 {
-            if self.read_fat(c)? == FAT_FREE {
-                self.write_fat(c, 0x0FFF_FFFF)?;
-                return Ok(c);
+        let max = self.clus_count.saturating_add(2);
+        let start = if self.next_free_clus >= 2 && self.next_free_clus < max { self.next_free_clus } else { 2 };
+        let start_sec = start / 128;
+        let num_fat_secs = (max + 127) / 128;
+        let mut sec = [0u8; 512];
+
+        for pass in 0..2 {
+            let (begin_s, end_s) = if pass == 0 { (start_sec, num_fat_secs) } else { (0, start_sec) };
+            for s in begin_s..end_s {
+                let lba = self.part_lba + self.reserved_secs as u64 + s as u64;
+                if self.drive.read_sectors(lba, 1, &mut sec).is_err() { continue; }
+                let base_clus = s * 128;
+                for i in 0..128 {
+                    let clus = base_clus + i;
+                    if clus < 2 || clus >= max { continue; }
+                    if pass == 0 && clus < start { continue; }
+                    let off = (i as usize) * 4;
+                    let val = u32::from_le_bytes([sec[off], sec[off+1], sec[off+2], sec[off+3]]) & 0x0FFF_FFFF;
+                    if val == FAT_FREE {
+                        let old_val = u32::from_le_bytes([sec[off], sec[off+1], sec[off+2], sec[off+3]]);
+                        let new_val = (old_val & 0xF000_0000) | 0x0FFF_FFFF;
+                        sec[off..off+4].copy_from_slice(&new_val.to_le_bytes());
+                        self.drive.write_sectors(lba, 1, &sec)?;
+                        for f in 1..self.num_fats {
+                            let lba2 = lba + f as u64 * self.fat_size as u64;
+                            self.drive.write_sectors(lba2, 1, &sec)?;
+                        }
+                        self.next_free_clus = clus + 1;
+                        return Ok(clus);
+                    }
+                }
             }
         }
         Err(FatError::NoSpace)
@@ -263,10 +302,13 @@ impl<'a> Fat32Volume<'a> {
 
     fn free_chain(&mut self, start: u32) -> FatResult<()> {
         let mut cur = start;
+        let mut iter = 0u32;
         while !self.is_eoc(cur) && cur >= 2 {
+            if iter >= self.clus_count + 2 { return Err(FatError::Corrupt); }
             let next = self.read_fat(cur)?;
             self.write_fat(cur, FAT_FREE)?;
             cur = next;
+            iter += 1;
         }
         Ok(())
     }
@@ -327,9 +369,30 @@ impl<'a> Fat32Volume<'a> {
 
     pub fn find_entry(&mut self, dir_cluster: u32, name: &str) -> FatResult<DirEntryInfo> {
         let mut found: Option<DirEntryInfo> = None;
+        let (n8, e3) = make_83(name);
+        let mut short_buf = [0u8; 13];
+        let mut slen = 0;
+        for &b in n8.iter() {
+            if b == b' ' { break; }
+            short_buf[slen] = b;
+            slen += 1;
+        }
+        if e3[0] != b' ' {
+            short_buf[slen] = b'.';
+            slen += 1;
+            for &b in e3.iter() {
+                if b == b' ' { break; }
+                short_buf[slen] = b;
+                slen += 1;
+            }
+        }
+        let short_name = core::str::from_utf8(&short_buf[..slen]).unwrap_or("");
+
         self.list_dir(dir_cluster, |e| {
-            if found.is_none() && names_eq(e.name_str(), name) {
-                found = Some(e.clone());
+            if found.is_none() {
+                if names_eq(e.name_str(), name) || (!short_name.is_empty() && names_eq(e.name_str(), short_name)) {
+                    found = Some(e.clone());
+                }
             }
         })?;
         found.ok_or(FatError::NotFound)
@@ -352,11 +415,39 @@ impl<'a> Fat32Volume<'a> {
         Ok(done)
     }
 
+    pub fn read_file_at(&mut self, entry: &DirEntryInfo, offset: usize, buf: &mut [u8]) -> FatResult<usize> {
+        if entry.is_dir { return Err(FatError::IsDir); }
+        if offset >= entry.size as usize { return Ok(0); }
+        let to_read = buf.len().min((entry.size as usize).saturating_sub(offset));
+        if to_read == 0 { return Ok(0); }
+        let bpc = self.bpc();
+        let mut clus = entry.cluster;
+        let mut pos = 0usize;
+        while pos + bpc <= offset && !self.is_eoc(clus) && clus >= 2 {
+            pos += bpc;
+            clus = self.read_fat(clus)?;
+        }
+        let mut done = 0usize;
+        while done < to_read && !self.is_eoc(clus) && clus >= 2 {
+            let mut cb = ClusterBuf::new(bpc);
+            self.read_cluster(clus, &mut cb)?;
+            let skip_in_cluster = offset.saturating_sub(pos);
+            let avail = bpc - skip_in_cluster;
+            let chunk = (to_read - done).min(avail);
+            buf[done..done + chunk].copy_from_slice(&cb.data[skip_in_cluster..skip_in_cluster + chunk]);
+            done += chunk;
+            pos += bpc;
+            clus = self.read_fat(clus)?;
+        }
+        Ok(done)
+    }
+
     pub fn write_file(&mut self, entry: &mut DirEntryInfo, data: &[u8]) -> FatResult<()> {
         if entry.is_dir { return Err(FatError::IsDir); }
         let bpc = self.bpc();
-        if entry.cluster != 0 { self.free_chain(entry.cluster)?; }
+        let old_chain = if entry.cluster != 0 { Some(entry.cluster) } else { None };
         let first = self.alloc_cluster()?;
+        if let Some(old) = old_chain { self.free_chain(old)?; }
         entry.cluster = first;
         self.update_cluster_field(entry, first)?;
 
@@ -421,10 +512,24 @@ impl<'a> Fat32Volume<'a> {
         Ok(())
     }
 
+    pub fn rename_entry(&mut self, entry: &DirEntryInfo, new_name: &str) -> FatResult<()> {
+        let (name8, ext3) = make_83(new_name);
+        let mut sec = [0u8; 512];
+        self.drive.read_sectors(entry.dir_sector, 1, &mut sec)?;
+        let off = entry.dir_offset;
+        sec[off..off + 8].copy_from_slice(&name8);
+        sec[off + 8..off + 11].copy_from_slice(&ext3);
+        self.drive.write_sectors(entry.dir_sector, 1, &sec)?;
+        Ok(())
+    }
+
     fn write_dir_entry(&mut self, dir_cluster: u32, entry: &DirEntry83) -> FatResult<(u64, usize)> {
         let bpc = self.bpc();
         let mut clus = dir_cluster;
+        let mut iter = 0u32;
         while !self.is_eoc(clus) && clus >= 2 {
+            if iter >= self.clus_count + 2 { return Err(FatError::Corrupt); }
+            iter += 1;
             let mut buf = ClusterBuf::new(bpc);
             self.read_cluster(clus, &mut buf)?;
             for i in 0..bpc / DIR_ENTRY_SIZE {
@@ -517,10 +622,11 @@ fn accumulate_lfn(lfn: &LfnEntry, buf: &mut [u16; 256], len: &mut usize) {
         if pos < 256 { buf[pos] = w; pos += 1; }
     }
 
-    if pos > *len { *len = pos; }
+    if pos > *len { *len = pos.min(256); }
 }
 
 fn build_entry(raw: &DirEntry83, lfn: &[u16; 256], lfn_len: usize, dir_sector: u64, dir_offset: usize) -> DirEntryInfo {
+    let lfn_len = lfn_len.min(256);
     let mut name = [0u8; 256];
     let name_len;
     if lfn_len > 0 {
@@ -580,5 +686,40 @@ impl ClusterBuf {
             data: vec![0u8; actual].into_boxed_slice(),
             len: actual,
         }
+    }
+}
+/// [T-001] Resolución de ruta FAT (antes en `elf.rs`): sólo la usa el adaptador
+/// de solo lectura de /boot.
+pub fn resolve_path<'p>(
+    vol: &mut Fat32Volume,
+    root_cluster: u32,
+    path: &'p str,
+) -> Result<(u32, &'p str), &'static str> {
+    let path = path.trim_start_matches('/');
+    if !path.contains('/') {
+        return Ok((root_cluster, path));
+    }
+
+    let mut cluster = root_cluster;
+    let mut remaining = path;
+
+    loop {
+        let slash = match remaining.find('/') {
+            Some(i) => i,
+            None => return Ok((cluster, remaining)),
+        };
+
+        let component = &remaining[..slash];
+        if component.is_empty() || component == "." {
+            remaining = &remaining[slash + 1..];
+            continue;
+        }
+
+        let entry = vol.find_entry(cluster, component).map_err(|_| "path component not found")?;
+        if !entry.is_dir {
+            return Err("not a directory");
+        }
+        cluster = entry.cluster;
+        remaining = &remaining[slash + 1..];
     }
 }

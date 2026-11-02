@@ -3,7 +3,7 @@
 build_ring3.py — Build C programs for PORTIX ring-3 and inject into disk image.
 
 Usage:
-    python scripts/build_ring3.py              # uses build/portix.img
+    python scripts/build_ring3.py              # uses build/dist/portix.img
     python scripts/build_ring3.py --img=<path>
 """
 
@@ -14,6 +14,11 @@ import struct
 import shutil
 import tempfile
 
+if __package__:
+    from .rutas_imagenes import RUN, dentro_de_dist
+else:
+    from rutas_imagenes import RUN, dentro_de_dist
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 LIB = os.path.join(ROOT, "lib")
@@ -22,7 +27,7 @@ CC = os.path.join(TOOLCHAIN, "x86_64-elf-gcc.exe")
 AS = os.path.join(TOOLCHAIN, "x86_64-elf-as.exe")
 AR = os.path.join(TOOLCHAIN, "x86_64-elf-ar.exe")
 LD = os.path.join(TOOLCHAIN, "x86_64-elf-ld.exe")
-IMG = os.path.join(BUILD, "portix.img")
+IMG = os.path.join(BUILD, "dist", "portix.img")
 
 def log(*args):
     print("[R3]", *args)
@@ -87,7 +92,8 @@ def compile_c(source, output, lib_build):
 def inject_into_fat32(img_path, files):
     """files: list of (local_path, fat32_path)"""
     from pyfatfs.PyFatFS import PyFatFS
-    import tempfile
+    if not dentro_de_dist(img_path):
+        raise ValueError("La imagen debe estar dentro de build/dist/")
 
     with open(img_path, "rb") as f:
         mbr = f.read(512)
@@ -96,7 +102,8 @@ def inject_into_fat32(img_path, files):
         pt2_size_sectors = struct.unpack_from('<I', mbr, 0x1CE+12)[0]
         pt2_size = pt2_size_sectors * 512
 
-    tmp = tempfile.NamedTemporaryFile(delete=False)
+    RUN.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(dir=RUN, suffix=".img", delete=False)
     tmp.close()
     with open(img_path, "rb") as src:
         src.seek(pt2_offset)
@@ -119,6 +126,13 @@ def inject_into_fat32(img_path, files):
     os.unlink(tmp.name)
 
 def main():
+    # T-029: se conserva el código histórico, pero no se generan ni inyectan
+    # utilidades propias en C. Salir con error evita presentar una omisión como éxito.
+    log("Desactivado: el userland propio de Portix se construye en Rust (T-029)")
+    return 1
+
+
+def main_historico_no_invocado():
     img = IMG
     if "--img=" in " ".join(sys.argv[1:]):
         for a in sys.argv[1:]:

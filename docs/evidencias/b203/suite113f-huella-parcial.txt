@@ -1,0 +1,6 @@
+Huella parcial durante la suite 6; NO es hash de la imagen completa.
+Fecha UTC: 2026-10-31 04:52:43
+Imagen base: build/dist/portix.img | dispositivo=65024 inode=1136518 tamano=2186280960 mtime=2026-10-31 04:38:23.806268395 +0000
+c20779e692ba33d109d277a25b161bc98d9bedd87eb86f1c108ba3f18d7a8e22  build/kernel.bin
+fe02313a7a2a571071290e7d6df4a62380f520fc0c8430c743299890c0e745e4  kernel/target/x86_64-portix/release/kernel
+d795a82fb206e53dc59b9e7fc76a6a49d80a8d78f751437fec960c1a1daf5890  scripts/headless_runner.py

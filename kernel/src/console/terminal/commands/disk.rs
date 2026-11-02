@@ -65,6 +65,7 @@
 
 use crate::console::terminal::{Terminal, LineColor, TERM_COLS};
 use crate::console::terminal::fmt::*;
+use alloc::boxed::Box;
 use crate::console::terminal::editor::EditorState;
 use crate::drivers::storage::ata::{
     AtaBus, AtaError, DriveId, DriveType,
@@ -73,15 +74,16 @@ use crate::drivers::storage::fat32::{Fat32Volume, FatError};
 use crate::drivers::storage::mkfs;
 use crate::drivers::storage::registry;
 use crate::drivers::storage::traits::BlockDevice;
+use crate::arch::Spinlock;
 use crate::drivers::storage::vfs::{VfsMount, path_split, path_join, basename, parent_copy};
 
 // ── Caché global del volumen FAT32 ────────────────────────────────────────────
 // mount_vol() monta una sola vez y cachea; comandos posteriores reutilizan.
 
-static mut VOL_CACHE: Option<(Fat32Volume<'static>, VfsMount)> = None;
+static VOL_CACHE: Spinlock<Option<(Fat32Volume<'static>, VfsMount)>> = Spinlock::new(None);
 
 pub fn invalidate_vol_cache() {
-    unsafe { VOL_CACHE = None; }
+    *VOL_CACHE.lock() = None;
 }
 
 // ── Helpers privados ──────────────────────────────────────────────────────────
@@ -134,9 +136,12 @@ fn fat_err_msg(e: FatError) -> &'static [u8] {
 }
 
 fn mount_vol(t: &mut Terminal) -> Option<(&'static mut Fat32Volume<'static>, &'static mut VfsMount)> {
-    unsafe {
-        if let Some(ref mut pair) = VOL_CACHE {
-            return Some((&mut pair.0, &mut pair.1));
+    // Fast path: check cache with brief lock
+    if let Some(mut cache) = VOL_CACHE.try_lock() {
+        if let Some((vol_ref, mnt_ref)) = cache.as_mut() {
+            let vol = vol_ref as *mut _;
+            let mnt = mnt_ref as *mut _;
+            return Some((unsafe { &mut *vol }, unsafe { &mut *mnt }));
         }
     }
 
@@ -150,20 +155,20 @@ fn mount_vol(t: &mut Terminal) -> Option<(&'static mut Fat32Volume<'static>, &'s
     }
 
     for i in 0..count {
-        let drive = match registry::get_device(i) {
-            Some(d) => d,
-            None => continue,
-        };
-
-        if let Ok(mut vol) = Fat32Volume::mount(drive) {
-            let mut mnt = VfsMount::new();
-            let root = vol.root_cluster();
-            mnt.register("/", root);
-            let _ = resolve_and_register(&mut vol, root, &mut mnt);
-            unsafe {
-                VOL_CACHE = Some((vol, mnt));
-                let pair = VOL_CACHE.as_mut().unwrap();
-                return Some((&mut pair.0, &mut pair.1));
+        if let Some(drive) = registry::get_static_device(i) {
+            if let Ok(mut vol) = Fat32Volume::mount(drive) {
+                let mut mnt = VfsMount::new();
+                let root = vol.root_cluster();
+                mnt.register("/", root);
+                let _ = resolve_and_register(&mut vol, root, &mut mnt);
+                let mut cache = VOL_CACHE.lock();
+                *cache = Some((vol, mnt));
+                if let Some((vol_ref, mnt_ref)) = cache.as_mut() {
+                    let vol = vol_ref as *mut _;
+                    let mnt = mnt_ref as *mut _;
+                    return Some((unsafe { &mut *vol }, unsafe { &mut *mnt }));
+                }
+                return None;
             }
         }
     }
@@ -223,7 +228,7 @@ fn resolve_path(
             core::str::from_utf8(&cwd[..cwd_len]).unwrap_or("/"),
             core::str::from_utf8(path).unwrap_or(""),
             &mut abs,
-        );
+        ).unwrap_or(0);
     }
 
     if let Some(c) = mnt.resolve(core::str::from_utf8(&abs[..abs_len]).unwrap_or("")) {
@@ -278,7 +283,7 @@ fn make_abs_path(cwd: &[u8], cwd_len: usize, input: &[u8], out: &mut [u8]) -> us
         core::str::from_utf8(&cwd[..cwd_len]).unwrap_or("/"),
         core::str::from_utf8(input).unwrap_or(""),
         out,
-    )
+    ).unwrap_or(0)
 }
 
 fn fmt_size(buf: &mut [u8], pos: &mut usize, bytes: u32) {
@@ -295,10 +300,90 @@ fn fmt_size(buf: &mut [u8], pos: &mut usize, bytes: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// COMANDOS DE NAVEGACIÓN — idénticos a v0.7.5 excepto que usan nuevo mount_vol
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMANDOS DE NAVEGACIÓN — soporta VFS híbrido (FAT32 + RamFS)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub fn cmd_ls(t: &mut Terminal, args: &[u8]) {
+    let mut abs = [0u8; 256];
+    let abs_len = if trim(args).is_empty() {
+        let l = t.cwd_len.min(256);
+        abs[..l].copy_from_slice(&t.cwd[..l]);
+        l
+    } else {
+        make_abs_path(&t.cwd, t.cwd_len, trim(args), &mut abs)
+    };
+    let abs_str = core::str::from_utf8(&abs[..abs_len]).unwrap_or("/");
+
+    if crate::drivers::storage::vfs::es_ruta_fs(abs_str) {
+        {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  Directorio: ");
+            let l = abs_len.min(TERM_COLS - pos);
+            buf[pos..pos + l].copy_from_slice(&abs[..l]); pos += l;
+            t.write_bytes(&buf[..pos], LineColor::Info);
+        }
+        t.write_line("  Tipo  Tamaño      Nombre", LineColor::Header);
+        t.write_line("  ----  ----------  ------", LineColor::Normal);
+
+        let mut count_files = 0u32;
+        let mut count_dirs  = 0u32;
+        let mut total_bytes = 0u64;
+
+        // [CICLO 51] por el contrato SistemaDeFicheros (ramfs o ext2 raiz)
+        let result = crate::drivers::storage::vfs::listar_fs_tam(abs_str).map(|lista| {
+            for (name, is_dir, size) in lista.iter() {
+                let (name, is_dir, size) = (name.as_str(), *is_dir, *size);
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  ");
+
+                if is_dir {
+                    append_str(&mut buf, &mut pos, b"[DIR]  ");
+                    append_str(&mut buf, &mut pos, b"           ");
+                    count_dirs += 1;
+                } else {
+                    append_str(&mut buf, &mut pos, b"[ARC]  ");
+                    fmt_size(&mut buf, &mut pos, size as u32);
+                    while pos < 20 { buf[pos] = b' '; pos += 1; }
+                    count_files += 1;
+                    total_bytes += size as u64;
+                }
+
+                let nb = name.as_bytes();
+                let nl = nb.len().min(TERM_COLS - pos);
+                buf[pos..pos + nl].copy_from_slice(&nb[..nl]); pos += nl;
+
+                let color = if is_dir { LineColor::Info } else { LineColor::Normal };
+                t.write_bytes(&buf[..pos], color);
+            }
+        });
+
+        if result.is_err() {
+            t.write_line("  ls: error al listar el directorio", LineColor::Error);
+            return;
+        }
+
+        t.write_line("  ----  ----------  ------", LineColor::Normal);
+        {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  ");
+            append_u32(&mut buf, &mut pos, count_dirs);
+            append_str(&mut buf, &mut pos, b" directorio(s)   ");
+            append_u32(&mut buf, &mut pos, count_files);
+            append_str(&mut buf, &mut pos, b" archivo(s)   total: ");
+            if total_bytes >= 1024 {
+                append_u32(&mut buf, &mut pos, (total_bytes / 1024) as u32);
+                append_str(&mut buf, &mut pos, b" KiB");
+            } else {
+                append_u32(&mut buf, &mut pos, total_bytes as u32);
+                append_str(&mut buf, &mut pos, b" bytes");
+            }
+            t.write_bytes(&buf[..pos], LineColor::Success);
+        }
+        t.write_empty();
+        return;
+    }
+
     let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cwd     = t.cwd;
     let cwd_len = t.cwd_len;
@@ -414,9 +499,26 @@ pub fn cmd_cd(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
+    let mut new_path = [0u8; 256];
+    let new_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut new_path);
+    let new_str = core::str::from_utf8(&new_path[..new_len]).unwrap_or("/");
+
+    if crate::drivers::storage::vfs::is_ramfs_path(new_str) {
+        let is_dir = crate::drivers::storage::vfs::with_ramfs(|ram| ram.is_dir(new_str));
+        if is_dir || new_str == "/tmp" {
+            let l = new_len.min(255);
+            t.cwd[..l].copy_from_slice(&new_path[..l]);
+            t.cwd_len = l;
+            return;
+        } else {
+            t.write_line("  cd: no es un directorio", LineColor::Error);
+            return;
+        }
+    }
+
     let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
-    let cluster = match resolve_path(vol, mnt, &t.cwd, t.cwd_len, args) {
+    let _cluster = match resolve_path(vol, mnt, &t.cwd, t.cwd_len, args) {
         Ok(c) => c,
         Err(e) => {
             let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -427,10 +529,6 @@ pub fn cmd_cd(t: &mut Terminal, args: &[u8]) {
             return;
         }
     };
-
-    let mut new_path = [0u8; 256];
-    let new_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut new_path);
-    let _ = cluster;
 
     let l = new_len.min(255);
     t.cwd[..l].copy_from_slice(&new_path[..l]);
@@ -503,12 +601,98 @@ pub fn cmd_cat(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
+    let mut abs = [0u8; 256];
+    let abs_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut abs);
+    let abs_str = core::str::from_utf8(&abs[..abs_len]).unwrap_or("");
+
+    if crate::drivers::storage::procfs::is_procfs_path(abs_str) {
+        if let Some((ft, is_dir)) = crate::drivers::storage::procfs::resolve_proc_path(abs_str) {
+            if is_dir {
+                t.write_line("  cat: es un directorio", LineColor::Warning);
+                return;
+            }
+            let content = crate::drivers::storage::procfs::generate_content(ft);
+            if let Ok(s) = core::str::from_utf8(&content) {
+                for line in s.lines() {
+                    t.write_line(line, LineColor::Normal);
+                }
+            }
+            return;
+        } else {
+            t.write_line("  cat: entrada no encontrada en /proc", LineColor::Error);
+            return;
+        }
+    }
+
+    if crate::drivers::storage::vfs::es_ruta_fs(abs_str) {
+        let mut content = [0u8; 8192];
+        // [CICLO 51] por el contrato SistemaDeFicheros (ramfs o ext2 raiz)
+        let read_res = if crate::drivers::storage::vfs::es_dir_fs(abs_str) {
+            Err("es un directorio. Usa 'ls' para listar su contenido.")
+        } else {
+            match crate::drivers::storage::vfs::leer_fs(abs_str, 0, &mut content) {
+                Ok(n) => Ok(n),
+                Err(_) => Err("Entrada no encontrada"),
+            }
+        };
+
+        match read_res {
+            Ok(bytes) => {
+                let mut hdr = [0u8; TERM_COLS]; let mut hp = 0;
+                append_str(&mut hdr, &mut hp, b"  --- ");
+                let nb = args.len().min(50);
+                hdr[hp..hp + nb].copy_from_slice(&args[..nb]); hp += nb;
+                append_str(&mut hdr, &mut hp, b" (");
+                append_u32(&mut hdr, &mut hp, bytes as u32);
+                append_str(&mut hdr, &mut hp, b" bytes) ---");
+                t.write_bytes(&hdr[..hp], LineColor::Header);
+
+                let mut start = 0usize;
+                let mut line_n = 1u32;
+                for i in 0..bytes {
+                    let is_nl = content[i] == b'\n' || content[i] == b'\r';
+                    let is_end = i + 1 == bytes;
+                    if is_nl || is_end {
+                        let end = if is_end && !is_nl { i + 1 } else { i };
+                        if end > start {
+                            let chunk = &content[start..end];
+                            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                            append_str(&mut buf, &mut pos, b"  ");
+                            append_u32(&mut buf, &mut pos, line_n);
+                            append_str(&mut buf, &mut pos, b"  ");
+                            if pos < 6 { buf[pos] = b' '; pos += 1; }
+                            for &b in chunk {
+                                if pos >= TERM_COLS - 1 { break; }
+                                buf[pos] = if b >= 0x20 && b < 0x7F { b } else if b == b'\t' { b' ' } else { b'.' };
+                                pos += 1;
+                            }
+                            t.write_bytes(&buf[..pos], LineColor::Normal);
+                            line_n += 1;
+                        }
+                        if content[i] == b'\r' && i + 1 < bytes && content[i + 1] == b'\n' {
+                            start = i + 2;
+                        } else {
+                            start = i + 1;
+                        }
+                    }
+                }
+                t.write_empty();
+                return;
+            }
+            Err(e) => {
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  cat: ");
+                append_str(&mut buf, &mut pos, e.as_bytes());
+                t.write_bytes(&buf[..pos], LineColor::Error);
+                return;
+            }
+        }
+    }
+
     let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
     let name = basename(core::str::from_utf8(args).unwrap_or(""));
     let mut par = [0u8; 256]; let par_len;
-    let mut abs = [0u8; 256];
-    let abs_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut abs);
     {
         par_len = parent_copy(core::str::from_utf8(&abs[..abs_len]).unwrap_or("/"), &mut par);
     }
@@ -601,6 +785,31 @@ pub fn cmd_touch(t: &mut Terminal, args: &[u8]) {
         t.write_line("  Uso: touch <nombre_archivo>", LineColor::Warning);
         return;
     }
+
+    let mut abs = [0u8; 256];
+    let abs_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut abs);
+    let abs_str = core::str::from_utf8(&abs[..abs_len]).unwrap_or("");
+
+    if crate::drivers::storage::vfs::is_ramfs_path(abs_str) {
+        let ok = crate::drivers::storage::vfs::with_ramfs(|ram| {
+            if ram.find(abs_str).is_some() {
+                true
+            } else {
+                ram.create(abs_str)
+            }
+        });
+        if ok {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  [OK] Archivo creado: ");
+            let nl = args.len().min(TERM_COLS - pos);
+            buf[pos..pos + nl].copy_from_slice(&args[..nl]); pos += nl;
+            t.write_bytes(&buf[..pos], LineColor::Success);
+        } else {
+            t.write_line("  touch: no se pudo crear archivo en RamFS", LineColor::Error);
+        }
+        return;
+    }
+
     let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
 
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
@@ -643,6 +852,32 @@ pub fn cmd_write(t: &mut Terminal, args: &[u8]) {
 
     let name_bytes = trim(&args[..sp]);
     let content    = trim(&args[sp + 1..]);
+
+    let mut abs = [0u8; 256];
+    let abs_len = make_abs_path(&t.cwd, t.cwd_len, name_bytes, &mut abs);
+    let abs_str = core::str::from_utf8(&abs[..abs_len]).unwrap_or("");
+
+    // [CICLO 51 / L3] ramfs o raiz ext2: por el contrato SistemaDeFicheros
+    if crate::drivers::storage::vfs::es_ruta_fs(abs_str) {
+        let res = if crate::drivers::storage::vfs::escribir_fichero_fs(abs_str, content) { Ok(content.len()) } else { Err(()) };
+        match res {
+            Ok(bytes) => {
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  [OK] Escrito: ");
+                let nl = name_bytes.len().min(40);
+                buf[pos..pos + nl].copy_from_slice(&name_bytes[..nl]); pos += nl;
+                append_str(&mut buf, &mut pos, b" (");
+                append_u32(&mut buf, &mut pos, bytes as u32);
+                append_str(&mut buf, &mut pos, b" bytes)");
+                t.write_bytes(&buf[..pos], LineColor::Success);
+            }
+            Err(_) => {
+                t.write_line("  write: error al escribir el fichero", LineColor::Error);
+            }
+        }
+        return;
+    }
+
     let name = core::str::from_utf8(name_bytes).unwrap_or("archivo");
 
     let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
@@ -702,6 +937,24 @@ pub fn cmd_mkdir(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
+    let mut abs = [0u8; 256];
+    let abs_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut abs);
+    let abs_str = core::str::from_utf8(&abs[..abs_len]).unwrap_or("");
+
+    if crate::drivers::storage::vfs::is_ramfs_path(abs_str) {
+        let ok = crate::drivers::storage::vfs::with_ramfs(|ram| ram.mkdir(abs_str));
+        if ok {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  [OK] Directorio creado: ");
+            let nl = args.len().min(TERM_COLS - pos);
+            buf[pos..pos + nl].copy_from_slice(&args[..nl]); pos += nl;
+            t.write_bytes(&buf[..pos], LineColor::Success);
+        } else {
+            t.write_line("  mkdir: error al crear directorio en RamFS", LineColor::Error);
+        }
+        return;
+    }
+
     let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
                      .unwrap_or(mnt.root_cluster());
@@ -729,6 +982,42 @@ pub fn cmd_rm(t: &mut Terminal, args: &[u8]) {
     let args = trim(args);
     if args.is_empty() {
         t.write_line("  Uso: rm <archivo_o_directorio>", LineColor::Warning);
+        return;
+    }
+
+    let mut abs = [0u8; 256];
+    let abs_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut abs);
+    let abs_str = core::str::from_utf8(&abs[..abs_len]).unwrap_or("");
+
+    // [b188] Raiz ext2 (o cualquier volumen del contrato SistemaDeFicheros): `rm` del
+    // shell del nucleo solo sabia de RamFS y FAT; sobre / decia "no encontrado".
+    if crate::drivers::storage::vfs::es_ruta_fs(abs_str) && !crate::drivers::storage::vfs::is_ramfs_path(abs_str) {
+        let es_dir = crate::drivers::storage::vfs::es_dir_fs(abs_str);
+        let r = crate::drivers::storage::vfs::con_fs(abs_str, |fs| if es_dir { fs.eliminar_directorio(abs_str) } else { fs.eliminar(abs_str) });
+        match r {
+            Some(Ok(())) => {
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  [OK] Eliminado: ");
+                let nl = args.len().min(TERM_COLS - pos);
+                buf[pos..pos + nl].copy_from_slice(&args[..nl]); pos += nl;
+                t.write_bytes(&buf[..pos], LineColor::Success);
+            }
+            Some(Err(_)) => t.write_line(if es_dir { "  rm: no se pudo eliminar el directorio (¿no vacio?)" } else { "  rm: archivo no encontrado" }, LineColor::Error),
+            None => t.write_line("  rm: volumen no montado", LineColor::Error),
+        }
+        return;
+    }
+    if crate::drivers::storage::vfs::is_ramfs_path(abs_str) {
+        let ok = crate::drivers::storage::vfs::with_ramfs(|ram| ram.unlink(abs_str));
+        if ok {
+            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+            append_str(&mut buf, &mut pos, b"  [OK] Eliminado: ");
+            let nl = args.len().min(TERM_COLS - pos);
+            buf[pos..pos + nl].copy_from_slice(&args[..nl]); pos += nl;
+            t.write_bytes(&buf[..pos], LineColor::Success);
+        } else {
+            t.write_line("  rm: archivo no encontrado en RamFS", LineColor::Error);
+        }
         return;
     }
 
@@ -772,6 +1061,48 @@ pub fn cmd_stat(t: &mut Terminal, args: &[u8]) {
     if args.is_empty() {
         t.write_line("  Uso: stat <archivo_o_directorio>", LineColor::Warning);
         return;
+    }
+
+    let mut abs = [0u8; 256];
+    let abs_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut abs);
+    let abs_str = core::str::from_utf8(&abs[..abs_len]).unwrap_or("");
+
+    if crate::drivers::storage::vfs::is_ramfs_path(abs_str) {
+        let stat_res = crate::drivers::storage::vfs::with_ramfs(|ram| {
+            ram.find(abs_str).map(|idx| (ram.files[idx].is_dir, ram.files[idx].data.len()))
+        });
+
+        match stat_res {
+            Some((is_dir, size)) => {
+                t.separador("INFORMACIÓN DE ENTRADA (RamFS)");
+                {
+                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                    append_str(&mut buf, &mut pos, b"  Ruta     : ");
+                    let nl = abs_len.min(TERM_COLS - pos);
+                    buf[pos..pos + nl].copy_from_slice(&abs[..nl]); pos += nl;
+                    t.write_bytes(&buf[..pos], LineColor::Normal);
+                }
+                {
+                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                    append_str(&mut buf, &mut pos, b"  Tipo     : ");
+                    if is_dir { append_str(&mut buf, &mut pos, b"Directorio en memoria"); }
+                    else      { append_str(&mut buf, &mut pos, b"Archivo en memoria (RamFS)"); }
+                    t.write_bytes(&buf[..pos], LineColor::Normal);
+                }
+                {
+                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                    append_str(&mut buf, &mut pos, b"  Tama\xF1o     : ");
+                    append_u32(&mut buf, &mut pos, size as u32);
+                    append_str(&mut buf, &mut pos, b" bytes");
+                    t.write_bytes(&buf[..pos], LineColor::Normal);
+                }
+                return;
+            }
+            None => {
+                t.write_line("  stat: entrada no encontrada en RamFS", LineColor::Error);
+                return;
+            }
+        }
     }
 
     let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
@@ -932,6 +1263,50 @@ pub fn cmd_edit(t: &mut Terminal, args: &[u8]) {
         return;
     }
 
+    // [CICLO 51 / L3] edicion por el contrato SistemaDeFicheros (raiz ext2,
+    // ramfs): el editor guarda con `escribir_fichero_fs`; la FAT solo si la
+    // raiz no esta montada.
+    {
+        let mut abs = [0u8; 256];
+        let abs_len = make_abs_path(&t.cwd, t.cwd_len, args, &mut abs);
+        let abs_str = core::str::from_utf8(&abs[..abs_len]).unwrap_or("");
+        if crate::drivers::storage::vfs::es_ruta_fs(abs_str) {
+            if crate::drivers::storage::vfs::es_dir_fs(abs_str) {
+                t.write_line("  edit: es un directorio.", LineColor::Error);
+                return;
+            }
+            let existe = crate::drivers::storage::vfs::tam_fs(abs_str).is_some();
+            if !existe {
+                if !crate::drivers::storage::vfs::escribir_fichero_fs(abs_str, &[]) {
+                    t.write_line("  edit: no se pudo crear el archivo.", LineColor::Error);
+                    return;
+                }
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  Archivo nuevo: ");
+                let nl = args.len().min(40);
+                buf[pos..pos + nl].copy_from_slice(&args[..nl]); pos += nl;
+                t.write_bytes(&buf[..pos], LineColor::Info);
+            }
+            let mut content: Box<[u8; crate::console::terminal::editor::EDITOR_MAX_BYTES]> = {
+                use alloc::vec;
+                vec![0u8; crate::console::terminal::editor::EDITOR_MAX_BYTES].try_into().unwrap_or_else(|_| alloc::boxed::Box::new([0u8; crate::console::terminal::editor::EDITOR_MAX_BYTES]))
+            };
+            let content_len = crate::drivers::storage::vfs::leer_fs(abs_str, 0, &mut *content).unwrap_or(0);
+            let drive_info = registry::with_device(0, |d| d.map(|d| d.device_info()));
+            if let Some(drive_info) = drive_info {
+                t.editor = Some(EditorState::new_text_contrato(content, content_len, drive_info, &abs[..abs_len]));
+                let mut msg = [0u8; TERM_COLS]; let mut mp = 0;
+                append_str(&mut msg, &mut mp, b"  Abriendo editor de texto: ");
+                let nl = args.len().min(40);
+                msg[mp..mp + nl].copy_from_slice(&args[..nl]); mp += nl;
+                t.write_bytes(&msg[..mp], LineColor::Info);
+            } else {
+                t.write_line("  edit: drive no disponible.", LineColor::Error);
+            }
+            return;
+        }
+    }
+
     let (vol, mnt) = match mount_vol(t) { Some(x) => x, None => return };
     let name = core::str::from_utf8(args).unwrap_or("archivo");
     let cluster = mnt.resolve(core::str::from_utf8(&t.cwd[..t.cwd_len]).unwrap_or("/"))
@@ -975,9 +1350,12 @@ pub fn cmd_edit(t: &mut Terminal, args: &[u8]) {
         }
     };
 
-    let mut content = [0u8; crate::console::terminal::editor::EDITOR_MAX_BYTES];
+    let mut content: Box<[u8; crate::console::terminal::editor::EDITOR_MAX_BYTES]> = {
+        use alloc::vec;
+                vec![0u8; crate::console::terminal::editor::EDITOR_MAX_BYTES].try_into().unwrap_or_else(|_| alloc::boxed::Box::new([0u8; crate::console::terminal::editor::EDITOR_MAX_BYTES]))
+    };
     let content_len = if entry.size > 0 {
-        vol.read_file(&entry, &mut content).unwrap_or(0)
+        vol.read_file(&entry, &mut *content).unwrap_or(0)
     } else {
         0
     };
@@ -985,12 +1363,11 @@ pub fn cmd_edit(t: &mut Terminal, args: &[u8]) {
     let mut full_path = [0u8; 256];
     let fpl = make_abs_path(&t.cwd, t.cwd_len, args, &mut full_path);
 
-    if let Some(_drive) = registry::get_device(0) {
-        let drive_info = _drive.device_info();
-        let device_id = 0usize;
+    let drive_info = registry::with_device(0, |d| d.map(|d| d.device_info()));
+    if let Some(drive_info) = drive_info {
         t.editor = Some(EditorState::new_text(
             content, content_len,
-            entry, drive_info, device_id,
+            entry, drive_info, 0usize,
             &full_path[..fpl],
         ));
         let mut msg = [0u8; TERM_COLS]; let mut mp = 0;
@@ -1035,39 +1412,46 @@ fn show_device_fat32(t: &mut Terminal, drive: &mut dyn BlockDevice, idx: usize) 
                 }
             }
 
-            t.write_line("  Tabla de particiones:", LineColor::Info);
-            t.write_line("  #  Estado   Tipo    LBA inicio   Tamaño (sectores)", LineColor::Normal);
-            for i in 0..4usize {
-                let off    = 0x1BE + i * 16;
-                let status = mbr[off];
-                let ptype  = mbr[off + 4];
-                let lba    = u32::from_le_bytes([mbr[off+8], mbr[off+9], mbr[off+10], mbr[off+11]]);
-                let size   = u32::from_le_bytes([mbr[off+12], mbr[off+13], mbr[off+14], mbr[off+15]]);
-                if ptype == 0 { continue; }
+            // Check for GPT protective MBR
+            let is_gpt = crate::drivers::storage::gpt::is_gpt_disk(&mbr);
+            if is_gpt {
+                t.write_line("  GPT protective MBR detectado (tipo 0xEE)", LineColor::Info);
+                show_gpt_partitions(t, drive);
+            } else {
+                t.write_line("  Tabla de particiones MBR:", LineColor::Info);
+                t.write_line("  #  Estado   Tipo    LBA inicio   Tamaño (sectores)", LineColor::Normal);
+                for i in 0..4usize {
+                    let off    = 0x1BE + i * 16;
+                    let status = mbr[off];
+                    let ptype  = mbr[off + 4];
+                    let lba    = u32::from_le_bytes([mbr[off+8], mbr[off+9], mbr[off+10], mbr[off+11]]);
+                    let size   = u32::from_le_bytes([mbr[off+12], mbr[off+13], mbr[off+14], mbr[off+15]]);
+                    if ptype == 0 { continue; }
 
-                let tipo_s: &[u8] = match ptype {
-                    0x0B | 0x0C => b"FAT32   ",
-                    0x0E        => b"FAT16   ",
-                    0x83        => b"Linux   ",
-                    0x07        => b"NTFS    ",
-                    _           => b"Otro    ",
-                };
+                    let tipo_s: &[u8] = match ptype {
+                        0x0B | 0x0C => b"FAT32   ",
+                        0x0E        => b"FAT16   ",
+                        0x83        => b"Linux   ",
+                        0x07        => b"NTFS    ",
+                        _           => b"Otro    ",
+                    };
 
-                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-                append_str(&mut buf, &mut pos, b"  ");
-                append_u32(&mut buf, &mut pos, (i + 1) as u32);
-                append_str(&mut buf, &mut pos, b"  ");
-                if status == 0x80 {
-                    append_str(&mut buf, &mut pos, b"Activa   ");
-                } else {
-                    append_str(&mut buf, &mut pos, b"Inactiva ");
+                    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                    append_str(&mut buf, &mut pos, b"  ");
+                    append_u32(&mut buf, &mut pos, (i + 1) as u32);
+                    append_str(&mut buf, &mut pos, b"  ");
+                    if status == 0x80 {
+                        append_str(&mut buf, &mut pos, b"Activa   ");
+                    } else {
+                        append_str(&mut buf, &mut pos, b"Inactiva ");
+                    }
+                    buf[pos..pos + tipo_s.len()].copy_from_slice(tipo_s); pos += tipo_s.len();
+                    append_str(&mut buf, &mut pos, b"  ");
+                    append_u32(&mut buf, &mut pos, lba);
+                    append_str(&mut buf, &mut pos, b"          ");
+                    append_u32(&mut buf, &mut pos, size);
+                    t.write_bytes(&buf[..pos], LineColor::Normal);
                 }
-                buf[pos..pos + tipo_s.len()].copy_from_slice(tipo_s); pos += tipo_s.len();
-                append_str(&mut buf, &mut pos, b"  ");
-                append_u32(&mut buf, &mut pos, lba);
-                append_str(&mut buf, &mut pos, b"          ");
-                append_u32(&mut buf, &mut pos, size);
-                t.write_bytes(&buf[..pos], LineColor::Normal);
             }
         }
         Err(e) => {
@@ -1111,6 +1495,99 @@ fn show_device_fat32(t: &mut Terminal, drive: &mut dyn BlockDevice, idx: usize) 
         }
     }
     t.write_empty();
+}
+
+fn show_gpt_partitions(t: &mut Terminal, drive: &mut dyn BlockDevice) {
+    let mut sector = [0u8; 512];
+    if drive.read_sectors(1, 1, &mut sector).is_err() {
+        t.write_line("  Error leyendo cabecera GPT", LineColor::Error);
+        return;
+    }
+
+    if &sector[0..8] != b"EFI PART" {
+        t.write_line("  Cabecera GPT invalida", LineColor::Error);
+        return;
+    }
+
+    let partition_entry_lba = u64::from_le_bytes(match sector[72..80].try_into() { Ok(b) => b, Err(_) => return });
+    let num_partition_entries = u32::from_le_bytes(match sector[80..84].try_into() { Ok(b) => b, Err(_) => return });
+    let size_of_partition_entry = u32::from_le_bytes(match sector[84..88].try_into() { Ok(b) => b, Err(_) => return });
+
+    if size_of_partition_entry < 128 {
+        t.write_line("  Tamaño entrada GPT invalido", LineColor::Error);
+        return;
+    }
+
+    let entry_size = size_of_partition_entry as usize;
+    let _num_entries = num_partition_entries.min(128) as usize;
+    let entries_per_sector = 512 / entry_size;
+    if entries_per_sector == 0 {
+        return;
+    }
+
+    let esp_guid: [u8; 16] = [
+        0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
+        0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
+    ];
+    let basic_data_guid: [u8; 16] = [
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+        0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+    ];
+
+    let mut entry_buf = [0u8; 512];
+    let mut shown = 0usize;
+    let max_entries = num_partition_entries.min(128) as usize;
+
+    t.write_line("  Tabla de particiones GPT:", LineColor::Info);
+    t.write_line("  #  GUID                                    LBA inicio   Tamaño (sectores)  Tipo", LineColor::Normal);
+
+    for i in 0..max_entries {
+        let sector_idx = i / (512 / entry_size);
+        let off_in_sector = (i % (512 / entry_size)) * entry_size;
+
+        if off_in_sector == 0 {
+            if drive.read_sectors(partition_entry_lba + sector_idx as u64, 1, &mut entry_buf).is_err() {
+                return;
+            }
+        }
+
+        if off_in_sector + 16 > 512 { continue; }
+
+        let type_guid: &[u8; 16] = match entry_buf[off_in_sector..off_in_sector + 16].try_into() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        let is_fat32 = type_guid == &esp_guid || type_guid == &basic_data_guid;
+        let tipo_str: &[u8] = if is_fat32 { b"FAT32   " } else { b"Otro    " };
+
+        if off_in_sector + 48 > 512 { continue; }
+        let starting_lba = match entry_buf[off_in_sector + 32..off_in_sector + 40].try_into() {
+            Ok(b) => u64::from_le_bytes(b),
+            Err(_) => continue,
+        };
+        let ending_lba = match entry_buf[off_in_sector + 40..off_in_sector + 48].try_into() {
+            Ok(b) => u64::from_le_bytes(b),
+            Err(_) => continue,
+        };
+        if starting_lba == 0 { continue; }
+        let size = ending_lba.saturating_sub(starting_lba) + 1;
+
+        let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+        append_str(&mut buf, &mut pos, b"  ");
+        append_u32(&mut buf, &mut pos, (shown + 1) as u32);
+        append_str(&mut buf, &mut pos, b"  ");
+        append_u64(&mut buf, &mut pos, starting_lba);
+        append_str(&mut buf, &mut pos, b"          ");
+        append_u64(&mut buf, &mut pos, size);
+        append_str(&mut buf, &mut pos, b"  ");
+        buf[pos..pos + tipo_str.len()].copy_from_slice(tipo_str); pos += tipo_str.len();
+        t.write_bytes(&buf[..pos], LineColor::Normal);
+        shown += 1;
+    }
+    if shown == 0 {
+        t.write_line("  (sin particiones FAT32 detectadas en GPT)", LineColor::Warning);
+    }
 }
 
 // DISKPART — Panel de información del disco
@@ -1165,8 +1642,8 @@ pub fn cmd_diskpart(t: &mut Terminal) {
         t.write_line("  #   Tipo   Capacidad      Modelo", LineColor::Info);
         t.write_line("  --- -----  -------------  -----", LineColor::Normal);
         for i in 0..reg_count {
-            if let Some(drive) = registry::get_device(i) {
-                let info = drive.device_info();
+            let info = registry::with_device(i, |d| d.map(|d| d.device_info()));
+            if let Some(info) = info {
                 let kind_s: &[u8] = if info.kind == DriveType::Atapi { b"ATAPI" } else { b"ATA  " };
                 let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
                 append_str(&mut buf, &mut pos, b"  ");
@@ -1185,9 +1662,11 @@ pub fn cmd_diskpart(t: &mut Terminal) {
         t.write_empty();
 
         for i in 0..reg_count {
-            if let Some(drive) = registry::get_device(i) {
-                show_device_fat32(t, drive, i);
-            }
+            registry::with_device(i, |d| {
+                if let Some(drive) = d {
+                    show_device_fat32(t, drive, i);
+                }
+            });
         }
     } else {
         t.write_line("  No hay dispositivos de bloque registrados.", LineColor::Warning);
@@ -1220,8 +1699,10 @@ pub fn cmd_diskinfo(t: &mut Terminal) {
 
 fn read_sector_raw(drv_idx: usize, lba: u64, sector: &mut [u8; 512]) -> Result<(), AtaError> {
     if drv_idx == 0 {
-        let drive = registry::get_device(0).ok_or(AtaError::NoDrive)?;
-        drive.read_sectors(lba, 1, sector)
+        registry::with_device(0, |d| {
+            let drive = d.ok_or(AtaError::NoDrive)?;
+            drive.read_sectors(lba, 1, sector)
+        })
     } else {
         let bus = AtaBus::scan();
         let id = drive_id(drv_idx);
@@ -1236,10 +1717,11 @@ pub fn cmd_diskread(t: &mut Terminal, args: &[u8]) {
 
     // Verificar límites
     if drv_idx == 0 {
-        if let Some(d) = registry::get_device(0) {
-            if lba >= d.total_sectors() {
-                t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
-            }
+        let out_of_range = registry::with_device(0, |d| {
+            d.map(|d| lba >= d.total_sectors()).unwrap_or(false)
+        });
+        if out_of_range {
+            t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
         }
     } else {
         let bus = AtaBus::scan();
@@ -1318,23 +1800,22 @@ pub fn cmd_diskedit(t: &mut Terminal, args: &[u8]) {
     let (lba, drv_idx) = parse_lba_drive(args);
 
     if drv_idx == 0 {
-        let drive = match registry::get_device(0) {
-            Some(d) => d,
-            None => { t.write_line("  Error: dispositivo 0 no disponible.", LineColor::Error); return; }
+        let (info, sector) = match registry::with_device(0, |d| {
+            let drive = match d {
+                Some(d) => d,
+                None => { return None; }
+            };
+            if lba >= drive.total_sectors() {
+                return None;
+            }
+            let info = drive.device_info();
+            let mut sector = [0u8; 512];
+            drive.read_sectors(lba, 1, &mut sector).ok()?;
+            Some((info, sector))
+        }) {
+            Some(v) => v,
+            None => { t.write_line("  Error: dispositivo 0 no disponible o fuera de rango.", LineColor::Error); return; }
         };
-        if lba >= drive.total_sectors() {
-            t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
-        }
-        let info = drive.device_info();
-        let mut sector = [0u8; 512];
-        if let Err(e) = drive.read_sectors(lba, 1, &mut sector) {
-            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-            append_str(&mut buf, &mut pos, b"  Error leyendo sector: ");
-            let em = ata_err_msg(e);
-            buf[pos..pos + em.len()].copy_from_slice(em); pos += em.len();
-            t.write_bytes(&buf[..pos], LineColor::Error);
-            return;
-        }
         {
             let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
             append_str(&mut buf, &mut pos, b"  Abriendo editor hex: LBA=");
@@ -1402,21 +1883,23 @@ pub fn cmd_diskwrite(t: &mut Terminal, args: &[u8]) {
         None => { t.write_line("  Error: patrón inválido (usa 0xNN).", LineColor::Error); return; }
     };
 
-    let drive = match registry::get_device(0) {
-        Some(d) => d,
-        None => { t.write_line("  Error: dispositivo 0 no disponible.", LineColor::Error); return; }
-    };
-    if lba >= drive.total_sectors() {
-        t.write_line("  Error: LBA fuera de rango.", LineColor::Error); return;
-    }
-
     if lba < 68 {
         t.write_line("  [ADVERTENCIA] LBA en area de boot (0-67). El sistema puede volverse inarrancable.", LineColor::Error);
     }
 
-    let buf   = [pat; 512];
-    match drive.write_sectors(lba, 1, &buf) {
-        Ok(()) => {
+    let buf = [pat; 512];
+    let result = registry::with_device(0, |d| {
+        let drive = match d {
+            Some(d) => d,
+            None => { return None; }
+        };
+        if lba >= drive.total_sectors() {
+            return None;
+        }
+        drive.write_sectors(lba, 1, &buf).ok()
+    });
+    match result {
+        Some(()) => {
             let mut line = [0u8; TERM_COLS]; let mut lp = 0;
             append_str(&mut line, &mut lp, b"  [OK] Sector LBA=");
             append_u32(&mut line, &mut lp, lba as u32);
@@ -1426,7 +1909,7 @@ pub fn cmd_diskwrite(t: &mut Terminal, args: &[u8]) {
             line[lp] = H[(pat & 0xF) as usize]; lp += 1;
             t.write_bytes(&line[..lp], LineColor::Success);
         }
-        Err(_) => { t.write_line("  Error: fallo al escribir sector.", LineColor::Error); }
+        None => { t.write_line("  Error: fallo al escribir sector.", LineColor::Error); }
     }
 }
 
@@ -1442,11 +1925,13 @@ pub fn cmd_mkfs(t: &mut Terminal, args: &[u8]) {
         None => {
             let mut found: Option<usize> = None;
             for i in 0..registry::device_count() {
-                if let Some(d) = registry::get_device(i) {
-                    if d.device_info().kind != DriveType::Atapi && d.total_sectors() > 0 {
-                        found = Some(i);
-                        break;
-                    }
+                let valid = registry::with_device(i, |d| {
+                    d.map(|d| d.device_info().kind != DriveType::Atapi && d.total_sectors() > 0)
+                     .unwrap_or(false)
+                });
+                if valid {
+                    found = Some(i);
+                    break;
                 }
             }
             match found {
@@ -1462,44 +1947,45 @@ pub fn cmd_mkfs(t: &mut Terminal, args: &[u8]) {
         }
     };
 
-    let drive = match registry::get_device(dev_idx) {
-        Some(d) => d,
-        None => {
-            let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-            append_str(&mut buf, &mut pos, b"  Error: device ");
-            append_u32(&mut buf, &mut pos, dev_idx as u32);
-            append_str(&mut buf, &mut pos, b" no disponible.");
-            t.write_bytes(&buf[..pos], LineColor::Error);
+    registry::with_device(dev_idx, |d| {
+        let drive = match d {
+            Some(d) => d,
+            None => {
+                let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+                append_str(&mut buf, &mut pos, b"  Error: device ");
+                append_u32(&mut buf, &mut pos, dev_idx as u32);
+                append_str(&mut buf, &mut pos, b" no disponible.");
+                t.write_bytes(&buf[..pos], LineColor::Error);
+                return;
+            }
+        };
+
+        let info = drive.device_info();
+        if info.kind == DriveType::Atapi {
+            t.write_line("  Error: no se puede formatear un CD-ROM (ATAPI).", LineColor::Error);
+            t.write_line("  Especifica un device ATA valido (ej: 'mkfs 1').", LineColor::Normal);
             return;
         }
-    };
 
-    let info = drive.device_info();
-    if info.kind == DriveType::Atapi {
-        t.write_line("  Error: no se puede formatear un CD-ROM (ATAPI).", LineColor::Error);
-        t.write_line("  Especifica un device ATA valido (ej: 'mkfs 1').", LineColor::Normal);
-        return;
-    }
+        let total_secs = drive.total_sectors();
+        if total_secs == 0 {
+            t.write_line("  Error: el dispositivo tiene 0 sectores.", LineColor::Error);
+            return;
+        }
 
-    let total_secs = drive.total_sectors();
-    if total_secs == 0 {
-        t.write_line("  Error: el dispositivo tiene 0 sectores.", LineColor::Error);
-        return;
-    }
+        let mut mb = [0u8; 32]; let mut mp = 0;
+        append_u32(&mut mb, &mut mp, (total_secs / 2048) as u32);
+        let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
+        append_str(&mut buf, &mut pos, b"  Formateando device ");
+        append_u32(&mut buf, &mut pos, dev_idx as u32);
+        append_str(&mut buf, &mut pos, b" (");
+        append_u32(&mut buf, &mut pos, total_secs as u32);
+        append_str(&mut buf, &mut pos, b" sectores = ");
+        t.write_bytes(&buf[..pos], LineColor::Info);
+        t.write_bytes(&mb[..mp], LineColor::Info);
+        t.write_line(" MiB)...", LineColor::Info);
 
-    let mut mb = [0u8; 32]; let mut mp = 0;
-    append_u32(&mut mb, &mut mp, (total_secs / 2048) as u32);
-    let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
-    append_str(&mut buf, &mut pos, b"  Formateando device ");
-    append_u32(&mut buf, &mut pos, dev_idx as u32);
-    append_str(&mut buf, &mut pos, b" (");
-    append_u32(&mut buf, &mut pos, total_secs as u32);
-    append_str(&mut buf, &mut pos, b" sectores = ");
-    t.write_bytes(&buf[..pos], LineColor::Info);
-    t.write_bytes(&mb[..mp], LineColor::Info);
-    t.write_line(" MiB)...", LineColor::Info);
-
-    match mkfs::auto_format(drive, total_secs) {
+        match mkfs::auto_format(drive, total_secs) {
         Some(root_clus) => {
             invalidate_vol_cache();
             let mut buf = [0u8; TERM_COLS]; let mut pos = 0;
@@ -1514,10 +2000,11 @@ pub fn cmd_mkfs(t: &mut Terminal, args: &[u8]) {
             t.write_bytes(&buf[..pos], LineColor::Normal);
             t.write_line("  Ejecuta 'diskpart' para verificar el estado.", LineColor::Normal);
         }
-        None => {
-            invalidate_vol_cache();
-            t.write_line("  [ERROR] Fallo al formatear el dispositivo.", LineColor::Error);
-            t.write_line("  Verifica que no este en uso y tenga al menos 8 MB.", LineColor::Warning);
+            None => {
+                invalidate_vol_cache();
+                t.write_line("  [ERROR] Fallo al formatear el dispositivo.", LineColor::Error);
+                t.write_line("  Verifica que no este en uso y tenga al menos 8 MB.", LineColor::Warning);
+            }
         }
-    }
+    });
 }

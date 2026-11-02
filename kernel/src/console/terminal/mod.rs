@@ -10,12 +10,13 @@
 pub mod fmt;
 pub mod commands;
 pub mod editor;
+pub mod ansi;
 
 // ── Constantes públicas ───────────────────────────────────────────────────────
 
 pub const TERM_COLS:   usize = 92;
 pub const TERM_ROWS:   usize = 128;
-pub const INPUT_MAX:   usize = 80;
+pub const INPUT_MAX:   usize = 256; // [CICLO 51] antes 80: las rutas del almacen ext2 no cabian en la linea de ordenes
 pub const PROMPT:      &[u8] = b"PORTIX> ";
 pub const SCROLL_STEP: usize = 3;
 pub const CWD_MAX:     usize = 256;
@@ -90,6 +91,9 @@ impl Terminal {
     }
 
     pub fn write_bytes(&mut self, s: &[u8], color: LineColor) {
+        crate::drivers::serial::write_bytes_raw(s);
+        crate::drivers::serial::write_str("\r\n");
+
         let mut start = 0;
         loop {
             let end   = (start + TERM_COLS).min(s.len());

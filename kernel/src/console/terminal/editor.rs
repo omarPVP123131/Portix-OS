@@ -20,10 +20,12 @@
 #![allow(dead_code)]
 
 use crate::drivers::input::keyboard::Key;
-use crate::drivers::storage::ata::{AtaError, DriveId, DriveInfo};
+use crate::drivers::storage::ata::{DriveId, DriveInfo};
 use crate::drivers::storage::fat32::{Fat32Volume, DirEntryInfo};
 use crate::drivers::storage::registry;
 use crate::graphics::driver::framebuffer::{Color, Console, Layout};
+use alloc::boxed::Box;
+use alloc::vec;
 use crate::util::fmt as kfmt;
 
 // ── Límites ───────────────────────────────────────────────────────────────────
@@ -104,7 +106,7 @@ pub struct EditorState {
 
     // ── Modo Texto ────────────────────────────────────────────────────────────
     /// Buffer de texto (hasta EDITOR_MAX_BYTES).
-    pub text_buf:     [u8; EDITOR_MAX_BYTES],
+    pub text_buf:     Box<[u8; EDITOR_MAX_BYTES]>,
     /// Bytes válidos en text_buf.
     pub text_len:     usize,
     /// Línea actual del cursor (fila lógica 0-based).
@@ -145,7 +147,7 @@ impl EditorState {
     }
 
     pub fn new_text(
-        content: [u8; EDITOR_MAX_BYTES],
+        content: Box<[u8; EDITOR_MAX_BYTES]>,
         content_len: usize,
         entry: DirEntryInfo,
         drive_info: DriveInfo,
@@ -168,6 +170,26 @@ impl EditorState {
         ed
     }
 
+    /// [CICLO 51 / L3] editor de texto sobre un fichero servido por el
+    /// contrato `SistemaDeFicheros` (raiz ext2 o ramfs); sin entrada FAT.
+    pub fn new_text_contrato(
+        content: Box<[u8; EDITOR_MAX_BYTES]>,
+        content_len: usize,
+        drive_info: DriveInfo,
+        path: &[u8],
+    ) -> Self {
+        let mut ed = Self::base(drive_info);
+        ed.mode = EditorMode::Text;
+        ed.text_buf = content;
+        ed.text_len = content_len;
+        ed.fat_entry = None;
+        let pl = path.len().min(256);
+        ed.file_path[..pl].copy_from_slice(&path[..pl]);
+        ed.file_path_len = pl;
+        ed.set_msg(b"  Ctrl+S = Guardar   |   Ctrl+X o Esc = Salir   |   Flechas = Mover cursor", MsgKind::Normal);
+        ed
+    }
+
     fn base(drive_info: DriveInfo) -> Self {
         EditorState {
             mode:          EditorMode::Hex,
@@ -178,7 +200,7 @@ impl EditorState {
             cursor:        0,
             hi_nibble:     true,
             scroll:        0,
-            text_buf:      [0u8; EDITOR_MAX_BYTES],
+            text_buf:      vec![0u8; EDITOR_MAX_BYTES].try_into().unwrap_or_else(|_| alloc::boxed::Box::new([0u8; EDITOR_MAX_BYTES])),
             text_len:      0,
             text_row:      0,
             text_col:      0,
@@ -302,28 +324,20 @@ pub fn handle_key(&mut self, key: Key, ctrl: bool) -> bool {
             return;
         }
 
-        let drive = match registry::get_device(self.device_id) {
-            Some(d) => d,
-            None => { self.set_msg(b"[ERROR] Dispositivo no disponible.", MsgKind::Error); return; }
-        };
-        match drive.write_sectors(self.lba, 1, &self.buf) {
-            Ok(()) => {
+        let result = registry::with_device(self.device_id, |d| {
+            let drive = match d {
+                Some(d) => d,
+                None => { return None; }
+            };
+            drive.write_sectors(self.lba, 1, &self.buf).ok()
+        });
+        match result {
+            Some(()) => {
                 self.dirty = false;
                 self.set_msg(b"[OK] Sector escrito en disco.", MsgKind::Ok);
             }
-            Err(e) => {
-                let mut m = [0u8; 80]; let mut p = 0;
-                let prefix = b"[ERROR] No se pudo guardar: ";
-                m[..prefix.len()].copy_from_slice(prefix); p += prefix.len();
-                let es: &[u8] = match e {
-                    AtaError::Timeout        => b"timeout",
-                    AtaError::DriveFault     => b"fallo de drive",
-                    AtaError::OutOfRange     => b"fuera de rango",
-                    AtaError::DeviceError(_) => b"error de dispositivo",
-                    _                        => b"error desconocido",
-                };
-                m[p..p + es.len().min(80 - p)].copy_from_slice(&es[..es.len().min(80 - p)]);
-                self.set_msg(&m, MsgKind::Error);
+            None => {
+                self.set_msg(b"[ERROR] No se pudo guardar el sector.", MsgKind::Error);
             }
         }
     }
@@ -543,23 +557,42 @@ fn handle_key_text(&mut self, key: Key, ctrl: bool) -> bool {
     // ── Guardar en FAT32 ─────────────────────────────────────────────────────
 
     fn save_text(&mut self) {
-        let drive = match registry::get_device(self.device_id) {
-            Some(d) => d,
-            None => {
-                self.set_msg(b"[ERROR] Dispositivo no disponible.", MsgKind::Error);
+        // [CICLO 51 / L3] por el contrato si la ruta pertenece a un montaje
+        // (raiz ext2, ramfs); la FAT queda como rescate.
+        if let Ok(ruta) = core::str::from_utf8(&self.file_path[..self.file_path_len]) {
+            if crate::drivers::storage::vfs::es_ruta_fs(ruta) {
+                if crate::drivers::storage::vfs::escribir_fichero_fs(ruta, &self.text_buf[..self.text_len]) {
+                    self.dirty = false;
+                    let mut m = [0u8; 80]; let mut p = 0;
+                    let ok = b"[OK] Guardado: ";
+                    m[..ok.len()].copy_from_slice(ok); p += ok.len();
+                    let nl = self.file_path_len.min(80 - p);
+                    m[p..p + nl].copy_from_slice(&self.file_path[..nl]);
+                    self.set_msg(&m, MsgKind::Ok);
+                } else {
+                    self.set_msg(b"[ERROR] No se pudo escribir el archivo.", MsgKind::Error);
+                }
                 return;
             }
-        };
-        let mut vol = match Fat32Volume::mount(drive) {
-            Ok(v) => v,
-            Err(_) => {
-                self.set_msg(b"[ERROR] No se pudo montar el volumen FAT32.", MsgKind::Error);
-                return;
-            }
-        };
+        }
+        registry::with_device(self.device_id, |d| {
+            let drive = match d {
+                Some(d) => d,
+                None => {
+                    self.set_msg(b"[ERROR] Dispositivo no disponible.", MsgKind::Error);
+                    return;
+                }
+            };
+            let mut vol = match Fat32Volume::mount(drive) {
+                Ok(v) => v,
+                Err(_) => {
+                    self.set_msg(b"[ERROR] No se pudo montar el volumen FAT32.", MsgKind::Error);
+                    return;
+                }
+            };
 
-        if let Some(ref mut entry) = self.fat_entry {
-            match vol.write_file(entry, &self.text_buf[..self.text_len]) {
+            if let Some(ref mut entry) = self.fat_entry {
+                match vol.write_file(entry, &self.text_buf[..self.text_len]) {
                 Ok(()) => {
                     self.dirty = false;
                     let mut m = [0u8; 80]; let mut p = 0;
@@ -576,6 +609,7 @@ fn handle_key_text(&mut self, key: Key, ctrl: bool) -> bool {
         } else {
             self.set_msg(b"[ERROR] Sin referencia al archivo.", MsgKind::Error);
         }
+    });
     }
 }
 
@@ -767,7 +801,7 @@ fn draw_text(c: &mut Console, lay: &Layout, ed: &EditorState) {
     c.fill_rect(x0, y_text, fw, TEXT_VISIBLE_ROWS * row_h, EdPalette::TEXT_BG);
 
     // Recopilar líneas para renderizar
-    let mut lines: [[u8; TEXT_LINE_MAX]; TEXT_VISIBLE_ROWS] = [[0u8; TEXT_LINE_MAX]; TEXT_VISIBLE_ROWS];
+    let mut lines = vec![[0u8; TEXT_LINE_MAX]; TEXT_VISIBLE_ROWS];
     let mut line_lens = [0usize; TEXT_VISIBLE_ROWS];
     let mut logical_row = 0usize;
     let mut vis_idx = 0usize;

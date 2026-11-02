@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FLOPPY = ROOT / "build" / "floppy.img"
+FLOPPY = ROOT / "build" / "dist" / "floppy.img"
 KERNELBIN = ROOT / "build" / "kernel.bin"
 
 def hexdump(data, offset=0, length=64):

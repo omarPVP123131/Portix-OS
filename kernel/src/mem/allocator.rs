@@ -19,6 +19,8 @@ pub struct AllocStats {
     pub total_allocs:  AtomicUsize,
     pub total_frees:   AtomicUsize,
     pub failed_allocs: AtomicUsize,
+    /// [T-011] bytes realmente ocupados (suma de 1<<orden de los bloques entregados).
+    pub bytes_en_uso:  AtomicUsize,
     pub free_blocks:   [AtomicUsize; ORDER_COUNT],
 }
 
@@ -45,6 +47,7 @@ impl AllocStats {
             total_allocs:  AtomicUsize::new(0),
             total_frees:   AtomicUsize::new(0),
             failed_allocs: AtomicUsize::new(0),
+            bytes_en_uso:  AtomicUsize::new(0),
             free_blocks:   atomic_array!(ORDER_COUNT),
         }
     }
@@ -164,18 +167,25 @@ impl BuddyAllocator {
     }
 
     #[inline(always)]
-    fn lock(&self) {
+    fn lock_irqsave(&self) -> u64 {
+        let flags: u64;
+        unsafe { core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nostack)); }
+        unsafe { core::arch::asm!("cli", options(nostack)); }
         while self.locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             core::hint::spin_loop();
         }
+        flags
     }
 
     #[inline(always)]
-    fn unlock(&self) {
+    fn unlock_irqrestore(&self, flags: u64) {
         self.locked.store(false, Ordering::Release);
+        if flags & 0x200 != 0 {
+            unsafe { core::arch::asm!("sti", options(nostack)); }
+        }
     }
 }
 
@@ -257,15 +267,19 @@ unsafe impl GlobalAlloc for BuddyAllocator {
             return ptr::null_mut();
         }
         let need  = layout.size().max(layout.align()).max(1 << MIN_ORDER);
+        if need > (1usize << MAX_ORDER) {
+            ALLOC_STATS.failed_allocs.fetch_add(1, Ordering::Relaxed);
+            return ptr::null_mut();
+        }
         let order = order_for(need);
         if order > MAX_ORDER {
             ALLOC_STATS.failed_allocs.fetch_add(1, Ordering::Relaxed);
             return ptr::null_mut();
         }
 
-        self.lock();
+        let flags = self.lock_irqsave();
         let result = buddy_alloc(&mut *self.inner.get(), order);
-        self.unlock();
+        self.unlock_irqrestore(flags);
 
         if result.is_null() {
             ALLOC_STATS.failed_allocs.fetch_add(1, Ordering::Relaxed);
@@ -273,7 +287,9 @@ unsafe impl GlobalAlloc for BuddyAllocator {
             serial::log_level(Level::Warn, "HEAP", "OOM — alloc fallida");
         } else {
             ALLOC_STATS.total_allocs.fetch_add(1, Ordering::Relaxed);
-            ALLOC_STATS.free_blocks[ord_idx(order)].fetch_sub(1, Ordering::Relaxed);
+            // [T-011] free_blocks se ajusta dentro de buddy_alloc (pop en found_ord,
+            // push de cada mitad al partir); aqui solo los bytes entregados.
+            ALLOC_STATS.bytes_en_uso.fetch_add(1usize << order, Ordering::Relaxed);
             #[cfg(debug_assertions)]
             {
                 serial::write_str("[ DBG ] HEAP  alloc ord=");
@@ -288,14 +304,19 @@ unsafe impl GlobalAlloc for BuddyAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let need  = layout.size().max(layout.align()).max(1 << MIN_ORDER);
+        if need > (1usize << MAX_ORDER) {
+            serial::log_level(Level::Warn, "HEAP", "dealloc: size exceeds max order, leaking");
+            return;
+        }
         let order = order_for(need);
 
-        self.lock();
+        let flags = self.lock_irqsave();
         buddy_free(&mut *self.inner.get(), ptr, order);
-        self.unlock();
+        self.unlock_irqrestore(flags);
 
         ALLOC_STATS.total_frees.fetch_add(1, Ordering::Relaxed);
-        ALLOC_STATS.free_blocks[ord_idx(order)].fetch_add(1, Ordering::Relaxed);
+        // [T-011] free_blocks se ajusta dentro de buddy_free (orden final tras fusion).
+        ALLOC_STATS.bytes_en_uso.fetch_sub(1usize << order, Ordering::Relaxed);
 
         #[cfg(debug_assertions)]
         {
@@ -316,17 +337,73 @@ unsafe impl GlobalAlloc for BuddyAllocator {
     }
 
     unsafe fn realloc(&self, old_ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+        if old_ptr.is_null() {
+            let new_layout = match Layout::from_size_align(new_size, old_layout.align()) {
+                Ok(l)  => l,
+                Err(_) => return ptr::null_mut(),
+            };
+            return self.alloc(new_layout);
+        }
+        if new_size <= old_layout.size() {
+            return old_ptr;
+        }
         let new_layout = match Layout::from_size_align(new_size, old_layout.align()) {
             Ok(l)  => l,
             Err(_) => return ptr::null_mut(),
         };
-        let new_ptr = self.alloc(new_layout);
-        if !new_ptr.is_null() {
-            let copy_size = old_layout.size().min(new_size);
-            ptr::copy_nonoverlapping(old_ptr, new_ptr, copy_size);
-            self.dealloc(old_ptr, old_layout);
+        let need = new_layout.size().max(new_layout.align()).max(1 << MIN_ORDER);
+        // [T-005b, defecto 31 — autorizado por el usuario, 30-10-2026] La misma guarda
+        // que `alloc`/`dealloc`: por encima del orden máximo `order_for` satura y
+        // `new_order <= old_order` devolvía el MISMO bloque de 4 MiB para una
+        // petición de 8 MiB (el ramfs creciendo un `Vec`): el llamador escribía
+        // fuera del bloque y corrompía las kernel stacks vecinas (#UD/#GP en dos CPUs).
+        if need > (1usize << MAX_ORDER) {
+            ALLOC_STATS.failed_allocs.fetch_add(1, Ordering::Relaxed);
+            return ptr::null_mut();
         }
-        new_ptr
+        let new_order = order_for(need);
+        let old_need = old_layout.size().max(old_layout.align()).max(1 << MIN_ORDER);
+        let old_order = order_for(old_need);
+        if new_order <= old_order {
+            return old_ptr;
+        }
+        let flags = self.lock_irqsave();
+        let inner = &mut *self.inner.get();
+        let mut addr = old_ptr as usize;
+        let mut ord = old_order;
+        let mut can_grow = false;
+        loop {
+            if ord >= new_order || ord >= MAX_ORDER { break; }
+            let buddy_addr = buddy_of(addr, ord);
+            if buddy_addr < HEAP_START || buddy_addr >= HEAP_START + HEAP_SIZE { break; }
+            if find_buddy(inner, ord, buddy_addr) {
+                inner_remove(inner, ord, buddy_addr as *mut u8);
+                addr = addr.min(buddy_addr);
+                ord += 1;
+                if ord >= new_order {
+                    can_grow = true;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if can_grow {
+            self.unlock_irqrestore(flags);
+            if addr != old_ptr as usize {
+                ptr::copy(old_ptr, addr as *mut u8, old_layout.size());
+            }
+            addr as *mut u8
+        } else {
+            self.unlock_irqrestore(flags);
+            let new_ptr = self.alloc(new_layout);
+            if !new_ptr.is_null() {
+                let copy_size = old_layout.size().min(new_size);
+                ptr::copy_nonoverlapping(old_ptr, new_ptr, copy_size);
+                self.dealloc(old_ptr, old_layout);
+            }
+            new_ptr
+        }
     }
 }
 
@@ -355,7 +432,15 @@ unsafe fn buddy_alloc(inner: &mut BuddyInner, order: usize) -> *mut u8 {
         return ptr::null_mut();
     }
 
-    let ptr = inner_pop(inner, found_ord).unwrap();
+    let ptr = match inner_pop(inner, found_ord) {
+        Some(p) => p,
+        None => {
+            serial::log("ALLOCATOR", "CRITICAL: buddy allocation failed - list corruption?\n");
+            return ptr::null_mut();
+        }
+    };
+    // [T-011] el bloque extraido deja de estar libre en su orden de origen
+    ALLOC_STATS.free_blocks[ord_idx(found_ord)].fetch_sub(1, Ordering::Relaxed);
     let mut cur_ord = found_ord;
 
     while cur_ord > order {
@@ -377,7 +462,6 @@ unsafe fn buddy_alloc(inner: &mut BuddyInner, order: usize) -> *mut u8 {
 unsafe fn buddy_free(inner: &mut BuddyInner, ptr: *mut u8, order: usize) {
     let mut addr = ptr as usize;
     let mut ord  = order;
-    let mut merges = 0u32;
 
     loop {
         if ord >= MAX_ORDER { break; }
@@ -391,19 +475,13 @@ unsafe fn buddy_free(inner: &mut BuddyInner, ptr: *mut u8, order: usize) {
 
         addr  = addr.min(buddy_addr);
         ord  += 1;
-        merges += 1;
     }
 
+    if find_buddy(inner, ord, addr) {
+        serial::log("ALLOCATOR", "CRITICAL: double-free detected\n");
+        return;
+    }
     inner_push(inner, ord, addr as *mut u8);
-
-    #[cfg(debug_assertions)]
-    if merges > 0 {
-        serial::write_str("[ DBG ] HEAP  merge x");
-        serial::write_u32(merges);
-        serial::write_str(" → ord=");
-        serial::write_u32(ord as u32);
-        serial::write_byte(b'\n');
-    }
-    #[cfg(not(debug_assertions))]
-    let _ = merges;
+    // [T-011] el bloque (posiblemente fusionado) queda libre en su orden final
+    ALLOC_STATS.free_blocks[ord_idx(ord)].fetch_add(1, Ordering::Relaxed);
 }

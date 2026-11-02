@@ -1,0 +1,7 @@
+[package]
+name = "ar"
+version = "2.42.0"
+edition = "2021"
+
+[dependencies]
+portix-rt = { path = "../../crates/portix-rt" }

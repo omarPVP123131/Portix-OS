@@ -1,0 +1,22 @@
+--- docs/evidencias/b203/t035c-isr-antes.rs	2026-10-31 15:08:23.581548658 +0000
++++ kernel/src/arch/isr_handlers.rs	2026-10-31 15:08:29.449548658 +0000
+@@ -1080,9 +1080,17 @@
+ 
+     // [ÉPICA 58] SIGSEGV: si el proceso instaló manejador, se le entrega el
+     // fallo en lugar de terminar el proceso de inmediato.
+-    // [b191] si_code: ACCERR si la página estaba presente (bit P del código de error), MAPERR si no.
++    // [T-035c] El bit P de hardware no distingue una dirección no mapeada de
++    // una reserva PROT_NONE: ambas usan una PTE no presente. Linux informa
++    // ACCERR para la reserva (existe, pero el acceso está prohibido), y MAPERR
++    // para un hueco. Sólo se reclasifica la reserva perezosa de protección cero;
++    // no se atribuyen a permisos otros fallos, p. ej. falta de memoria.
++    let reserva_sin_acceso = ec & 4 != 0 &&
++        crate::mem::paging::pte_cruda(current_cr3, cr2 as usize).map_or(false, |pte| {
++            crate::mem::paging::es_perezosa(pte) && crate::mem::paging::prot_perezosa(pte) == 0
++        });
+     let fallo = crate::process::signals::InfoFallo {
+-        code: if ec & 1 != 0 { crate::process::signals::SEGV_ACCERR } else { crate::process::signals::SEGV_MAPERR },
++        code: if ec & 1 != 0 || reserva_sin_acceso { crate::process::signals::SEGV_ACCERR } else { crate::process::signals::SEGV_MAPERR },
+         addr: cr2, err: ec, trapno: 14,
+     };
+     if deliver_signal_from_exception(crate::process::signals::SIGSEGV, "page_fault", fallo) {

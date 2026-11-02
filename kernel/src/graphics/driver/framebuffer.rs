@@ -19,13 +19,14 @@ use crate::bootinfo;
 use crate::drivers::bus::pci;
 use crate::drivers::serial;
 
-const LEGACY_LFB_PTR_ADDR: *const u32 = 0x9004 as *const u32;
-const LEGACY_WIDTH_ADDR:   *const u16 = 0x9008 as *const u16;
-const LEGACY_HEIGHT_ADDR:  *const u16 = 0x900A as *const u16;
-const LEGACY_PITCH_ADDR:   *const u16 = 0x900C as *const u16;
-const LEGACY_BPP_ADDR:     *const u8  = 0x900E as *const u8;
+const LEGACY_LFB_PTR_ADDR: *const u32 = 0x5004 as *const u32;
+const LEGACY_WIDTH_ADDR:   *const u16 = 0x5008 as *const u16;
+const LEGACY_HEIGHT_ADDR:  *const u16 = 0x500A as *const u16;
+const LEGACY_PITCH_ADDR:   *const u16 = 0x500C as *const u16;
+const LEGACY_BPP_ADDR:     *const u8  = 0x500E as *const u8;
 
-const BACKBUF_ADDR: u64 = 0x0500_0000;
+/// [Fase B.2] Back buffer en físico 0x05000000, escrito SIEMPRE por su alias alto.
+const BACKBUF_ADDR: u64 = (crate::mem::paging::KERNEL_VMA_OFFSET + crate::mem::paging::BACKBUF_PHYS) as u64;
 
 // Matriz Bayer 4×4 para dithering ordenado (mejora #4)
 const BAYER_4X4: [[u8; 4]; 4] = [
@@ -68,14 +69,14 @@ unsafe fn vbe_outw(reg: u16, val: u16) {
 
 /// Intenta inicializar/leer el modo Bochs VBE.
 /// Si VBE no está activo, lo inicializa a 1024x768x32.
-/// Devuelve (width, height, bpp) o (0,0,0) si falla.
-fn bochs_vbe_setup() -> (u32, u32, u32) {
+/// Devuelve (width, height, bpp, pitch_bytes) o (0,0,0,0) si falla.
+fn bochs_vbe_setup() -> (u32, u32, u32, u32) {
     unsafe {
         let id = vbe_inw(0);
         let active = id == 0xB0C0 || id == 0xB0C1 || id == 0xB0C2 || id == 0xB0C3 || id == 0xB0C4;
 
         if active {
-            serial::log("VBE", "already active, reading current mode");
+            serial::log("VBE", "already active, mode: 1024x768x32");
         } else {
             serial::log("VBE", "not active — initializing to 1024x768x32");
             vbe_outw(0, 0xB0C4);        // set ID
@@ -92,10 +93,24 @@ fn bochs_vbe_setup() -> (u32, u32, u32) {
         let bpp  = vbe_inw(3) as u32;
         if xres == 0 || yres == 0 || bpp < 15 {
             serial::log("VBE", "invalid resolution after init");
-            return (0, 0, 0);
+            return (0, 0, 0, 0);
         }
+
+        // Leer stride real del HW: registro 6 = virtual width (pixels per scanline)
+        let stride_dwords = vbe_inw(6) as u32;
+        let pitch = if stride_dwords > 0 {
+            stride_dwords * 4
+        } else {
+            xres * (bpp / 8)
+        };
+
         serial::log("VBE", if active { "resolution OK (active)" } else { "resolution OK (init)" });
-        (xres, yres, bpp)
+        serial::write_str("[VBE] stride_dwords=");
+        serial::write_usize(stride_dwords as usize);
+        serial::write_str(" pitch_bytes=");
+        serial::write_usize(pitch as usize);
+        serial::write_byte(b'\n');
+        (xres, yres, bpp, pitch)
     }
 }
 
@@ -250,7 +265,7 @@ impl Layout {
 
         let pad     = (fw / 80).max(8).min(18);
         let col_div = fw * 5 / 12;
-        let tab_w   = fw / 5;
+        let tab_w   = fw / 6;
 
         Layout {
             fw, fh,
@@ -272,7 +287,7 @@ impl Layout {
         let x = mx as usize; let y = my as usize;
         if y < self.tab_y || y >= self.tab_y + self.tab_h { return -1; }
         let idx = x / self.tab_w;
-        if idx < 5 { idx as i32 } else { -1 }
+        if idx < 6 { idx as i32 } else { -1 }
     }
 }
 
@@ -288,13 +303,25 @@ pub struct Framebuffer {
     bpp:        u8,
     back_pitch: usize,
     pub dirty:  DirtyRegion,
+    pub direct_lfb: bool,
 }
+
+/// Modo real del framebuffer lineal (para SYS_FB_INFO).
+#[derive(Clone, Copy)]
+pub struct FbMode { pub phys: u64, pub width: usize, pub height: usize, pub bpp: u8, pub pitch: usize }
+impl FbMode {
+    pub const fn empty() -> Self { FbMode { phys: 0, width: 0, height: 0, bpp: 0, pitch: 0 } }
+    fn set(&mut self, phys: u64, w: usize, h: usize, bpp: u8, pitch: usize) {
+        self.phys = phys; self.width = w; self.height = h; self.bpp = bpp; self.pitch = pitch;
+    }
+}
+pub static FB_MODE: crate::arch::spinlock::Spinlock<FbMode> = crate::arch::spinlock::Spinlock::new(FbMode::empty());
 
 impl Framebuffer {
     pub fn new() -> Self {
         unsafe {
             let mut needs_vbe_init;
-            let (mut lfb, mut w_raw, mut h_raw, p_raw, mut bpp_raw) =
+            let (mut lfb, mut w_raw, mut h_raw, mut p_raw, mut bpp_raw) =
                 if let Some(info) = bootinfo::get() {
                     let fb = &info.framebuffer;
                     needs_vbe_init = fb.source != 1;
@@ -329,7 +356,7 @@ impl Framebuffer {
             }
 
             if needs_vbe_init && lfb != 0 {
-                let (vbe_w, vbe_h, vbe_bpp) = bochs_vbe_setup();
+                let (vbe_w, vbe_h, vbe_bpp, vbe_pitch) = bochs_vbe_setup();
                 serial::log("FB", "VBE resolution (w x h x bpp):");
                 serial::write_usize(vbe_w as usize);
                 serial::write_byte(b'x');
@@ -341,6 +368,9 @@ impl Framebuffer {
                     w_raw = vbe_w as usize;
                     h_raw = vbe_h as usize;
                     bpp_raw = vbe_bpp as u8;
+                    if vbe_pitch > 0 {
+                        p_raw = vbe_pitch as usize;
+                    }
                 } else {
                     w_raw = 1024;
                     h_raw = 768;
@@ -357,6 +387,22 @@ impl Framebuffer {
                 (w_raw, h_raw, p, bpp)
             };
 
+            serial::log("FB", "VBE resolution (w x h x bpp):");
+            serial::write_usize(w);
+            serial::write_byte(b'x');
+            serial::write_usize(h);
+            serial::write_byte(b'x');
+            serial::write_usize(bpp as usize);
+            serial::write_byte(b'\n');
+            serial::write_str("[VBE] framebuffer activo ");
+            serial::write_usize(w); serial::write_byte(b'x'); serial::write_usize(h);
+            serial::write_byte(b'x'); serial::write_usize(bpp as usize);
+            serial::write_str(" pitch_bytes="); serial::write_usize(lfb_pitch);
+            serial::write_byte(b'\n');
+            // [FRENTE B-3] Modo real publicado para Ring 3 (SYS_FB_INFO): el
+            // compositor portix-wm no debe suponer 32 bpp ni pitch = ancho*4.
+            FB_MODE.lock().set(lfb, w, h, bpp, lfb_pitch);
+
             let back_pitch = w * 4;
 
             // rep stosd: limpia back buffer (mejora #1)
@@ -364,11 +410,16 @@ impl Framebuffer {
 
             init_alpha_lut(); // mejora #6
 
+            let cr3 = crate::mem::paging::read_cr3();
+            let is_backbuf_mapped = crate::mem::paging::translate(cr3, BACKBUF_ADDR as usize).is_some();
+            let direct_lfb = !is_backbuf_mapped || lfb == 0;
+
             Self {
                 lfb, backbuf: BACKBUF_ADDR,
                 width: w, height: h,
                 lfb_pitch, bpp, back_pitch,
                 dirty: DirtyRegion::clean(),
+                direct_lfb,
             }
         }
     }
@@ -380,7 +431,7 @@ impl Framebuffer {
         core::arch::asm!(
             "cld", "rep stosd",
             inout("rdi") dst   => _,
-            inout("ecx") count => _,
+            inout("rcx") count => _,
             in("eax")    val,
             options(nostack)
         );
@@ -399,7 +450,7 @@ impl Framebuffer {
             "cld", "rep movsd",
             inout("rdi") dst   => _,
             inout("rsi") src   => _,
-            inout("ecx") count => _,
+            inout("rcx") count => _,
             options(nostack)
         );
     }
@@ -418,20 +469,82 @@ impl Framebuffer {
     #[inline(always)]
     pub unsafe fn draw_pixel(&mut self, x: usize, y: usize, color: Color) {
         if x >= self.width || y >= self.height { return; }
-        let off = (y * self.back_pitch + x * 4) as u64;
-        core::ptr::write_volatile((self.backbuf + off) as *mut u32, color.0);
+        if self.direct_lfb {
+            if self.lfb == 0 { return; }
+            match self.bpp {
+                32 => {
+                    let off = (y * self.lfb_pitch + x * 4) as u64;
+                    core::ptr::write_volatile((self.lfb + off) as *mut u32, color.0);
+                }
+                24 => {
+                    let off = (y * self.lfb_pitch + x * 3) as u64;
+                    let dst = (self.lfb + off) as *mut u8;
+                    core::ptr::write_volatile(dst,       ( color.0        & 0xFF) as u8);
+                    core::ptr::write_volatile(dst.add(1), ((color.0 >>  8) & 0xFF) as u8);
+                    core::ptr::write_volatile(dst.add(2), ((color.0 >> 16) & 0xFF) as u8);
+                }
+                16 => {
+                    let off = (y * self.lfb_pitch + x * 2) as u64;
+                    let r = ((color.0 >> 16) & 0xFF) as u16;
+                    let g = ((color.0 >>  8) & 0xFF) as u16;
+                    let bv = ( color.0        & 0xFF) as u16;
+                    let val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (bv >> 3);
+                    core::ptr::write_volatile((self.lfb + off) as *mut u16, val);
+                }
+                _ => {
+                    let bpp_b = (self.bpp as usize + 7) / 8;
+                    let off = (y * self.lfb_pitch + x * bpp_b) as u64;
+                    let dst = (self.lfb + off) as *mut u8;
+                    core::ptr::write_volatile(dst,   ( color.0        & 0xFF) as u8);
+                    if bpp_b > 1 { core::ptr::write_volatile(dst.add(1), ((color.0>>8)&0xFF)  as u8); }
+                    if bpp_b > 2 { core::ptr::write_volatile(dst.add(2), ((color.0>>16)&0xFF) as u8); }
+                }
+            }
+        } else {
+            if self.backbuf == 0 { return; }
+            let off = (y * self.back_pitch + x * 4) as u64;
+            core::ptr::write_volatile((self.backbuf + off) as *mut u32, color.0);
+        }
     }
 
     #[inline(always)]
     pub unsafe fn read_back_pixel(&self, x: usize, y: usize) -> Color {
         if x >= self.width || y >= self.height { return Color::BLACK; }
-        let off = (y * self.back_pitch + x * 4) as u64;
-        Color(core::ptr::read_volatile((self.backbuf + off) as *const u32))
+        if self.direct_lfb {
+            if self.lfb == 0 { return Color::BLACK; }
+            match self.bpp {
+                32 => {
+                    let off = (y * self.lfb_pitch + x * 4) as u64;
+                    Color(core::ptr::read_volatile((self.lfb + off) as *const u32))
+                }
+                24 => {
+                    let off = (y * self.lfb_pitch + x * 3) as u64;
+                    let src = (self.lfb + off) as *const u8;
+                    let r = core::ptr::read_volatile(src.add(2)) as u32;
+                    let g = core::ptr::read_volatile(src.add(1)) as u32;
+                    let b = core::ptr::read_volatile(src) as u32;
+                    Color((r << 16) | (g << 8) | b)
+                }
+                16 => {
+                    let off = (y * self.lfb_pitch + x * 2) as u64;
+                    let val = core::ptr::read_volatile((self.lfb + off) as *const u16) as u32;
+                    let r = ((val >> 11) & 0x1F) << 3;
+                    let g = ((val >> 5) & 0x3F) << 2;
+                    let b = (val & 0x1F) << 3;
+                    Color((r << 16) | (g << 8) | b)
+                }
+                _ => Color::BLACK,
+            }
+        } else {
+            if self.backbuf == 0 { return Color::BLACK; }
+            let off = (y * self.back_pitch + x * 4) as u64;
+            Color(core::ptr::read_volatile((self.backbuf + off) as *const u32))
+        }
     }
 
     // ── present() — dirty-rect (mejora #2) + rep movsd (mejora #1) ───────────
     pub fn present(&mut self) {
-        if self.lfb == 0 || !self.dirty.dirty { return; }
+        if self.direct_lfb || self.lfb == 0 || !self.dirty.dirty { return; }
         let x0 = self.dirty.min_x.min(self.width);
         let y0 = self.dirty.min_y.min(self.height);
         let x1 = self.dirty.max_x.min(self.width);
@@ -505,11 +618,31 @@ impl Framebuffer {
     pub fn clear(&self, color: Color) {
         let val   = color.0;
         let total = self.width * self.height;
-        unsafe { Self::fast_fill_u32(self.backbuf as *mut u32, val, total); }
+        if self.direct_lfb {
+            if self.lfb == 0 { return; }
+            unsafe {
+                match self.bpp {
+                    32 => {
+                        Self::fast_fill_u32(self.lfb as *mut u32, val, total);
+                    }
+                    _ => {
+                        for y in 0..self.height {
+                            for x in 0..self.width {
+                                let ptr = self as *const Self as *mut Self;
+                                (*ptr).draw_pixel(x, y, color);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            if self.backbuf == 0 { return; }
+            unsafe { Self::fast_fill_u32(self.backbuf as *mut u32, val, total); }
+        }
     }
 
     pub fn fill_rect(&mut self, sx: usize, sy: usize, w: usize, h: usize, c: Color) {
-        if self.backbuf == 0 || w == 0 || h == 0 { return; }
+        if (self.backbuf == 0 && !self.direct_lfb) || w == 0 || h == 0 { return; }
         let ex = sx.saturating_add(w).min(self.width);
         let ey = sy.saturating_add(h).min(self.height);
         if sx >= ex || sy >= ey { return; }
@@ -517,11 +650,17 @@ impl Framebuffer {
         let val = c.0;
         unsafe {
             for y in sy..ey {
-                let row = (self.backbuf + (y * self.back_pitch + sx * 4) as u64) as *mut u32;
-                Self::fast_fill_u32(row, val, rw);
+                if self.direct_lfb {
+                    for x in sx..ex {
+                        self.draw_pixel(x, y, c);
+                    }
+                } else {
+                    let row = (self.backbuf + (y * self.back_pitch + sx * 4) as u64) as *mut u32;
+                    Self::fast_fill_u32(row, val, rw);
+                }
             }
         }
-        self.dirty.mark(sx, sy, ex - sx, ey - sy);
+        self.dirty.mark(sx, sy, rw, ey - sy);
     }
 
     pub fn hline(&mut self, x: usize, y: usize, l: usize, c: Color) { self.fill_rect(x,y,l,1,c); }
@@ -654,13 +793,28 @@ impl Framebuffer {
                              lines: usize, fill: Color) {
         if lines == 0 || lines >= h || w == 0 { return; }
         let visible = h - lines;
-        for row in 0..visible {
-            let src_y = sy + row + lines;
-            let dst_y = sy + row;
-            if src_y >= self.height { break; }
-            let src = (self.backbuf + (src_y * self.back_pitch + sx * 4) as u64) as *const u32;
-            let dst = (self.backbuf + (dst_y * self.back_pitch + sx * 4) as u64) as *mut u32;
-            unsafe { Self::fast_copy_u32(dst, src, w.min(self.width - sx)); }
+        if self.direct_lfb {
+            for row in 0..visible {
+                let src_y = sy + row + lines;
+                let dst_y = sy + row;
+                if src_y >= self.height { break; }
+                let cols = w.min(self.width - sx);
+                for col in 0..cols {
+                    unsafe {
+                        let c = self.read_back_pixel(sx + col, src_y);
+                        self.draw_pixel(sx + col, dst_y, c);
+                    }
+                }
+            }
+        } else {
+            for row in 0..visible {
+                let src_y = sy + row + lines;
+                let dst_y = sy + row;
+                if src_y >= self.height { break; }
+                let src = (self.backbuf + (src_y * self.back_pitch + sx * 4) as u64) as *const u32;
+                let dst = (self.backbuf + (dst_y * self.back_pitch + sx * 4) as u64) as *mut u32;
+                unsafe { Self::fast_copy_u32(dst, src, w.min(self.width - sx)); }
+            }
         }
         for row in visible..h {
             self.fill_rect(sx, sy + row, w, 1, fill);
